@@ -28,6 +28,13 @@ public:
         std::shared_ptr<SeEditor::Forest::SuRenderTextureResource> Texture;
     };
 
+    struct DebugLine
+    {
+        SlLib::Math::Vector3 From{};
+        SlLib::Math::Vector3 To{};
+        SlLib::Math::Vector3 Color{1.0f, 1.0f, 1.0f};
+    };
+
     void SetForestMeshes(std::vector<ForestCpuMesh> meshes);
     void SetDrawForestMeshes(bool enable) { _drawForestMeshes = enable; }
 
@@ -38,6 +45,10 @@ public:
                           std::vector<std::array<int, 3>> triangles);
     void SetForestBoxes(std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> boxes);
     void SetDrawForestBoxes(bool enable) { _drawForestBoxes = enable; }
+    void SetTriggerBoxes(std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> boxes);
+    void SetDrawTriggerBoxes(bool enable) { _drawTriggerBoxes = enable; }
+    void SetDebugLines(std::vector<DebugLine> lines);
+    void SetDrawDebugLines(bool enable) { _drawDebugLines = enable; }
     void SetOrbitCamera(float yaw, float pitch, float distance, SlLib::Math::Vector3 target);
     void SetDrawCollisionMesh(bool enable) { _drawCollisionMesh = enable; }
 
@@ -59,6 +70,9 @@ private:
     float _collisionRadius = 1.0f;
     std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> _forestBoxes;
     bool _drawForestBoxes = false;
+    std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> _triggerBoxes;
+    bool _drawTriggerBoxes = false;
+    std::vector<DebugLine> _debugLines;
     std::vector<ForestCpuMesh> _forestCpuMeshes;
     std::vector<ForestGpuMesh> _forestGpuMeshes;
     std::unordered_map<const void*, GLuint> _forestTextureCache;
@@ -69,6 +83,7 @@ private:
     float _orbitDistance = 10.0f;
     SlLib::Math::Vector3 _orbitTarget{0.0f, 0.5f, 0.0f};
     bool _drawCollisionMesh = true;
+    bool _drawDebugLines = false;
 };
 
 } // namespace SeEditor::Renderer

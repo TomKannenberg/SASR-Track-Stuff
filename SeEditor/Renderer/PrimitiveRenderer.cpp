@@ -192,7 +192,7 @@ void PrimitiveRenderer::EndPrimitiveScene() noexcept
     {
         ImVec2 display = ImGui::GetIO().DisplaySize;
         float aspect = display.y > 0.0f ? display.x / display.y : 16.0f / 9.0f;
-        s_proj = MakePerspective(60.0f * 3.14159265f / 180.0f, aspect, 0.1f, 1000.0f);
+        s_proj = MakePerspective(60.0f * 3.14159265f / 180.0f, aspect, 0.1f, 200000.0f);
     }
     if (s_view(3, 3) == 0.0f)
     {

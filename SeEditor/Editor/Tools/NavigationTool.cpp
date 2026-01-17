@@ -10,15 +10,70 @@ NavigationTool::NavigationTool(SlLib::SumoTool::Siff::Navigation* navigation) no
     : _navData(navigation)
 {}
 
+void NavigationTool::SetRacingLineVisibility(std::vector<std::uint8_t> visibility)
+{
+    _racingLineVisibility = std::move(visibility);
+}
+
+void NavigationTool::SetDrawWaypoints(bool enabled)
+{
+    _drawWaypoints = enabled;
+}
+
+void NavigationTool::SetWaypointBoxSize(float size)
+{
+    _waypointBoxSize = size;
+}
+
 void NavigationTool::OnRender()
 {
     if (_navData == nullptr)
         return;
 
     Renderer::PrimitiveRenderer::BeginPrimitiveScene();
-    for (auto const& line : _navData->RacingLines)
+    if (_drawWaypoints)
     {
-        RenderRacingLine(line);
+        static const SlLib::Math::Vector3 waypointColor{1.0f, 0.0f, 0.0f};
+        float half = std::max(0.1f, _waypointBoxSize * 0.5f);
+        for (auto const& waypoint : _navData->Waypoints)
+        {
+            if (!waypoint)
+                continue;
+            SlLib::Math::Vector3 c = waypoint->Pos;
+            SlLib::Math::Vector3 v0{c.X - half, c.Y - half, c.Z - half};
+            SlLib::Math::Vector3 v1{c.X + half, c.Y - half, c.Z - half};
+            SlLib::Math::Vector3 v2{c.X + half, c.Y + half, c.Z - half};
+            SlLib::Math::Vector3 v3{c.X - half, c.Y + half, c.Z - half};
+            SlLib::Math::Vector3 v4{c.X - half, c.Y - half, c.Z + half};
+            SlLib::Math::Vector3 v5{c.X + half, c.Y - half, c.Z + half};
+            SlLib::Math::Vector3 v6{c.X + half, c.Y + half, c.Z + half};
+            SlLib::Math::Vector3 v7{c.X - half, c.Y + half, c.Z + half};
+
+            Renderer::PrimitiveRenderer::DrawLine(v0, v1, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v1, v2, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v2, v3, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v3, v0, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v4, v5, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v5, v6, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v6, v7, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v7, v4, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v0, v4, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v1, v5, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v2, v6, waypointColor);
+            Renderer::PrimitiveRenderer::DrawLine(v3, v7, waypointColor);
+        }
+    }
+    for (std::size_t i = 0; i < _navData->RacingLines.size(); ++i)
+    {
+        auto const& line = _navData->RacingLines[i];
+        if (!line)
+            continue;
+        if (!_racingLineVisibility.empty())
+        {
+            if (i >= _racingLineVisibility.size() || _racingLineVisibility[i] == 0)
+                continue;
+        }
+        RenderRacingLine(*line);
     }
     Renderer::PrimitiveRenderer::EndPrimitiveScene();
 }
@@ -39,7 +94,9 @@ void NavigationTool::RenderRacingLine(SlLib::SumoTool::Siff::NavData::NavRacingL
     for (std::size_t i = 0; i < segments.size(); ++i)
     {
         auto const& segment = segments[i];
-        auto* link = segment.Link;
+        if (!segment)
+            continue;
+        auto* link = segment->Link.get();
         if (link == nullptr)
             continue;
 
@@ -69,7 +126,8 @@ void NavigationTool::RenderRacingLine(SlLib::SumoTool::Siff::NavData::NavRacingL
         if (segments.size() > 1)
         {
             auto const& next = segments[(i + 1) % segments.size()];
-            Renderer::PrimitiveRenderer::DrawLine(segment.RacingLine, next.RacingLine, white);
+            if (next)
+                Renderer::PrimitiveRenderer::DrawLine(segment->RacingLine, next->RacingLine, white);
         }
     }
 }

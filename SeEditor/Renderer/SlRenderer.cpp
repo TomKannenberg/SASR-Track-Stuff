@@ -260,7 +260,7 @@ void SlRenderer::Render()
         target = _orbitTarget;
     }
 
-    auto proj = makePerspective(60.0f * 3.14159265f / 180.0f, aspect, 0.1f, 5000.0f);
+    auto proj = makePerspective(60.0f * 3.14159265f / 180.0f, aspect, 0.1f, 200000.0f);
     auto view = makeLookAt(eye, target, {0.0f, 1.0f, 0.0f});
     PrimitiveRenderer::SetCamera(view, proj);
 
@@ -356,6 +356,46 @@ void SlRenderer::Render()
             for (auto const& edge : edges)
                 drawEdge(edge.first, edge.second);
         }
+    }
+
+    // Trigger phantom boxes (kill/respawn zones)
+    if (_drawTriggerBoxes && !_triggerBoxes.empty())
+    {
+        SlLib::Math::Vector3 col = {0.9f, 0.2f, 0.2f};
+        const std::array<std::pair<int, int>, 12> edges = {{
+            {0, 1}, {1, 2}, {2, 3}, {3, 0},
+            {4, 5}, {5, 6}, {6, 7}, {7, 4},
+            {0, 4}, {1, 5}, {2, 6}, {3, 7}
+        }};
+
+        for (auto const& box : _triggerBoxes)
+        {
+            auto const& min = box.first;
+            auto const& max = box.second;
+            std::array<SlLib::Math::Vector3, 8> corners = {
+                SlLib::Math::Vector3{min.X, min.Y, min.Z},
+                SlLib::Math::Vector3{max.X, min.Y, min.Z},
+                SlLib::Math::Vector3{max.X, max.Y, min.Z},
+                SlLib::Math::Vector3{min.X, max.Y, min.Z},
+                SlLib::Math::Vector3{min.X, min.Y, max.Z},
+                SlLib::Math::Vector3{max.X, min.Y, max.Z},
+                SlLib::Math::Vector3{max.X, max.Y, max.Z},
+                SlLib::Math::Vector3{min.X, max.Y, max.Z}
+            };
+
+            auto drawEdge = [&](int a, int b) {
+                PrimitiveRenderer::DrawLine(corners[a], corners[b], col);
+            };
+
+            for (auto const& edge : edges)
+                drawEdge(edge.first, edge.second);
+        }
+    }
+
+    if (_drawDebugLines && !_debugLines.empty())
+    {
+        for (auto const& line : _debugLines)
+            PrimitiveRenderer::DrawLine(line.From, line.To, line.Color);
     }
 
     if (_forestDirty)
@@ -492,6 +532,16 @@ void SlRenderer::SetCollisionMesh(std::vector<SlLib::Math::Vector3> vertices,
 void SlRenderer::SetForestBoxes(std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> boxes)
 {
     _forestBoxes = std::move(boxes);
+}
+
+void SlRenderer::SetTriggerBoxes(std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> boxes)
+{
+    _triggerBoxes = std::move(boxes);
+}
+
+void SlRenderer::SetDebugLines(std::vector<DebugLine> lines)
+{
+    _debugLines = std::move(lines);
 }
 
 void SlRenderer::SetOrbitCamera(float yaw, float pitch, float distance, SlLib::Math::Vector3 target)

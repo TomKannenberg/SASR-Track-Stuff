@@ -3,7 +3,14 @@ GitKan.pub
 *.o
 *.obj
 *.exe
+*.sig
+*.zig
+*.sif
+*.zif
+*.forest
 build/
+build_release/
 imgui.ini
 track.Forest
+*_forestXYZ.txt
 gitignore.bak/

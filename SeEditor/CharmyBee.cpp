@@ -11,9 +11,15 @@
 #include "Installers/SlTextureInstaller.hpp"
 #include "Managers/SlFile.hpp"
 #include "Renderer/SlRenderer.hpp"
+#include "NavigationLoader.hpp"
+#include "LogicLoader.hpp"
 #include "SlLib/Resources/Database/SlPlatform.hpp"
+#include "SlLib/Utilities/SlUtil.hpp"
+#include "Forest/ForestArchive.hpp"
 
 #include <SlLib/Excel/ExcelData.hpp>
+#include <SlLib/Enums/TriggerPhantomShape.hpp>
+#include <SlLib/Resources/Scene/Definitions/TriggerPhantomDefinitionNode.hpp>
 #include <SlLib/Resources/Scene/SeDefinitionNode.hpp>
 #include <SlLib/SumoTool/Siff/NavData/NavWaypoint.hpp>
 #include <SlLib/SumoTool/Siff/Navigation.hpp>
@@ -23,6 +29,8 @@
 #include <limits>
 #include <functional>
 #include <array>
+#include <cmath>
+#include <unordered_set>
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <chrono>
@@ -520,6 +528,646 @@ std::string QuoteArgument(std::string const& value)
     return escaped;
 }
 
+std::uint64_t MakeForestTreeKey(int forestHash, int treeHash)
+{
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(forestHash)) << 32) |
+           static_cast<std::uint32_t>(treeHash);
+}
+
+bool TryParseForestArchive(std::span<const std::uint8_t> input,
+                           std::vector<std::uint8_t>& cpuData,
+                           std::vector<std::uint32_t>& relocations,
+                           std::vector<std::uint8_t>& gpuData,
+                           bool& bigEndian)
+{
+    using SeEditor::Forest::kForestArchiveFlagBigEndian;
+    using SeEditor::Forest::kForestArchiveMagic;
+
+    if (input.size() < 20)
+        return false;
+
+    auto readU32 = [&](std::size_t offset) -> std::uint32_t {
+        if (offset + 4 > input.size())
+            return 0;
+        return static_cast<std::uint32_t>(input[offset]) |
+               (static_cast<std::uint32_t>(input[offset + 1]) << 8) |
+               (static_cast<std::uint32_t>(input[offset + 2]) << 16) |
+               (static_cast<std::uint32_t>(input[offset + 3]) << 24);
+    };
+
+    std::uint32_t magic = readU32(0);
+    std::uint32_t version = readU32(4);
+    if (magic != kForestArchiveMagic)
+        return false;
+
+    std::size_t headerSize = 0;
+    std::uint32_t flags = 0;
+    std::size_t chunkSize = 0;
+    std::size_t relocCount = 0;
+    std::size_t gpuSize = 0;
+
+    if (version == 1)
+    {
+        headerSize = 20;
+        chunkSize = readU32(8);
+        relocCount = readU32(12);
+        gpuSize = readU32(16);
+    }
+    else if (version == 2)
+    {
+        headerSize = 24;
+        flags = readU32(8);
+        chunkSize = readU32(12);
+        relocCount = readU32(16);
+        gpuSize = readU32(20);
+    }
+    else
+    {
+        return false;
+    }
+
+    bigEndian = (flags & kForestArchiveFlagBigEndian) != 0;
+
+    constexpr std::size_t kUint32Size = sizeof(std::uint32_t);
+    auto safeAdd = [](std::size_t a, std::size_t b) -> std::optional<std::size_t> {
+        if (b > std::numeric_limits<std::size_t>::max() - a)
+            return std::nullopt;
+        return a + b;
+    };
+
+    auto total = safeAdd(headerSize, chunkSize);
+    if (!total)
+        return false;
+    auto withRelocs = safeAdd(*total, relocCount * kUint32Size);
+    if (!withRelocs)
+        return false;
+    auto withGpu = safeAdd(*withRelocs, gpuSize);
+    if (!withGpu)
+        return false;
+
+    if (input.size() < *withGpu)
+        return false;
+
+    cpuData.assign(input.begin() + headerSize, input.begin() + headerSize + chunkSize);
+    relocations.clear();
+    relocations.reserve(relocCount);
+    auto const* relocBase = reinterpret_cast<const std::uint32_t*>(input.data() + headerSize + chunkSize);
+    for (std::size_t i = 0; i < relocCount; ++i)
+        relocations.push_back(relocBase[i]);
+
+    auto gpuStart = input.data() + headerSize + chunkSize + relocCount * kUint32Size;
+    gpuData.assign(gpuStart, gpuStart + gpuSize);
+    return true;
+}
+
+bool TryLoadForestLibraryFromChunk(SifChunkInfo const& chunk,
+                                   std::span<const std::uint8_t> gpuData,
+                                   std::shared_ptr<SeEditor::Forest::ForestLibrary>& outLibrary,
+                                   std::string& error)
+{
+    if (chunk.Data.empty())
+    {
+        error = "Forest chunk has no data.";
+        return false;
+    }
+
+    std::vector<SlLib::Resources::Database::SlResourceRelocation> relocations;
+    relocations.reserve(chunk.Relocations.size());
+    for (auto offset : chunk.Relocations)
+        relocations.push_back({static_cast<int>(offset), 0});
+
+    SlLib::Serialization::ResourceLoadContext context(
+        std::span<const std::uint8_t>(chunk.Data.data(), chunk.Data.size()),
+        gpuData,
+        std::move(relocations));
+    static SlLib::Resources::Database::SlPlatform s_win32("win32", false, false, 0);
+    static SlLib::Resources::Database::SlPlatform s_xbox360("x360", true, false, 0);
+    context.Platform = chunk.BigEndian ? &s_xbox360 : &s_win32;
+
+    auto library = std::make_shared<SeEditor::Forest::ForestLibrary>();
+    try
+    {
+        library->Load(context);
+    }
+    catch (std::exception const& ex)
+    {
+        error = ex.what();
+        return false;
+    }
+
+    outLibrary = std::move(library);
+    return true;
+}
+
+void BuildForestTreeMeshMaps(SeEditor::Forest::ForestLibrary const& library,
+                             bool isBigEndian,
+                             std::unordered_map<std::uint64_t,
+                                                std::shared_ptr<std::vector<SeEditor::Renderer::SlRenderer::ForestCpuMesh>>>&
+                                 byForestTree,
+                             std::unordered_map<int,
+                                                std::shared_ptr<std::vector<SeEditor::Renderer::SlRenderer::ForestCpuMesh>>>&
+                                 byTreeHash)
+{
+    using SeEditor::Forest::D3DDeclType;
+    using SeEditor::Forest::D3DDeclUsage;
+    using SeEditor::Renderer::SlRenderer;
+
+    byForestTree.clear();
+    byTreeHash.clear();
+
+    struct ForestVertex
+    {
+        SlLib::Math::Vector3 Pos{};
+        SlLib::Math::Vector3 Normal{0.0f, 1.0f, 0.0f};
+        SlLib::Math::Vector2 Uv{};
+    };
+
+    auto readFloat = [](std::vector<std::uint8_t> const& data, std::size_t offset) -> float {
+        if (offset + 4 > data.size())
+            return 0.0f;
+        float v = 0.0f;
+        std::memcpy(&v, data.data() + offset, sizeof(float));
+        return v;
+    };
+    auto readU16 = [](std::vector<std::uint8_t> const& data, std::size_t offset) -> std::uint16_t {
+        if (offset + 2 > data.size())
+            return 0;
+        return static_cast<std::uint16_t>(data[offset] | (data[offset + 1] << 8));
+    };
+    auto readS16 = [&](std::vector<std::uint8_t> const& data, std::size_t offset) -> std::int16_t {
+        return static_cast<std::int16_t>(readU16(data, offset));
+    };
+
+    auto decodeVertex = [&](SeEditor::Forest::SuRenderVertexStream const& stream) {
+        std::vector<ForestVertex> verts;
+        if (stream.VertexCount <= 0 || stream.VertexStride <= 0 || stream.Stream.empty())
+            return verts;
+
+        verts.resize(static_cast<std::size_t>(stream.VertexCount));
+        for (int i = 0; i < stream.VertexCount; ++i)
+        {
+            std::size_t base = static_cast<std::size_t>(i) * static_cast<std::size_t>(stream.VertexStride);
+            ForestVertex v;
+            for (auto const& attr : stream.AttributeStreamsInfo)
+            {
+                if (attr.Stream != 0)
+                    continue;
+
+                std::size_t off = base + static_cast<std::size_t>(attr.Offset);
+                if (attr.Usage == D3DDeclUsage::Position)
+                {
+                    std::size_t posOff = off;
+                    if (stream.StreamBias != 0)
+                        posOff += static_cast<std::size_t>(stream.StreamBias);
+                    if (attr.Type == D3DDeclType::Float3)
+                    {
+                        v.Pos = {readFloat(stream.Stream, posOff + 0),
+                                 readFloat(stream.Stream, posOff + 4),
+                                 readFloat(stream.Stream, posOff + 8)};
+                    }
+                    else if (attr.Type == D3DDeclType::Float4)
+                    {
+                        v.Pos = {readFloat(stream.Stream, posOff + 0),
+                                 readFloat(stream.Stream, posOff + 4),
+                                 readFloat(stream.Stream, posOff + 8)};
+                    }
+                }
+                else if (attr.Usage == D3DDeclUsage::Normal)
+                {
+                    if (attr.Type == D3DDeclType::Float3)
+                    {
+                        v.Normal = {readFloat(stream.Stream, off + 0),
+                                    readFloat(stream.Stream, off + 4),
+                                    readFloat(stream.Stream, off + 8)};
+                    }
+                    else if (attr.Type == D3DDeclType::Short4N)
+                    {
+                        v.Normal = {readS16(stream.Stream, off + 0) / 32767.0f,
+                                    readS16(stream.Stream, off + 2) / 32767.0f,
+                                    readS16(stream.Stream, off + 4) / 32767.0f};
+                    }
+                }
+                else if (attr.Usage == D3DDeclUsage::TexCoord)
+                {
+                    if (attr.Type == D3DDeclType::Float2)
+                    {
+                        v.Uv = {readFloat(stream.Stream, off + 0),
+                                readFloat(stream.Stream, off + 4)};
+                    }
+                    else if (attr.Type == D3DDeclType::Short2N)
+                    {
+                        v.Uv = {readS16(stream.Stream, off + 0) / 32767.0f,
+                                readS16(stream.Stream, off + 2) / 32767.0f};
+                    }
+                }
+            }
+            verts[static_cast<std::size_t>(i)] = v;
+        }
+
+        return verts;
+    };
+
+    auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
+        auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        s.X = clamp(s.X);
+        s.Y = clamp(s.Y);
+        s.Z = clamp(s.Z);
+        SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
+        SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
+        SlLib::Math::Matrix4x4 scale{};
+        scale(0, 0) = s.X;
+        scale(1, 1) = s.Y;
+        scale(2, 2) = s.Z;
+        scale(3, 3) = 1.0f;
+        SlLib::Math::Matrix4x4 local = SlLib::Math::Multiply(rot, scale);
+        local(0, 3) = t.X;
+        local(1, 3) = t.Y;
+        local(2, 3) = t.Z;
+        local(3, 3) = 1.0f;
+        return local;
+    };
+
+    std::size_t debugDroppedLogged = 0;
+
+    for (auto const& forestEntry : library.Forests)
+    {
+        if (!forestEntry.Forest)
+            continue;
+
+        int forestHash = forestEntry.Hash;
+        int forestNameHash = 0;
+        if (!forestEntry.Name.empty())
+            forestNameHash = SlLib::Utilities::HashString(forestEntry.Name);
+
+        auto const& trees = forestEntry.Forest->Trees;
+        for (auto const& tree : trees)
+        {
+            if (!tree)
+                continue;
+
+            std::vector<SlRenderer::ForestCpuMesh> treeMeshes;
+
+            std::size_t branchCount = tree->Branches.size();
+            std::vector<SlLib::Math::Matrix4x4> world(branchCount);
+            std::vector<bool> computed(branchCount, false);
+
+            std::function<SlLib::Math::Matrix4x4(int)> computeWorld = [&](int idx) -> SlLib::Math::Matrix4x4 {
+                if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount)
+                    return SlLib::Math::Matrix4x4{};
+                if (computed[static_cast<std::size_t>(idx)])
+                    return world[static_cast<std::size_t>(idx)];
+
+                SlLib::Math::Vector4 t{};
+                SlLib::Math::Vector4 r{};
+                SlLib::Math::Vector4 s{1.0f, 1.0f, 1.0f, 1.0f};
+                if (static_cast<std::size_t>(idx) < tree->Translations.size())
+                    t = tree->Translations[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < tree->Rotations.size())
+                    r = tree->Rotations[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < tree->Scales.size())
+                    s = tree->Scales[static_cast<std::size_t>(idx)];
+
+                auto local = buildLocalMatrix(t, r, s);
+                int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+                if (parentIndex >= 0 && parentIndex < static_cast<int>(branchCount))
+                {
+                    world[static_cast<std::size_t>(idx)] =
+                        SlLib::Math::Multiply(computeWorld(parentIndex), local);
+                }
+                else
+                {
+                    world[static_cast<std::size_t>(idx)] = local;
+                }
+
+                computed[static_cast<std::size_t>(idx)] = true;
+                return world[static_cast<std::size_t>(idx)];
+            };
+
+            auto appendMesh = [&](std::shared_ptr<SeEditor::Forest::SuRenderMesh> const& mesh,
+                                  SlLib::Math::Matrix4x4 const& worldMatrix) {
+                if (!mesh)
+                    return;
+
+                for (std::size_t primIndex = 0; primIndex < mesh->Primitives.size(); ++primIndex)
+                {
+                    auto const& primitive = mesh->Primitives[primIndex];
+                    if (!primitive || !primitive->VertexStream)
+                        continue;
+
+                    auto verts = decodeVertex(*primitive->VertexStream);
+                    if (verts.empty())
+                        continue;
+
+                    SlLib::Math::Matrix4x4 normalMatrix = worldMatrix;
+                    normalMatrix(0, 3) = 0.0f;
+                    normalMatrix(1, 3) = 0.0f;
+                    normalMatrix(2, 3) = 0.0f;
+
+                    for (auto& v : verts)
+                    {
+                        SlLib::Math::Vector4 pos4{v.Pos.X, v.Pos.Y, v.Pos.Z, 1.0f};
+                        auto transformed = SlLib::Math::Transform(worldMatrix, pos4);
+                        v.Pos = {transformed.X, transformed.Y, transformed.Z};
+
+                        SlLib::Math::Vector4 n4{v.Normal.X, v.Normal.Y, v.Normal.Z, 0.0f};
+                        auto nT = SlLib::Math::Transform(normalMatrix, n4);
+                        v.Normal = SlLib::Math::normalize({nT.X, nT.Y, nT.Z});
+                    }
+
+                    SlRenderer::ForestCpuMesh cpu;
+                    cpu.Vertices.reserve(verts.size() * 8);
+                    for (auto const& v : verts)
+                    {
+                        cpu.Vertices.push_back(v.Pos.X);
+                        cpu.Vertices.push_back(v.Pos.Y);
+                        cpu.Vertices.push_back(v.Pos.Z);
+                        cpu.Vertices.push_back(v.Normal.X);
+                        cpu.Vertices.push_back(v.Normal.Y);
+                        cpu.Vertices.push_back(v.Normal.Z);
+                        cpu.Vertices.push_back(v.Uv.X);
+                        cpu.Vertices.push_back(v.Uv.Y);
+                    }
+
+                    std::size_t availableIndices = primitive->IndexData.size() / 2;
+                    std::size_t indexCount = availableIndices;
+                    if (primitive->NumIndices > 0)
+                        indexCount = std::min(static_cast<std::size_t>(primitive->NumIndices), availableIndices);
+
+                    if (indexCount == 0)
+                        continue;
+
+                    std::size_t vertexLimit = verts.size();
+                    struct IndexMode
+                    {
+                        bool Use32 = false;
+                        bool Swap = false;
+                        std::size_t Count = 0;
+                        std::size_t Droppable = 0;
+                        std::size_t Restart = 0;
+                        std::uint32_t MaxIndex = 0;
+                    };
+
+                    auto eval16 = [&](bool swap) {
+                        IndexMode mode;
+                        mode.Use32 = false;
+                        mode.Swap = swap;
+                        mode.Count = indexCount;
+                        for (std::size_t i = 0; i < indexCount; ++i)
+                        {
+                            std::uint16_t a = primitive->IndexData[i * 2];
+                            std::uint16_t b = primitive->IndexData[i * 2 + 1];
+                            std::uint16_t idx = swap ? static_cast<std::uint16_t>((a << 8) | b)
+                                                     : static_cast<std::uint16_t>(a | (b << 8));
+                            if (idx == 0xFFFFu)
+                            {
+                                ++mode.Restart;
+                                continue;
+                            }
+                            if (idx > mode.MaxIndex)
+                                mode.MaxIndex = idx;
+                            if (static_cast<std::size_t>(idx) >= vertexLimit)
+                                ++mode.Droppable;
+                        }
+                        return mode;
+                    };
+
+                    auto eval32 = [&](bool swap) {
+                        IndexMode mode;
+                        mode.Use32 = true;
+                        mode.Swap = swap;
+                        if (primitive->IndexData.size() % 4 != 0)
+                            return mode;
+                        mode.Count = primitive->IndexData.size() / 4;
+                        if (primitive->NumIndices > 0)
+                            mode.Count = std::min<std::size_t>(mode.Count,
+                                static_cast<std::size_t>(primitive->NumIndices));
+                        for (std::size_t i = 0; i < mode.Count; ++i)
+                        {
+                            std::size_t off = i * 4;
+                            std::uint32_t idx = static_cast<std::uint32_t>(primitive->IndexData[off + 0] |
+                                (primitive->IndexData[off + 1] << 8) |
+                                (primitive->IndexData[off + 2] << 16) |
+                                (primitive->IndexData[off + 3] << 24));
+                            if (swap)
+                            {
+                                idx = ((idx & 0x000000FFu) << 24) |
+                                      ((idx & 0x0000FF00u) << 8) |
+                                      ((idx & 0x00FF0000u) >> 8) |
+                                      ((idx & 0xFF000000u) >> 24);
+                            }
+                            if (idx == 0xFFFFFFFFu)
+                            {
+                                ++mode.Restart;
+                                continue;
+                            }
+                            if (idx > mode.MaxIndex)
+                                mode.MaxIndex = idx;
+                            if (idx >= vertexLimit)
+                                ++mode.Droppable;
+                        }
+                        return mode;
+                    };
+
+                    IndexMode mode16le = eval16(false);
+                    IndexMode mode16be = eval16(true);
+                    IndexMode mode32le = eval32(false);
+                    IndexMode mode32be = eval32(true);
+
+                    IndexMode best = mode16le;
+                    if (mode16be.Droppable < best.Droppable)
+                        best = mode16be;
+                    if (mode32le.Count > 0 && mode32le.Droppable < best.Droppable)
+                        best = mode32le;
+                    if (mode32be.Count > 0 && mode32be.Droppable < best.Droppable)
+                        best = mode32be;
+
+                    bool use32Bit = best.Use32;
+                    bool swapIndices = best.Swap;
+                    std::size_t indexCount32 = best.Use32 ? best.Count : 0;
+                    std::size_t droppable = 0;
+                    std::size_t restart = 0;
+                    std::vector<std::uint32_t> rawIndices;
+                    rawIndices.reserve(best.Count);
+
+                    if (use32Bit)
+                    {
+                        for (std::size_t i = 0; i < indexCount32; ++i)
+                        {
+                            std::size_t off = i * 4;
+                            std::uint32_t idx = static_cast<std::uint32_t>(primitive->IndexData[off + 0] |
+                                (primitive->IndexData[off + 1] << 8) |
+                                (primitive->IndexData[off + 2] << 16) |
+                                (primitive->IndexData[off + 3] << 24));
+                            if (swapIndices)
+                            {
+                                idx = ((idx & 0x000000FFu) << 24) |
+                                      ((idx & 0x0000FF00u) << 8) |
+                                      ((idx & 0x00FF0000u) >> 8) |
+                                      ((idx & 0xFF000000u) >> 24);
+                            }
+                            if (idx == 0xFFFFFFFFu)
+                            {
+                                ++restart;
+                                rawIndices.push_back(idx);
+                                continue;
+                            }
+                            if (idx >= vertexLimit)
+                            {
+                                ++droppable;
+                                continue;
+                            }
+                            rawIndices.push_back(idx);
+                        }
+                    }
+                    else
+                    {
+                        for (std::size_t i = 0; i < best.Count; ++i)
+                        {
+                            std::uint16_t a = primitive->IndexData[i * 2];
+                            std::uint16_t b = primitive->IndexData[i * 2 + 1];
+                            std::uint16_t idx = swapIndices ? static_cast<std::uint16_t>((a << 8) | b)
+                                                            : static_cast<std::uint16_t>(a | (b << 8));
+                            if (idx == 0xFFFFu)
+                            {
+                                ++restart;
+                                rawIndices.push_back(idx);
+                                continue;
+                            }
+                            if (static_cast<std::size_t>(idx) >= vertexLimit)
+                            {
+                                ++droppable;
+                                continue;
+                            }
+                            rawIndices.push_back(static_cast<std::uint32_t>(idx));
+                        }
+                    }
+
+                    int primitiveType = primitive->Unknown_0x9c;
+                    bool isStrip = primitiveType == 5 || (primitiveType != 4 && restart > 0);
+                    if (isStrip)
+                    {
+                        cpu.Indices.reserve(rawIndices.size());
+                        bool have0 = false;
+                        bool have1 = false;
+                        std::uint32_t i0 = 0;
+                        std::uint32_t i1 = 0;
+                        bool flip = false;
+                        for (std::size_t i = 0; i < rawIndices.size(); ++i)
+                        {
+                            std::uint32_t idx = rawIndices[i];
+                            if ((use32Bit && idx == 0xFFFFFFFFu) || (!use32Bit && idx == 0xFFFFu))
+                            {
+                                have0 = false;
+                                have1 = false;
+                                flip = false;
+                                continue;
+                            }
+                            if (!have0)
+                            {
+                                i0 = idx;
+                                have0 = true;
+                                continue;
+                            }
+                            if (!have1)
+                            {
+                                i1 = idx;
+                                have1 = true;
+                                continue;
+                            }
+
+                            if (i0 != i1 && i1 != idx && i0 != idx)
+                            {
+                                if (flip)
+                                {
+                                    cpu.Indices.push_back(i1);
+                                    cpu.Indices.push_back(i0);
+                                    cpu.Indices.push_back(idx);
+                                }
+                                else
+                                {
+                                    cpu.Indices.push_back(i0);
+                                    cpu.Indices.push_back(i1);
+                                    cpu.Indices.push_back(idx);
+                                }
+                            }
+                            i0 = i1;
+                            i1 = idx;
+                            flip = !flip;
+                        }
+                    }
+                    else
+                    {
+                        cpu.Indices.reserve(rawIndices.size());
+                        for (std::uint32_t idx : rawIndices)
+                        {
+                            if ((use32Bit && idx == 0xFFFFFFFFu) || (!use32Bit && idx == 0xFFFFu))
+                                continue;
+                            cpu.Indices.push_back(idx);
+                        }
+                    }
+
+                    if (droppable > 0 || restart > 0)
+                    {
+                        if (debugDroppedLogged < 2 && primitive->VertexStream)
+                        {
+                            ++debugDroppedLogged;
+                            std::cerr << "[Forest] Dropped " << droppable << " indices for item mesh ("
+                                      << vertexLimit << " verts), restart=" << restart
+                                      << " endian=" << (isBigEndian ? "BE" : "LE")
+                                      << " primType=" << primitiveType << '\n';
+                        }
+                    }
+
+                    if (cpu.Indices.empty())
+                        continue;
+
+                    if (primitive->Material && !primitive->Material->Textures.empty())
+                        cpu.Texture = primitive->Material->Textures[0]->TextureResource;
+                    treeMeshes.push_back(std::move(cpu));
+                }
+            };
+
+            for (std::size_t i = 0; i < branchCount; ++i)
+            {
+                auto worldMatrix = computeWorld(static_cast<int>(i));
+                auto const& branch = tree->Branches[i];
+                if (!branch)
+                    continue;
+
+                if (branch->Mesh)
+                    appendMesh(branch->Mesh, worldMatrix);
+                if (branch->Lod)
+                {
+                    for (auto const& threshold : branch->Lod->Thresholds)
+                    {
+                        if (threshold && threshold->Mesh)
+                            appendMesh(threshold->Mesh, worldMatrix);
+                    }
+                }
+            }
+
+            if (treeMeshes.empty())
+                continue;
+
+            auto meshPtr = std::make_shared<std::vector<SlRenderer::ForestCpuMesh>>(std::move(treeMeshes));
+            int treeHash = tree->Hash;
+            auto insertTree = [&](int hash) {
+                auto key = MakeForestTreeKey(hash, treeHash);
+                if (byForestTree.find(key) == byForestTree.end())
+                    byForestTree.emplace(key, meshPtr);
+            };
+
+            if (treeHash != 0 && byTreeHash.find(treeHash) == byTreeHash.end())
+                byTreeHash.emplace(treeHash, meshPtr);
+
+            if (forestHash != 0)
+                insertTree(forestHash);
+            if (forestNameHash != 0 && forestNameHash != forestHash)
+                insertTree(forestNameHash);
+        }
+    }
+}
+
 } // namespace
 
 namespace SeEditor {
@@ -573,7 +1221,8 @@ void CharmyBee::OnLoad()
         try
         {
             Editor::SceneManager::LoadScene("levels/seasidehill2/seasidehill2");
-            SetupNavigationRendering();
+            auto* scene = Editor::SceneManager::Current();
+            SetupNavigationRendering(scene ? scene->Navigation : nullptr);
             OnWorkspaceLoad();
         }
         catch (std::exception const& exception)
@@ -583,13 +1232,9 @@ void CharmyBee::OnLoad()
     }
 }
 
-void CharmyBee::SetupNavigationRendering()
+void CharmyBee::SetupNavigationRendering(SlLib::SumoTool::Siff::Navigation* navigation)
 {
-    auto* scene = Editor::SceneManager::Current();
-    if (scene == nullptr)
-        return;
-
-    _navigation = scene->Navigation;
+    _navigation = navigation;
     if (_navigation == nullptr)
         return;
 
@@ -646,8 +1291,13 @@ void CharmyBee::SetupNavigationRendering()
     }
 
     _selectedRacingLine = _navigation->RacingLines.empty() ? -1 : 0;
-    _selectedRacingLineSegment =
-        (_selectedRacingLine == -1 || _navigation->RacingLines[_selectedRacingLine].Segments.empty()) ? -1 : 0;
+    _selectedRacingLineSegment = -1;
+    if (_selectedRacingLine != -1 && _selectedRacingLine < static_cast<int>(_navigation->RacingLines.size()))
+    {
+        auto const& line = _navigation->RacingLines[static_cast<std::size_t>(_selectedRacingLine)];
+        if (line && !line->Segments.empty())
+            _selectedRacingLineSegment = 0;
+    }
 
     std::cout << "[CharmyBee] Navigation rendering configured." << std::endl;
 }
@@ -678,6 +1328,8 @@ void CharmyBee::OnWorkspaceLoad()
         std::string nodeName = definition->ShortName.empty() ? definition->UidName : definition->ShortName;
         AddItemNode(nodeName, definition);
     }
+
+    UpdateTriggerPhantomBoxes();
 }
 
 void CharmyBee::TriggerCloseWorkspace()
@@ -699,6 +1351,10 @@ void CharmyBee::TriggerCloseWorkspace()
     _selectedRacingLineSegment = -1;
 
     ResetAssetTree();
+    _renderer.SetTriggerBoxes({});
+    _renderer.SetDrawTriggerBoxes(false);
+    _renderer.SetDebugLines({});
+    _renderer.SetDrawDebugLines(false);
     _requestedWorkspaceClose = false;
 }
 
@@ -992,6 +1648,9 @@ void CharmyBee::RenderSceneView()
     if (_scenePanel)
         _scenePanel->OnImGuiRender();
 
+    if (ImGui::Checkbox("Draw killzones", &_drawTriggerBoxes))
+        UpdateTriggerPhantomBoxes();
+
     if (_debugKeyInput)
         PollGlfwKeyInput();
 
@@ -1007,8 +1666,11 @@ void CharmyBee::RenderSceneView()
                                         ImGui::GetColorU32(ImGuiCol_TextDisabled),
                                         "Scene rendering placeholder");
 
-    if (_navigationTool)
-        _navigationTool->OnRender();
+    if (_drawNavigation && !_sifNavigation)
+    {
+        if (_navigationTool)
+            _navigationTool->OnRender();
+    }
 
     // Orbit controls (right-drag rotate, scroll zoom) when hovering scene.
     ImGuiIO& io = ImGui::GetIO();
@@ -1250,6 +1912,63 @@ void CharmyBee::RenderSifViewer()
                             ExportForestObj(*result, "track.Forest");
                     }
                 }
+                else if (chunk.TypeValue == MakeTypeCode('T', 'R', 'A', 'K'))
+                {
+                    if (ImGui::Button("Show Navigation"))
+                    {
+                        _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                        LoadNavigationResources();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Draw", &_drawNavigation))
+                        UpdateDebugLines();
+                    if (_sifNavigationTool)
+                    {
+                        ImGui::SameLine();
+                        if (ImGui::Checkbox("Waypoints", &_drawNavigationWaypoints))
+                            UpdateDebugLines();
+                        if (_drawNavigationWaypoints)
+                        {
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(80.0f);
+                            if (ImGui::DragFloat("Size", &_navigationWaypointBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
+                                UpdateDebugLines();
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Navigation hierarchy"))
+                        _showNavigationHierarchyWindow = true;
+                }
+                else if (chunk.TypeValue == MakeTypeCode('L', 'O', 'G', 'C'))
+                {
+                    if (ImGui::Button("Show Logic"))
+                    {
+                        _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                        LoadLogicResources();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Draw", &_drawLogic))
+                    {
+                        UpdateDebugLines();
+                        UpdateForestMeshRendering();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Triggers", &_drawLogicTriggers))
+                        UpdateDebugLines();
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Locators", &_drawLogicLocators))
+                    {
+                        UpdateDebugLines();
+                        UpdateForestMeshRendering();
+                    }
+                    if (_drawLogicLocators)
+                    {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(80.0f);
+                        if (ImGui::DragFloat("Size", &_logicLocatorBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
+                            UpdateDebugLines();
+                    }
+                }
                 else
                 {
                     ImGui::TextDisabled("No visualizer for this chunk yet.");
@@ -1306,6 +2025,30 @@ void CharmyBee::RenderSifViewer()
                         UpdateForestBoxRenderer();
                         UpdateForestMeshRendering();
                     }
+                }
+            }
+            ImGui::End();
+        }
+
+        if (_showNavigationHierarchyWindow)
+        {
+            ImGui::SetNextWindowSize(ImVec2(320.0f, 400.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Navigation Hierarchy", &_showNavigationHierarchyWindow))
+            {
+                if (_sifNavigation == nullptr || _sifNavigation->RacingLines.empty())
+                {
+                    ImGui::Text("No navigation data loaded yet.");
+                }
+                else
+                {
+                    bool changed = false;
+                    for (auto& entry : _navigationLineEntries)
+                    {
+                        if (ImGui::Checkbox(entry.Name.c_str(), &entry.Visible))
+                            changed = true;
+                    }
+                    if (changed)
+                        UpdateNavigationLineVisibility();
                 }
             }
             ImGui::End();
@@ -1375,6 +2118,18 @@ void CharmyBee::OpenSifFile()
             _renderer.SetDrawForestMeshes(false);
             _drawForestMeshes = false;
             _forestLibrary.reset();
+            _sifNavigation.reset();
+            _sifNavigationTool.reset();
+            _navigationLineEntries.clear();
+            _showNavigationHierarchyWindow = false;
+            _drawNavigation = false;
+            _sifLogic.reset();
+            _drawLogic = false;
+            _itemsForestLibrary.reset();
+            _itemsForestMeshesByForestTree.clear();
+            _itemsForestMeshesByTreeHash.clear();
+            _logicLocatorMeshes.clear();
+            _logicLocatorHasMesh.clear();
 
             try
             {
@@ -1682,6 +2437,10 @@ void CharmyBee::LoadForestResources()
     };
 
     auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
+        auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        s.X = clamp(s.X);
+        s.Y = clamp(s.Y);
+        s.Z = clamp(s.Z);
         SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
         SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
         SlLib::Math::Matrix4x4 scale{};
@@ -1767,12 +2526,15 @@ void CharmyBee::LoadForestResources()
             };
 
             auto appendMesh = [&](std::shared_ptr<SeEditor::Forest::SuRenderMesh> const& mesh,
-                                  SlLib::Math::Matrix4x4 const& worldMatrix) {
+                                  SlLib::Math::Matrix4x4 const& worldMatrix,
+                                  int branchIndex,
+                                  int lodIndex) {
                 if (!mesh)
                     return;
 
-                for (auto const& primitive : mesh->Primitives)
+                for (std::size_t primIndex = 0; primIndex < mesh->Primitives.size(); ++primIndex)
                 {
+                    auto const& primitive = mesh->Primitives[primIndex];
                     if (!primitive || !primitive->VertexStream)
                         continue;
 
@@ -2048,10 +2810,28 @@ void CharmyBee::LoadForestResources()
                         if (droppable > 0)
                         {
                             std::cerr << "[Forest] Dropped " << droppable << " indices that referenced "
-                                      << vertexLimit << " vertices.\n";
+                                      << vertexLimit << " vertices. "
+                                      << "forest=" << forestIdx
+                                      << " name=" << forestEntry.Name
+                                      << " tree=" << treeIdx
+                                      << " treeHash=" << tree->Hash
+                                      << " branch=" << branchIndex
+                                      << " lod=" << lodIndex
+                                      << " prim=" << primIndex
+                                      << '\n';
                         }
                         if (restart > 0)
-                            std::cerr << "[Forest] Skipped " << restart << " primitive-restart indices.\n";
+                        {
+                            std::cerr << "[Forest] Skipped " << restart << " primitive-restart indices. "
+                                      << "forest=" << forestIdx
+                                      << " name=" << forestEntry.Name
+                                      << " tree=" << treeIdx
+                                      << " treeHash=" << tree->Hash
+                                      << " branch=" << branchIndex
+                                      << " lod=" << lodIndex
+                                      << " prim=" << primIndex
+                                      << '\n';
+                        }
                         if (debugDroppedLogged < 5 && primitive->VertexStream)
                         {
                             ++debugDroppedLogged;
@@ -2068,6 +2848,13 @@ void CharmyBee::LoadForestResources()
                                       << " streamBias=" << primitive->VertexStream->StreamBias
                                       << " endian=" << (isBigEndian ? "BE" : "LE")
                                       << " primType=" << primitiveType
+                                      << " forest=" << forestIdx
+                                      << " name=" << forestEntry.Name
+                                      << " tree=" << treeIdx
+                                      << " treeHash=" << tree->Hash
+                                      << " branch=" << branchIndex
+                                      << " lod=" << lodIndex
+                                      << " prim=" << primIndex
                                       << '\n';
                         }
                     }
@@ -2089,13 +2876,14 @@ void CharmyBee::LoadForestResources()
                     continue;
 
                 if (branch->Mesh)
-                    appendMesh(branch->Mesh, worldMatrix);
+                    appendMesh(branch->Mesh, worldMatrix, static_cast<int>(i), -1);
                 if (branch->Lod)
                 {
-                    for (auto const& threshold : branch->Lod->Thresholds)
+                    for (std::size_t lodIdx = 0; lodIdx < branch->Lod->Thresholds.size(); ++lodIdx)
                     {
+                        auto const& threshold = branch->Lod->Thresholds[lodIdx];
                         if (threshold && threshold->Mesh)
-                            appendMesh(threshold->Mesh, worldMatrix);
+                            appendMesh(threshold->Mesh, worldMatrix, static_cast<int>(i), static_cast<int>(lodIdx));
                     }
                 }
             }
@@ -2145,8 +2933,591 @@ void CharmyBee::LoadForestResources()
     }
 
     _forestBoxLayers = std::move(layers);
+    LoadForestVisibility();
     UpdateForestBoxRenderer();
     UpdateForestMeshRendering();
+}
+
+void CharmyBee::LoadNavigationResources()
+{
+    if (_sifChunks.empty())
+    {
+        ReportSifError("No SIF chunks loaded.");
+        return;
+    }
+
+    NavigationProbeInfo probe{};
+    auto navigation = std::make_unique<SlLib::SumoTool::Siff::Navigation>();
+    std::string error;
+    if (!LoadNavigationFromSifChunks(_sifChunks, *navigation, probe, error))
+    {
+        ReportSifError(error);
+        return;
+    }
+
+    std::cout << "[Navigation] base=0x" << std::hex << probe.BaseOffset
+              << " version=" << std::dec << probe.Version
+              << " score=" << probe.Score
+              << " waypoints=" << probe.NumWaypoints
+              << " racingLines=" << probe.NumRacingLines
+              << std::endl;
+
+    _sifNavigation = std::move(navigation);
+    _sifNavigationTool = std::make_unique<Editor::Tools::NavigationTool>(_sifNavigation.get());
+
+    _navigationLineEntries.clear();
+    if (_sifNavigation)
+    {
+        for (std::size_t i = 0; i < _sifNavigation->RacingLines.size(); ++i)
+        {
+            std::string label = "Racing Line " + std::to_string(i);
+            auto const& line = _sifNavigation->RacingLines[i];
+            if (line)
+                label += " (" + std::to_string(line->Segments.size()) + " segments)";
+            _navigationLineEntries.push_back({static_cast<int>(i), std::move(label), true});
+        }
+    }
+
+    UpdateNavigationLineVisibility();
+    _drawNavigation = true;
+    UpdateDebugLines();
+
+    if (_sifNavigation)
+    {
+        bool hasPoint = false;
+        SlLib::Math::Vector3 min{};
+        SlLib::Math::Vector3 max{};
+        auto include = [&](SlLib::Math::Vector3 const& p) {
+            if (!hasPoint)
+            {
+                min = max = p;
+                hasPoint = true;
+                return;
+            }
+            min.X = std::min(min.X, p.X);
+            min.Y = std::min(min.Y, p.Y);
+            min.Z = std::min(min.Z, p.Z);
+            max.X = std::max(max.X, p.X);
+            max.Y = std::max(max.Y, p.Y);
+            max.Z = std::max(max.Z, p.Z);
+        };
+
+        for (auto const& wp : _sifNavigation->Waypoints)
+        {
+            if (wp)
+                include(wp->Pos);
+        }
+
+        if (!hasPoint)
+        {
+            for (auto const& line : _sifNavigation->RacingLines)
+            {
+                if (!line)
+                    continue;
+                for (auto const& seg : line->Segments)
+                {
+                    if (seg)
+                        include(seg->RacingLine);
+                }
+            }
+        }
+
+        if (hasPoint)
+        {
+            std::cout << "[Navigation] bounds min=(" << min.X << ", " << min.Y << ", " << min.Z
+                      << ") max=(" << max.X << ", " << max.Y << ", " << max.Z << ")\n";
+        }
+    }
+}
+
+void CharmyBee::UpdateNavigationLineVisibility()
+{
+    if (_sifNavigationTool == nullptr || _sifNavigation == nullptr)
+        return;
+
+    std::vector<std::uint8_t> visibility(_sifNavigation->RacingLines.size(), 1);
+    for (auto const& entry : _navigationLineEntries)
+    {
+        if (entry.LineIndex < 0 || static_cast<std::size_t>(entry.LineIndex) >= visibility.size())
+            continue;
+        visibility[static_cast<std::size_t>(entry.LineIndex)] = entry.Visible ? 1 : 0;
+    }
+
+    _sifNavigationTool->SetRacingLineVisibility(std::move(visibility));
+}
+
+void CharmyBee::UpdateNavigationDebugLines()
+{
+    std::vector<Renderer::SlRenderer::DebugLine> lines;
+    if (_drawNavigationWaypoints)
+    {
+        float half = std::max(0.1f, _navigationWaypointBoxSize * 0.5f);
+        const SlLib::Math::Vector3 color{1.0f, 0.0f, 0.0f};
+        for (auto const& waypoint : _sifNavigation->Waypoints)
+        {
+            if (!waypoint)
+                continue;
+            SlLib::Math::Vector3 c = waypoint->Pos;
+            SlLib::Math::Vector3 v0{c.X - half, c.Y - half, c.Z - half};
+            SlLib::Math::Vector3 v1{c.X + half, c.Y - half, c.Z - half};
+            SlLib::Math::Vector3 v2{c.X + half, c.Y + half, c.Z - half};
+            SlLib::Math::Vector3 v3{c.X - half, c.Y + half, c.Z - half};
+            SlLib::Math::Vector3 v4{c.X - half, c.Y - half, c.Z + half};
+            SlLib::Math::Vector3 v5{c.X + half, c.Y - half, c.Z + half};
+            SlLib::Math::Vector3 v6{c.X + half, c.Y + half, c.Z + half};
+            SlLib::Math::Vector3 v7{c.X - half, c.Y + half, c.Z + half};
+
+            auto add = [&](SlLib::Math::Vector3 const& a, SlLib::Math::Vector3 const& b) {
+                lines.push_back({a, b, color});
+            };
+
+            add(v0, v1); add(v1, v2); add(v2, v3); add(v3, v0);
+            add(v4, v5); add(v5, v6); add(v6, v7); add(v7, v4);
+            add(v0, v4); add(v1, v5); add(v2, v6); add(v3, v7);
+        }
+    }
+
+    _renderer.SetDebugLines(std::move(lines));
+    _renderer.SetDrawDebugLines(true);
+}
+
+void CharmyBee::LoadLogicResources()
+{
+    if (_sifChunks.empty())
+    {
+        ReportSifError("No SIF chunks loaded.");
+        return;
+    }
+
+    auto logic = std::make_unique<SlLib::SumoTool::Siff::LogicData>();
+    LogicProbeInfo probe{};
+    std::string error;
+    if (!LoadLogicFromSifChunks(_sifChunks, *logic, probe, error))
+    {
+        ReportSifError(error);
+        return;
+    }
+
+    std::cout << "[Logic] base=0x" << std::hex << probe.BaseOffset
+              << " version=" << std::dec << probe.Version
+              << " triggers=" << probe.NumTriggers
+              << " locators=" << probe.NumLocators
+              << std::endl;
+
+    _sifLogic = std::move(logic);
+    _drawLogic = true;
+    LoadItemsForestResources();
+    BuildLogicLocatorMeshes();
+    UpdateForestMeshRendering();
+    UpdateDebugLines();
+}
+
+void CharmyBee::LoadItemsForestResources()
+{
+    _itemsForestLibrary.reset();
+    _itemsForestMeshesByForestTree.clear();
+    _itemsForestMeshesByTreeHash.clear();
+
+    std::span<const std::uint8_t> gpuData;
+    if (!_sifGpuRaw.empty())
+        gpuData = std::span<const std::uint8_t>(_sifGpuRaw.data(), _sifGpuRaw.size());
+
+    bool loadedFromSif = false;
+    std::size_t forestChunkCount = 0;
+    for (auto const& chunk : _sifChunks)
+    {
+        if (chunk.TypeValue != MakeTypeCode('F', 'O', 'R', 'E'))
+            continue;
+        ++forestChunkCount;
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        std::string error;
+        if (!TryLoadForestLibraryFromChunk(chunk, gpuData, library, error))
+        {
+            std::cerr << "[Logic] Failed to load Forest chunk: " << error << '\n';
+            continue;
+        }
+
+        std::unordered_map<std::uint64_t, std::shared_ptr<ForestMeshList>> byForestTree;
+        std::unordered_map<int, std::shared_ptr<ForestMeshList>> byTreeHash;
+        BuildForestTreeMeshMaps(*library, chunk.BigEndian, byForestTree, byTreeHash);
+
+        for (auto& [key, value] : byForestTree)
+        {
+            if (_itemsForestMeshesByForestTree.find(key) == _itemsForestMeshesByForestTree.end())
+                _itemsForestMeshesByForestTree.emplace(key, value);
+        }
+        for (auto& [key, value] : byTreeHash)
+        {
+            if (_itemsForestMeshesByTreeHash.find(key) == _itemsForestMeshesByTreeHash.end())
+                _itemsForestMeshesByTreeHash.emplace(key, value);
+        }
+
+        if (!_itemsForestLibrary)
+            _itemsForestLibrary = library;
+        loadedFromSif = true;
+    }
+
+    if (loadedFromSif)
+    {
+        std::cout << "[Logic] Loaded " << forestChunkCount << " Forest chunk(s) from SIF. "
+                  << "Tree meshes=" << _itemsForestMeshesByTreeHash.size() << std::endl;
+        return;
+    }
+
+    if (_sifFilePath.empty())
+        return;
+
+    std::filesystem::path basePath = std::filesystem::path(_sifFilePath).parent_path();
+    std::vector<std::filesystem::path> candidates = {
+        basePath / "items.Forest",
+        basePath / "items.forest",
+        std::filesystem::current_path() / "items.Forest",
+        std::filesystem::current_path() / "items.forest",
+    };
+
+    std::filesystem::path itemsPath;
+    for (auto const& candidate : candidates)
+    {
+        if (std::filesystem::exists(candidate))
+        {
+            itemsPath = candidate;
+            break;
+        }
+    }
+
+    if (itemsPath.empty())
+        return;
+
+    std::ifstream input(itemsPath, std::ios::binary);
+    if (!input)
+    {
+        std::cerr << "[Logic] Unable to open items.Forest at " << itemsPath << '\n';
+        return;
+    }
+
+    std::vector<char> buffer((std::istreambuf_iterator<char>(input)), {});
+    if (buffer.empty())
+    {
+        std::cerr << "[Logic] items.Forest was empty.\n";
+        return;
+    }
+
+    std::vector<std::uint8_t> rawData(buffer.begin(), buffer.end());
+    std::vector<std::uint8_t> cpuData;
+    std::vector<std::uint32_t> relocationOffsets;
+    std::vector<std::uint8_t> forestGpuData;
+    bool bigEndian = false;
+    if (!TryParseForestArchive(std::span<const std::uint8_t>(rawData.data(), rawData.size()),
+                               cpuData,
+                               relocationOffsets,
+                               forestGpuData,
+                               bigEndian))
+    {
+        cpuData = std::move(rawData);
+        relocationOffsets.clear();
+        forestGpuData.clear();
+        bigEndian = false;
+    }
+
+    std::vector<SlLib::Resources::Database::SlResourceRelocation> relocations;
+    relocations.reserve(relocationOffsets.size());
+    for (auto offset : relocationOffsets)
+        relocations.push_back({static_cast<int>(offset), 0});
+
+    SlLib::Serialization::ResourceLoadContext context(
+        cpuData.empty() ? std::span<const std::uint8_t>() : std::span<const std::uint8_t>(cpuData.data(), cpuData.size()),
+        forestGpuData.empty() ? std::span<const std::uint8_t>()
+                              : std::span<const std::uint8_t>(forestGpuData.data(), forestGpuData.size()),
+        std::move(relocations));
+    static SlLib::Resources::Database::SlPlatform s_win32("win32", false, false, 0);
+    static SlLib::Resources::Database::SlPlatform s_xbox360("x360", true, false, 0);
+    context.Platform = bigEndian ? &s_xbox360 : &s_win32;
+
+    auto library = std::make_shared<SeEditor::Forest::ForestLibrary>();
+    try
+    {
+        library->Load(context);
+    }
+    catch (std::exception const& ex)
+    {
+        std::cerr << "[Logic] Failed to load items.Forest: " << ex.what() << '\n';
+        return;
+    }
+
+    BuildForestTreeMeshMaps(*library, bigEndian, _itemsForestMeshesByForestTree, _itemsForestMeshesByTreeHash);
+    _itemsForestLibrary = std::move(library);
+    std::cout << "[Logic] Loaded items.Forest tree meshes: " << _itemsForestMeshesByTreeHash.size() << std::endl;
+}
+
+void CharmyBee::BuildLogicLocatorMeshes()
+{
+    _logicLocatorMeshes.clear();
+    _logicLocatorHasMesh.clear();
+
+    if (_sifLogic == nullptr || _sifLogic->Locators.empty())
+        return;
+
+    _logicLocatorHasMesh.resize(_sifLogic->Locators.size(), false);
+    if (_itemsForestMeshesByForestTree.empty() && _itemsForestMeshesByTreeHash.empty())
+        return;
+
+    auto findMeshList = [&](SlLib::SumoTool::Siff::Logic::Locator const& locator)
+        -> std::shared_ptr<ForestMeshList> {
+        auto tryTreeHash = [&](int treeHash) -> std::shared_ptr<ForestMeshList> {
+            if (treeHash == 0)
+                return nullptr;
+            auto treeIt = _itemsForestMeshesByTreeHash.find(treeHash);
+            if (treeIt != _itemsForestMeshesByTreeHash.end())
+                return treeIt->second;
+            return nullptr;
+        };
+
+        if (locator.MeshForestNameHash != 0 && locator.MeshTreeNameHash != 0)
+        {
+            auto key = MakeForestTreeKey(locator.MeshForestNameHash, locator.MeshTreeNameHash);
+            auto it = _itemsForestMeshesByForestTree.find(key);
+            if (it != _itemsForestMeshesByForestTree.end())
+                return it->second;
+        }
+
+        if (auto mesh = tryTreeHash(locator.MeshTreeNameHash))
+            return mesh;
+        if (auto mesh = tryTreeHash(locator.SetupObjectNameHash))
+            return mesh;
+        if (auto mesh = tryTreeHash(locator.MeshForestNameHash))
+            return mesh;
+
+        return nullptr;
+    };
+
+    std::size_t matched = 0;
+    for (std::size_t i = 0; i < _sifLogic->Locators.size(); ++i)
+    {
+        auto const& locator = _sifLogic->Locators[i];
+        auto meshList = findMeshList(*locator);
+        if (!meshList)
+            continue;
+
+        _logicLocatorHasMesh[i] = true;
+        ++matched;
+
+        SlLib::Math::Quaternion q{locator->RotationAsFloats.X,
+                                  locator->RotationAsFloats.Y,
+                                  locator->RotationAsFloats.Z,
+                                  locator->RotationAsFloats.W};
+        float qLen = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+        if (qLen > 0.0f)
+        {
+            float inv = 1.0f / qLen;
+            q = q * inv;
+        }
+        else
+        {
+            q = {0.0f, 0.0f, 0.0f, 1.0f};
+        }
+
+        SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
+        SlLib::Math::Matrix4x4 world = rot;
+        world(0, 3) = locator->PositionAsFloats.X;
+        world(1, 3) = locator->PositionAsFloats.Y;
+        world(2, 3) = locator->PositionAsFloats.Z;
+        world(3, 3) = 1.0f;
+
+        for (auto const& mesh : *meshList)
+        {
+            Renderer::SlRenderer::ForestCpuMesh transformed = mesh;
+            for (std::size_t v = 0; v + 7 < transformed.Vertices.size(); v += 8)
+            {
+                SlLib::Math::Vector4 pos{
+                    transformed.Vertices[v + 0],
+                    transformed.Vertices[v + 1],
+                    transformed.Vertices[v + 2],
+                    1.0f};
+                SlLib::Math::Vector4 nrm{
+                    transformed.Vertices[v + 3],
+                    transformed.Vertices[v + 4],
+                    transformed.Vertices[v + 5],
+                    0.0f};
+
+                auto p = SlLib::Math::Transform(world, pos);
+                auto n = SlLib::Math::Transform(rot, nrm);
+                auto n3 = SlLib::Math::normalize({n.X, n.Y, n.Z});
+
+                transformed.Vertices[v + 0] = p.X;
+                transformed.Vertices[v + 1] = p.Y;
+                transformed.Vertices[v + 2] = p.Z;
+                transformed.Vertices[v + 3] = n3.X;
+                transformed.Vertices[v + 4] = n3.Y;
+                transformed.Vertices[v + 5] = n3.Z;
+            }
+
+            _logicLocatorMeshes.push_back(std::move(transformed));
+        }
+    }
+
+    std::cout << "[Logic] Locator meshes resolved: " << matched << " / " << _sifLogic->Locators.size()
+              << " (trees=" << _itemsForestMeshesByTreeHash.size()
+              << " forestTrees=" << _itemsForestMeshesByForestTree.size() << ")\n";
+}
+
+void CharmyBee::UpdateLogicDebugLines()
+{
+    std::vector<Renderer::SlRenderer::DebugLine> lines;
+    if (_sifLogic == nullptr)
+        return;
+
+    if (_drawLogicTriggers)
+    {
+        const SlLib::Math::Vector3 color{0.2f, 0.9f, 0.9f};
+        for (auto const& trigger : _sifLogic->Triggers)
+        {
+            if (!trigger)
+                continue;
+            auto v0 = SlLib::Math::Vector3{trigger->Vertex0.X, trigger->Vertex0.Y, trigger->Vertex0.Z};
+            auto v1 = SlLib::Math::Vector3{trigger->Vertex1.X, trigger->Vertex1.Y, trigger->Vertex1.Z};
+            auto v2 = SlLib::Math::Vector3{trigger->Vertex2.X, trigger->Vertex2.Y, trigger->Vertex2.Z};
+            auto v3 = SlLib::Math::Vector3{trigger->Vertex3.X, trigger->Vertex3.Y, trigger->Vertex3.Z};
+            lines.push_back(Renderer::SlRenderer::DebugLine{v0, v1, color});
+            lines.push_back(Renderer::SlRenderer::DebugLine{v1, v2, color});
+            lines.push_back(Renderer::SlRenderer::DebugLine{v2, v3, color});
+            lines.push_back(Renderer::SlRenderer::DebugLine{v3, v0, color});
+        }
+    }
+
+    if (_drawLogicLocators)
+    {
+        float half = std::max(0.1f, _logicLocatorBoxSize * 0.5f);
+        const SlLib::Math::Vector3 color{0.9f, 0.5f, 0.1f};
+        for (std::size_t i = 0; i < _sifLogic->Locators.size(); ++i)
+        {
+            auto const& locator = _sifLogic->Locators[i];
+            if (!locator)
+                continue;
+            if (i < _logicLocatorHasMesh.size() && _logicLocatorHasMesh[i])
+                continue;
+            SlLib::Math::Vector3 c{locator->PositionAsFloats.X,
+                                   locator->PositionAsFloats.Y,
+                                   locator->PositionAsFloats.Z};
+            SlLib::Math::Vector3 v0{c.X - half, c.Y - half, c.Z - half};
+            SlLib::Math::Vector3 v1{c.X + half, c.Y - half, c.Z - half};
+            SlLib::Math::Vector3 v2{c.X + half, c.Y + half, c.Z - half};
+            SlLib::Math::Vector3 v3{c.X - half, c.Y + half, c.Z - half};
+            SlLib::Math::Vector3 v4{c.X - half, c.Y - half, c.Z + half};
+            SlLib::Math::Vector3 v5{c.X + half, c.Y - half, c.Z + half};
+            SlLib::Math::Vector3 v6{c.X + half, c.Y + half, c.Z + half};
+            SlLib::Math::Vector3 v7{c.X - half, c.Y + half, c.Z + half};
+
+            auto add = [&](SlLib::Math::Vector3 const& a, SlLib::Math::Vector3 const& b) {
+                lines.push_back(Renderer::SlRenderer::DebugLine{a, b, color});
+            };
+
+            add(v0, v1); add(v1, v2); add(v2, v3); add(v3, v0);
+            add(v4, v5); add(v5, v6); add(v6, v7); add(v7, v4);
+            add(v0, v4); add(v1, v5); add(v2, v6); add(v3, v7);
+        }
+    }
+
+    if (!lines.empty())
+        _renderer.SetDrawDebugLines(true);
+
+    _renderer.SetDebugLines(std::move(lines));
+}
+
+void CharmyBee::UpdateDebugLines()
+{
+    std::vector<Renderer::SlRenderer::DebugLine> combined;
+
+    if (_drawNavigation && _sifNavigation)
+    {
+        std::vector<Renderer::SlRenderer::DebugLine> navLines;
+        if (_drawNavigationWaypoints)
+        {
+            float half = std::max(0.1f, _navigationWaypointBoxSize * 0.5f);
+            const SlLib::Math::Vector3 color{1.0f, 0.0f, 0.0f};
+            for (auto const& waypoint : _sifNavigation->Waypoints)
+            {
+                if (!waypoint)
+                    continue;
+                SlLib::Math::Vector3 c = waypoint->Pos;
+                SlLib::Math::Vector3 v0{c.X - half, c.Y - half, c.Z - half};
+                SlLib::Math::Vector3 v1{c.X + half, c.Y - half, c.Z - half};
+                SlLib::Math::Vector3 v2{c.X + half, c.Y + half, c.Z - half};
+                SlLib::Math::Vector3 v3{c.X - half, c.Y + half, c.Z - half};
+                SlLib::Math::Vector3 v4{c.X - half, c.Y - half, c.Z + half};
+                SlLib::Math::Vector3 v5{c.X + half, c.Y - half, c.Z + half};
+                SlLib::Math::Vector3 v6{c.X + half, c.Y + half, c.Z + half};
+                SlLib::Math::Vector3 v7{c.X - half, c.Y + half, c.Z + half};
+
+                auto add = [&](SlLib::Math::Vector3 const& a, SlLib::Math::Vector3 const& b) {
+                    navLines.push_back(Renderer::SlRenderer::DebugLine{a, b, color});
+                };
+
+                add(v0, v1); add(v1, v2); add(v2, v3); add(v3, v0);
+                add(v4, v5); add(v5, v6); add(v6, v7); add(v7, v4);
+                add(v0, v4); add(v1, v5); add(v2, v6); add(v3, v7);
+            }
+        }
+
+        combined.insert(combined.end(), navLines.begin(), navLines.end());
+    }
+
+    if (_drawLogic && _sifLogic)
+    {
+        std::vector<Renderer::SlRenderer::DebugLine> logicLines;
+        if (_drawLogicTriggers)
+        {
+            const SlLib::Math::Vector3 color{0.2f, 0.9f, 0.9f};
+            for (auto const& trigger : _sifLogic->Triggers)
+            {
+                if (!trigger)
+                    continue;
+                auto v0 = SlLib::Math::Vector3{trigger->Vertex0.X, trigger->Vertex0.Y, trigger->Vertex0.Z};
+                auto v1 = SlLib::Math::Vector3{trigger->Vertex1.X, trigger->Vertex1.Y, trigger->Vertex1.Z};
+                auto v2 = SlLib::Math::Vector3{trigger->Vertex2.X, trigger->Vertex2.Y, trigger->Vertex2.Z};
+                auto v3 = SlLib::Math::Vector3{trigger->Vertex3.X, trigger->Vertex3.Y, trigger->Vertex3.Z};
+                logicLines.push_back(Renderer::SlRenderer::DebugLine{v0, v1, color});
+                logicLines.push_back(Renderer::SlRenderer::DebugLine{v1, v2, color});
+                logicLines.push_back(Renderer::SlRenderer::DebugLine{v2, v3, color});
+                logicLines.push_back(Renderer::SlRenderer::DebugLine{v3, v0, color});
+            }
+        }
+
+        if (_drawLogicLocators)
+        {
+            float half = std::max(0.1f, _logicLocatorBoxSize * 0.5f);
+            const SlLib::Math::Vector3 color{0.9f, 0.5f, 0.1f};
+            for (auto const& locator : _sifLogic->Locators)
+            {
+                if (!locator)
+                    continue;
+                SlLib::Math::Vector3 c{locator->PositionAsFloats.X,
+                                       locator->PositionAsFloats.Y,
+                                       locator->PositionAsFloats.Z};
+                SlLib::Math::Vector3 v0{c.X - half, c.Y - half, c.Z - half};
+                SlLib::Math::Vector3 v1{c.X + half, c.Y - half, c.Z - half};
+                SlLib::Math::Vector3 v2{c.X + half, c.Y + half, c.Z - half};
+                SlLib::Math::Vector3 v3{c.X - half, c.Y + half, c.Z - half};
+                SlLib::Math::Vector3 v4{c.X - half, c.Y - half, c.Z + half};
+                SlLib::Math::Vector3 v5{c.X + half, c.Y - half, c.Z + half};
+                SlLib::Math::Vector3 v6{c.X + half, c.Y + half, c.Z + half};
+                SlLib::Math::Vector3 v7{c.X - half, c.Y + half, c.Z + half};
+
+                auto add = [&](SlLib::Math::Vector3 const& a, SlLib::Math::Vector3 const& b) {
+                    logicLines.push_back(Renderer::SlRenderer::DebugLine{a, b, color});
+                };
+
+                add(v0, v1); add(v1, v2); add(v2, v3); add(v3, v0);
+                add(v4, v5); add(v5, v6); add(v6, v7); add(v7, v4);
+                add(v0, v4); add(v1, v5); add(v2, v6); add(v3, v7);
+            }
+        }
+
+        combined.insert(combined.end(), logicLines.begin(), logicLines.end());
+    }
+
+    _renderer.SetDebugLines(std::move(combined));
+    _renderer.SetDrawDebugLines(_drawNavigation || _drawLogic);
 }
 
 void CharmyBee::RebuildForestBoxHierarchy()
@@ -2174,40 +3545,108 @@ void CharmyBee::UpdateForestBoxRenderer()
     _renderer.SetDrawForestBoxes(_drawForestBoxes);
 }
 
-void CharmyBee::UpdateForestMeshRendering()
+void CharmyBee::UpdateTriggerPhantomBoxes()
 {
-    if (_allForestMeshes.empty())
+    std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> boxes;
+    if (_database == nullptr)
     {
-        _renderer.SetForestMeshes({});
-        _renderer.SetDrawForestMeshes(false);
+        _renderer.SetTriggerBoxes({});
+        _renderer.SetDrawTriggerBoxes(false);
         return;
     }
 
-    std::vector<Renderer::SlRenderer::ForestCpuMesh> filtered;
-    filtered.reserve(_allForestMeshes.size());
+    using SlLib::Resources::Scene::SeDefinitionNode;
+    using SlLib::Resources::Scene::TriggerPhantomDefinitionNode;
 
-    auto gatherMeshes = [&](auto&& self, ForestBoxLayer const& layer) -> void {
-        if (!layer.Visible)
-            return;
-
-        if (layer.MeshCount > 0 && layer.MeshStartIndex < _allForestMeshes.size())
-        {
-            std::size_t end = std::min(layer.MeshStartIndex + layer.MeshCount, _allForestMeshes.size());
-            filtered.insert(filtered.end(),
-                            _allForestMeshes.begin() + layer.MeshStartIndex,
-                            _allForestMeshes.begin() + end);
-        }
-
-        for (auto const& child : layer.Children)
-            self(self, child);
+    auto addBox = [&](SlLib::Math::Vector3 const& center, SlLib::Math::Vector3 const& scale) {
+        SlLib::Math::Vector3 half{scale.X * 0.5f, scale.Y * 0.5f, scale.Z * 0.5f};
+        SlLib::Math::Vector3 min{center.X - half.X, center.Y - half.Y, center.Z - half.Z};
+        SlLib::Math::Vector3 max{center.X + half.X, center.Y + half.Y, center.Z + half.Z};
+        boxes.emplace_back(min, max);
     };
 
-    for (auto const& layer : _forestBoxLayers)
-        gatherMeshes(gatherMeshes, layer);
+    std::function<void(SeDefinitionNode*)> walk;
+    walk = [&](SeDefinitionNode* node) {
+        if (node == nullptr)
+            return;
 
-    bool hasVisible = !filtered.empty();
-    _renderer.SetForestMeshes(std::move(filtered));
-    _renderer.SetDrawForestMeshes(_drawForestMeshes && hasVisible);
+        if (auto* phantom = dynamic_cast<TriggerPhantomDefinitionNode*>(node))
+        {
+            float sx = phantom->WidthRadius;
+            float sy = phantom->Height;
+            float sz = phantom->Depth;
+
+            // Normalize missing sizes.
+            if (sx <= 0.0f && (sy > 0.0f || sz > 0.0f))
+                sx = std::max(sy, sz);
+            if (sy <= 0.0f)
+                sy = sx;
+            if (sz <= 0.0f)
+                sz = sx;
+
+            SlLib::Math::Vector3 scale{sx, sy, sz};
+            addBox(phantom->Translation, scale);
+        }
+
+        for (auto* child = node->FirstChild; child != nullptr; child = child->NextSibling)
+        {
+            if (auto* def = dynamic_cast<SeDefinitionNode*>(child))
+                walk(def);
+        }
+    };
+
+    for (auto* root : _database->RootDefinitions)
+        walk(root);
+
+    _renderer.SetTriggerBoxes(std::move(boxes));
+    _renderer.SetDrawTriggerBoxes(_drawTriggerBoxes);
+}
+
+void CharmyBee::UpdateForestMeshRendering()
+{
+    std::vector<Renderer::SlRenderer::ForestCpuMesh> combined;
+
+    if (_drawForestMeshes && !_allForestMeshes.empty())
+    {
+        std::vector<Renderer::SlRenderer::ForestCpuMesh> filtered;
+        filtered.reserve(_allForestMeshes.size());
+
+        auto gatherMeshes = [&](auto&& self, ForestBoxLayer const& layer) -> void {
+            if (!layer.Visible)
+                return;
+
+            if (layer.MeshCount > 0 && layer.MeshStartIndex < _allForestMeshes.size())
+            {
+                std::size_t end = std::min(layer.MeshStartIndex + layer.MeshCount, _allForestMeshes.size());
+                filtered.insert(filtered.end(),
+                                _allForestMeshes.begin() + layer.MeshStartIndex,
+                                _allForestMeshes.begin() + end);
+            }
+
+            for (auto const& child : layer.Children)
+                self(self, child);
+        };
+
+        for (auto const& layer : _forestBoxLayers)
+            gatherMeshes(gatherMeshes, layer);
+
+        if (!filtered.empty())
+        {
+            combined.reserve(filtered.size() + _logicLocatorMeshes.size());
+            combined.insert(combined.end(), filtered.begin(), filtered.end());
+        }
+    }
+
+    if (_drawLogic && _drawLogicLocators && !_logicLocatorMeshes.empty())
+    {
+        if (combined.empty())
+            combined.reserve(_logicLocatorMeshes.size());
+        combined.insert(combined.end(), _logicLocatorMeshes.begin(), _logicLocatorMeshes.end());
+    }
+
+    bool hasVisible = !combined.empty();
+    _renderer.SetForestMeshes(std::move(combined));
+    _renderer.SetDrawForestMeshes(hasVisible);
 }
 
 bool CharmyBee::RenderForestBoxLayer(ForestBoxLayer& layer)
@@ -2219,6 +3658,7 @@ bool CharmyBee::RenderForestBoxLayer(ForestBoxLayer& layer)
     {
         for (auto& child : layer.Children)
             SetForestLayerVisibilityRecursive(child, layer.Visible);
+        SaveForestVisibility();
     }
     if (!layer.Children.empty())
     {
@@ -2235,6 +3675,79 @@ void CharmyBee::SetForestLayerVisibilityRecursive(ForestBoxLayer& layer, bool vi
     layer.Visible = visible;
     for (auto& child : layer.Children)
         SetForestLayerVisibilityRecursive(child, visible);
+}
+
+std::filesystem::path CharmyBee::GetForestVisibilityPath() const
+{
+    std::filesystem::path base;
+    if (!_sifFilePath.empty())
+    {
+        base = std::filesystem::path(_sifFilePath).filename();
+        base.replace_extension("");
+    }
+    else
+    {
+        base = "forest";
+    }
+
+    std::string filename = base.string() + "_forestXYZ.txt";
+    return std::filesystem::current_path() / filename;
+}
+
+void CharmyBee::SaveForestVisibility() const
+{
+    std::unordered_set<std::string> visible;
+    std::function<void(ForestBoxLayer const&, std::string const&)> gather =
+        [&](ForestBoxLayer const& layer, std::string const& prefix) {
+            std::string name = layer.Name.empty() ? "Unnamed" : layer.Name;
+            std::string path = prefix.empty() ? name : prefix + "/" + name;
+            if (layer.Visible)
+                visible.insert(path);
+            for (auto const& child : layer.Children)
+                gather(child, path);
+        };
+
+    for (auto const& layer : _forestBoxLayers)
+        gather(layer, "");
+
+    std::filesystem::path outPath = GetForestVisibilityPath();
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out)
+        return;
+
+    for (auto const& entry : visible)
+        out << entry << "\n";
+}
+
+void CharmyBee::LoadForestVisibility()
+{
+    std::filesystem::path inPath = GetForestVisibilityPath();
+    std::ifstream in(inPath, std::ios::binary);
+    if (!in)
+        return;
+
+    std::unordered_set<std::string> visible;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (!line.empty())
+            visible.insert(line);
+    }
+
+    std::function<bool(ForestBoxLayer&, std::string const&)> apply =
+        [&](ForestBoxLayer& layer, std::string const& prefix) -> bool {
+            std::string name = layer.Name.empty() ? "Unnamed" : layer.Name;
+            std::string path = prefix.empty() ? name : prefix + "/" + name;
+            bool isVisible = visible.find(path) != visible.end();
+            bool anyChildVisible = false;
+            for (auto& child : layer.Children)
+                anyChildVisible |= apply(child, path);
+            layer.Visible = isVisible || anyChildVisible;
+            return layer.Visible;
+        };
+
+    for (auto& layer : _forestBoxLayers)
+        apply(layer, "");
 }
 
 void CharmyBee::ExportForestObj(std::filesystem::path const& outputPath,

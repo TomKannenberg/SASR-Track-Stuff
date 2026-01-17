@@ -1,16 +1,23 @@
 #pragma once
 
-#include <string>
+#include "SlLib/Serialization/IResourceSerializable.hpp"
 
 namespace SlLib::SumoTool::Siff::Logic {
 
-class TriggerAttribute
+namespace Serialization = SlLib::Serialization;
+
+class TriggerAttribute final : public Serialization::IResourceSerializable
 {
 public:
     TriggerAttribute();
     ~TriggerAttribute();
 
-    std::string Attribute;
+    int NameHash = 0;
+    int PackedValue = 0;
+
+    void Load(Serialization::ResourceLoadContext& context) override;
+    void Save(Serialization::ResourceSaveContext& context, Serialization::ISaveBuffer& buffer) override;
+    int GetSizeForSerialization() const override;
 };
 
 } // namespace SlLib::SumoTool::Siff::Logic

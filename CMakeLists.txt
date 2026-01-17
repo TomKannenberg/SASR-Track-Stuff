@@ -69,6 +69,13 @@ target_link_libraries(forest_unpacker PRIVATE ZLIB::ZLIB)
 
 target_link_libraries(SlLib PRIVATE ZLIB::ZLIB)
 
+# Statically link libgcc/libstdc++ for MinGW builds.
+if (MINGW)
+    foreach(_tgt CppSLib forest_extractor forest_to_obj forest_unpacker)
+        target_link_options(${_tgt} PRIVATE -static -static-libgcc -static-libstdc++)
+    endforeach()
+endif()
+
 find_package(imgui CONFIG REQUIRED)
 
 include(GNUInstallDirs)

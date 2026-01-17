@@ -32,6 +32,7 @@
 #include "SlLib/Resources/Scene/SeGraphNode.hpp"
 #include "SlLib/SumoTool/Siff/NavData/NavWaypoint.hpp"
 #include "SlLib/SumoTool/Siff/Navigation.hpp"
+#include "SlLib/SumoTool/Siff/LogicData.hpp"
 
 namespace SeEditor {
 
@@ -75,7 +76,21 @@ private:
     bool _drawCollisionMesh = true;
     bool _drawForestBoxes = false;
     bool _drawForestMeshes = false;
+    bool _drawTriggerBoxes = false;
+    bool _drawNavigation = false;
+    bool _drawNavigationWaypoints = true;
+    float _navigationWaypointBoxSize = 2.0f;
+    bool _drawLogic = false;
+    bool _drawLogicTriggers = true;
+    bool _drawLogicLocators = true;
+    float _logicLocatorBoxSize = 2.0f;
     std::shared_ptr<SeEditor::Forest::ForestLibrary> _forestLibrary;
+    using ForestMeshList = std::vector<Renderer::SlRenderer::ForestCpuMesh>;
+    std::shared_ptr<SeEditor::Forest::ForestLibrary> _itemsForestLibrary;
+    std::unordered_map<std::uint64_t, std::shared_ptr<ForestMeshList>> _itemsForestMeshesByForestTree;
+    std::unordered_map<int, std::shared_ptr<ForestMeshList>> _itemsForestMeshesByTreeHash;
+    std::vector<Renderer::SlRenderer::ForestCpuMesh> _logicLocatorMeshes;
+    std::vector<bool> _logicLocatorHasMesh;
     struct ForestBoxLayer
     {
         std::string Name;
@@ -88,9 +103,17 @@ private:
         std::size_t MeshCount = 0;
     };
     bool _showForestHierarchyWindow = false;
+    bool _showNavigationHierarchyWindow = false;
     bool _showHierarchyWindow = true;
     std::vector<ForestBoxLayer> _forestBoxLayers;
     std::vector<Renderer::SlRenderer::ForestCpuMesh> _allForestMeshes;
+    struct NavigationLineEntry
+    {
+        int LineIndex = 0;
+        std::string Name;
+        bool Visible = true;
+    };
+    std::vector<NavigationLineEntry> _navigationLineEntries;
     float _orbitYaw = 0.6f;
     float _orbitPitch = 0.35f;
     float _orbitDistance = 10.0f;
@@ -117,6 +140,9 @@ private:
     SlLib::Resources::Database::SlResourceDatabase* _database = nullptr;
     SlLib::SumoTool::Siff::Navigation* _navigation = nullptr;
     std::unique_ptr<Editor::Tools::NavigationTool> _navigationTool;
+    std::unique_ptr<SlLib::SumoTool::Siff::Navigation> _sifNavigation;
+    std::unique_ptr<Editor::Tools::NavigationTool> _sifNavigationTool;
+    std::unique_ptr<SlLib::SumoTool::Siff::LogicData> _sifLogic;
     std::vector<Editor::Tools::NavTool::NavRoute> _routes;
     Editor::Tools::NavTool::NavRoute* _selectedRoute = nullptr;
     SlLib::SumoTool::Siff::NavData::NavWaypoint* _selectedWaypoint = nullptr;
@@ -141,18 +167,30 @@ private:
     void RenderProjectSelector();
     void RenderPanelWindow(char const* title, Editor::Panel::IEditorPanel* panel);
     void OnLoad();
-    void SetupNavigationRendering();
+    void SetupNavigationRendering(SlLib::SumoTool::Siff::Navigation* navigation);
     void OnWorkspaceLoad();
     void TriggerCloseWorkspace();
     void LoadCollisionDebugGeometry();
     void LoadForestDebugGeometry();
     void LoadForestResources();
+    void LoadNavigationResources();
+    void LoadLogicResources();
+    void LoadItemsForestResources();
+    void BuildLogicLocatorMeshes();
     void ExportForestObj(std::filesystem::path const& outputPath,
                          std::string const& forestNameFilter);
     void RebuildForestBoxHierarchy();
     void UpdateForestBoxRenderer();
     void UpdateForestMeshRendering();
     void UpdateForestMeshVisibility();
+    void LoadForestVisibility();
+    void SaveForestVisibility() const;
+    std::filesystem::path GetForestVisibilityPath() const;
+    void UpdateNavigationLineVisibility();
+    void UpdateNavigationDebugLines();
+    void UpdateLogicDebugLines();
+    void UpdateDebugLines();
+    void UpdateTriggerPhantomBoxes();
     bool RenderForestBoxLayer(ForestBoxLayer& layer);
     void SetForestLayerVisibilityRecursive(ForestBoxLayer& layer, bool visible);
     void UpdateOrbitFromInput(float delta);
