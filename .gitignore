@@ -1,0 +1,9 @@
+GitKan
+GitKan.pub
+*.o
+*.obj
+*.exe
+build/
+imgui.ini
+track.Forest
+gitignore.bak/
