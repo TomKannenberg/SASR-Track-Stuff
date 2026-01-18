@@ -5,6 +5,7 @@
 #include "Frontend.hpp"
 #include "NavigationLoader.hpp"
 #include "LogicLoader.hpp"
+#include "XpacUnpacker.hpp"
 #include "Editor/Scene.hpp"
 #include "Forest/ForestTypes.hpp"
 #include "SlLib/Resources/Database/SlPlatform.hpp"
@@ -21,6 +22,9 @@
 #include <unordered_map>
 #include <algorithm>
 #include <optional>
+#ifdef Z_SOLO
+#undef Z_SOLO
+#endif
 #include <zlib.h>
 #include <functional>
 #include <cstring>
@@ -128,6 +132,15 @@ std::unordered_map<int, std::string> LoadExcelLookup(std::filesystem::path const
     return result;
 }
 
+std::filesystem::path GetDefaultStuffRoot()
+{
+    std::filesystem::path repoRoot = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+    std::filesystem::path root = repoRoot / "CppSLib_Stuff";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    return root;
+}
+
 void DumpHashCounts(char const* label,
                     std::unordered_map<int, int> const& counts,
                     std::unordered_map<int, std::string> const& lookup)
@@ -169,35 +182,111 @@ std::vector<std::uint8_t> DecompressZlib(std::span<const std::uint8_t> stream)
     if (stream.empty())
         return {};
 
+    constexpr int kZlibBufError = -5;
     z_stream inflater{};
     inflater.next_in = const_cast<std::uint8_t*>(stream.data());
     inflater.avail_in = static_cast<decltype(inflater.avail_in)>(stream.size());
-
-    if (inflateInit(&inflater) != kZlibOkValue)
+    static bool loggedInitFailure = false;
+    int initStatus = inflateInit(&inflater);
+    if (initStatus != kZlibOkValue)
+    {
+        if (!loggedInitFailure)
+        {
+            loggedInitFailure = true;
+            std::cerr << "[SIFRebuild] inflateInit failed status=" << initStatus
+                      << " input=" << stream.size() << "\n";
+        }
         return {};
+    }
 
     std::vector<std::uint8_t> output;
     std::array<std::uint8_t, 16384> buffer{};
-
     int status = kZlibOkValue;
+    static bool loggedFirstRun = false;
     while (status != kZlibStreamEndValue)
     {
         inflater.next_out = buffer.data();
         inflater.avail_out = static_cast<decltype(inflater.avail_out)>(buffer.size());
         status = inflate(&inflater, kZlibFlushNone);
-        if (status != kZlibOkValue && status != kZlibStreamEndValue)
+        if (!loggedFirstRun)
         {
+            loggedFirstRun = true;
+            std::cerr << "[SIFRebuild] inflate status=" << status
+                      << " avail_in=" << inflater.avail_in
+                      << " avail_out=" << inflater.avail_out << "\n";
+        }
+        if (status != kZlibOkValue && status != kZlibStreamEndValue && status != kZlibBufError)
+        {
+            std::cerr << "[SIFRebuild] inflate error status=" << status
+                      << " input=" << stream.size() << "\n";
             inflateEnd(&inflater);
             return {};
         }
-
         std::size_t produced = buffer.size() - inflater.avail_out;
-        output.insert(output.end(), buffer.begin(), buffer.begin() + produced);
+        if (produced > 0)
+            output.insert(output.end(), buffer.begin(), buffer.begin() + produced);
+        if (status == kZlibBufError && inflater.avail_in == 0 && produced == 0)
+            break;
     }
-
     inflateEnd(&inflater);
-
     return output;
+}
+
+std::uint32_t ReadU32LE(std::span<const std::uint8_t> data, std::size_t offset)
+{
+    if (offset + 4 > data.size())
+        return 0;
+    return static_cast<std::uint32_t>(data[offset]) |
+           (static_cast<std::uint32_t>(data[offset + 1]) << 8) |
+           (static_cast<std::uint32_t>(data[offset + 2]) << 16) |
+           (static_cast<std::uint32_t>(data[offset + 3]) << 24);
+}
+
+std::vector<std::uint8_t> DecodeZifZig(std::span<const std::uint8_t> data)
+{
+    if (data.empty())
+        return {};
+
+    auto stripLengthPrefix = [](std::span<const std::uint8_t> buffer) {
+        if (buffer.size() < 4)
+            return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
+
+        std::uint32_t expected = ReadU32LE(buffer, 0);
+        std::size_t payloadSize = buffer.size() - 4;
+        if (expected > 0 && expected <= payloadSize)
+            return std::vector<std::uint8_t>(buffer.begin() + 4, buffer.begin() + 4 + expected);
+
+        return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
+    };
+
+    if (!LooksLikeZlib(data))
+        return stripLengthPrefix(data);
+
+    std::vector<std::uint8_t> decompressed = DecompressZlib(data);
+    if (decompressed.empty())
+        return {};
+
+    return stripLengthPrefix(decompressed);
+}
+
+bool ReadFileBytes(std::filesystem::path const& path, std::vector<std::uint8_t>& out)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    out.assign(std::istreambuf_iterator<char>(file), {});
+    return true;
+}
+
+bool WriteFileBytes(std::filesystem::path const& path, std::span<const std::uint8_t> data)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return true;
 }
 
 void StripLengthPrefixIfPresent(std::vector<std::uint8_t>& data)
@@ -620,6 +709,158 @@ int Program::Run(int argc, char** argv)
     {
         if (std::string(argv[i]) == "--debug-keyinput")
             debugKeyInput = true;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--unpack-xpac")
+    {
+        std::filesystem::path xpacPath = argv[2];
+        std::filesystem::path outputRoot = argc >= 4 ? std::filesystem::path(argv[3]) : GetDefaultStuffRoot();
+
+        Xpac::XpacUnpackOptions options;
+        options.XpacPath = xpacPath;
+        options.OutputRoot = outputRoot;
+        options.MappingPath = Xpac::FindDefaultMappingPath(xpacPath, outputRoot);
+        options.ConvertToSifSig = true;
+
+        Xpac::XpacUnpackResult result = Xpac::UnpackXpac(options);
+        std::cout << "[XPAC] Entries=" << result.TotalEntries
+                  << " ZIF=" << result.ExtractedZif
+                  << " ZIG=" << result.ExtractedZig
+                  << " Converted=" << result.ConvertedPairs
+                  << " Skipped=" << result.SkippedEntries << std::endl;
+        for (auto const& err : result.Errors)
+            std::cerr << "[XPAC] " << err << std::endl;
+        return result.Errors.empty() ? 0 : 1;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--rebuild-sif")
+    {
+        std::filesystem::path root = argv[2];
+        if (!std::filesystem::exists(root))
+        {
+            std::cerr << "[SIFRebuild] Path does not exist: " << root.string() << std::endl;
+            return 1;
+        }
+
+        struct PairPaths
+        {
+            std::filesystem::path Zif;
+            std::filesystem::path Zig;
+        };
+        std::unordered_map<std::string, PairPaths> pairs;
+
+        std::error_code ec;
+        for (auto const& entry : std::filesystem::recursive_directory_iterator(root, ec))
+        {
+            if (ec)
+                break;
+            if (!entry.is_regular_file())
+                continue;
+            std::filesystem::path path = entry.path();
+            std::string ext = path.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+            if (ext != ".zif" && ext != ".zig")
+                continue;
+
+            std::filesystem::path base = path;
+            base.replace_extension();
+            auto& pair = pairs[base.string()];
+            if (ext == ".zif")
+                pair.Zif = path;
+            else
+                pair.Zig = path;
+        }
+
+        std::size_t converted = 0;
+        std::size_t skipped = 0;
+        bool printedSample = false;
+        for (auto const& [base, pair] : pairs)
+        {
+            if (pair.Zif.empty() && pair.Zig.empty())
+                continue;
+
+            if (!pair.Zif.empty())
+            {
+                std::vector<std::uint8_t> data;
+                if (!ReadFileBytes(pair.Zif, data))
+                {
+                    std::cerr << "[SIFRebuild] Failed to read " << pair.Zif.string() << std::endl;
+                    ++skipped;
+                }
+                else
+                {
+                    if (!printedSample)
+                    {
+                        printedSample = true;
+                        std::cerr << "[SIFRebuild] Sample " << pair.Zif.string()
+                                  << " size=" << data.size()
+                                  << " head=";
+                        for (std::size_t i = 0; i < std::min<std::size_t>(8, data.size()); ++i)
+                            std::cerr << std::hex << std::setw(2) << std::setfill('0')
+                                      << static_cast<int>(data[i]) << ' ';
+                        std::cerr << std::dec << std::setfill(' ') << "\n";
+                    }
+                    auto decoded = DecodeZifZig(data);
+                    if (decoded.empty())
+                    {
+                        std::cerr << "[SIFRebuild] Empty decode for " << pair.Zif.string() << std::endl;
+                        ++skipped;
+                    }
+                    else
+                    {
+                        std::filesystem::path outPath = pair.Zif;
+                        outPath.replace_extension(".sif");
+                        if (!WriteFileBytes(outPath, decoded))
+                        {
+                            std::cerr << "[SIFRebuild] Failed to write " << outPath.string() << std::endl;
+                            ++skipped;
+                        }
+                        else
+                        {
+                            ++converted;
+                        }
+                    }
+                }
+            }
+
+            if (!pair.Zig.empty())
+            {
+                std::vector<std::uint8_t> data;
+                if (!ReadFileBytes(pair.Zig, data))
+                {
+                    std::cerr << "[SIFRebuild] Failed to read " << pair.Zig.string() << std::endl;
+                    ++skipped;
+                }
+                else
+                {
+                    auto decoded = DecodeZifZig(data);
+                    if (decoded.empty())
+                    {
+                        std::cerr << "[SIFRebuild] Empty decode for " << pair.Zig.string() << std::endl;
+                        ++skipped;
+                    }
+                    else
+                    {
+                        std::filesystem::path outPath = pair.Zig;
+                        outPath.replace_extension(".sig");
+                        if (!WriteFileBytes(outPath, decoded))
+                        {
+                            std::cerr << "[SIFRebuild] Failed to write " << outPath.string() << std::endl;
+                            ++skipped;
+                        }
+                        else
+                        {
+                            ++converted;
+                        }
+                    }
+                }
+            }
+        }
+
+        std::cout << "[SIFRebuild] Converted=" << converted << " Skipped=" << skipped << std::endl;
+        return 0;
     }
 
     if (argc >= 3 && std::string(argv[1]) == "--parse-sif")

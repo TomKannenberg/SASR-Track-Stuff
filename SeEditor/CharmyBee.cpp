@@ -13,6 +13,7 @@
 #include "Renderer/SlRenderer.hpp"
 #include "NavigationLoader.hpp"
 #include "LogicLoader.hpp"
+#include "XpacUnpacker.hpp"
 #include "SlLib/Resources/Database/SlPlatform.hpp"
 #include "SlLib/Utilities/SlUtil.hpp"
 #include "Forest/ForestArchive.hpp"
@@ -110,19 +111,6 @@ std::string DescribeGlfwKey(int key)
 void ReportSifError(std::string const& message)
 {
     std::cerr << "[CharmyBee][SIF] " << message << std::endl;
-}
-
-void PrintSceneInfo()
-{
-    auto* scene = SeEditor::Editor::SceneManager::Current();
-    if (scene == nullptr)
-    {
-        std::cerr << "[CharmyBee] No active scene registered." << std::endl;
-        return;
-    }
-
-    std::cout << "[CharmyBee] Active scene: " << scene->SourceFileName << std::endl;
-    std::cout << "[CharmyBee] Scene definitions: " << scene->Database.RootDefinitions.size() << std::endl;
 }
 
 std::optional<std::pair<int, int>> ParseWaypointRoute(std::string const& name)
@@ -1181,7 +1169,11 @@ CharmyBee::CharmyBee(std::string title, int width, int height, bool debugKeyInpu
     ResetAssetTree();
 }
 
-CharmyBee::~CharmyBee() = default;
+CharmyBee::~CharmyBee()
+{
+    if (_xpacWorker && _xpacWorker->joinable())
+        _xpacWorker->join();
+}
 
 CharmyBee::TreeNode::TreeNode(std::string name, bool isFolder)
     : Name(std::move(name))
@@ -1201,35 +1193,7 @@ void CharmyBee::OnLoad()
     io.ConfigDragClickToInputText = true;
     io.ConfigWindowsMoveFromTitleBarOnly = true;
 
-    SlFile::AddGameDataFolder("F:/sart/game/pc");
-    SlFile::AddGameDataFolder("C:/Program Files (x86)/Steam/steamapps/common/Sonic & All-Stars Racing Transformed/Data");
-
-    if (auto racers = SlFile::GetExcelData("gamedata/racers"))
-        _racerData = std::move(*racers);
-    else
-        std::cerr << "[CharmyBee] Unable to load racer data\n";
-
-    if (auto tracks = SlFile::GetExcelData("gamedata/tracks"))
-        _trackData = std::move(*tracks);
-    else
-        std::cerr << "[CharmyBee] Unable to load track data\n";
-
     _renderer.Initialize();
-
-    if (_quickstart)
-    {
-        try
-        {
-            Editor::SceneManager::LoadScene("levels/seasidehill2/seasidehill2");
-            auto* scene = Editor::SceneManager::Current();
-            SetupNavigationRendering(scene ? scene->Navigation : nullptr);
-            OnWorkspaceLoad();
-        }
-        catch (std::exception const& exception)
-        {
-            std::cerr << "[CharmyBee] Failed to load quickstart scene: " << exception.what() << std::endl;
-        }
-    }
 }
 
 void CharmyBee::SetupNavigationRendering(SlLib::SumoTool::Siff::Navigation* navigation)
@@ -1330,32 +1294,6 @@ void CharmyBee::OnWorkspaceLoad()
     }
 
     UpdateTriggerPhantomBoxes();
-}
-
-void CharmyBee::TriggerCloseWorkspace()
-{
-    _title = "Sumo Engine Editor - <OpenGL>";
-    if (_database == nullptr)
-    {
-        _requestedWorkspaceClose = false;
-        return;
-    }
-
-    std::cout << "[CharmyBee] Closing workspace..." << std::endl;
-    _database = nullptr;
-    _navigation = nullptr;
-    _routes.clear();
-    _selectedRoute = nullptr;
-    _selectedWaypoint = nullptr;
-    _selectedRacingLine = -1;
-    _selectedRacingLineSegment = -1;
-
-    ResetAssetTree();
-    _renderer.SetTriggerBoxes({});
-    _renderer.SetDrawTriggerBoxes(false);
-    _renderer.SetDebugLines({});
-    _renderer.SetDrawDebugLines(false);
-    _requestedWorkspaceClose = false;
 }
 
 void CharmyBee::DrawNodeCreationMenu()
@@ -1459,127 +1397,6 @@ void CharmyBee::AddItemNode(std::string const& name, SlLib::Resources::Scene::Se
     parent->Children.push_back(std::move(node));
 
     std::cout << "[CharmyBee] Queued asset node: " << name << std::endl;
-}
-
-void CharmyBee::RenderWorkspace()
-{
-    if (_inspectorPanel)
-        _inspectorPanel->OnSelectionChanged();
-
-    ImGui::Begin("Inspector");
-    if (_inspectorPanel)
-        _inspectorPanel->OnImGuiRender();
-    ImGui::End();
-
-    ImGui::Begin("Assets");
-    if (_assetPanel)
-        _assetPanel->OnImGuiRender();
-    RenderAssetView();
-    ImGui::End();
-
-    RenderSceneView();
-    RenderRacingLineEditor();
-}
-
-void CharmyBee::RenderHierarchyWindow()
-{
-    if (!_showHierarchyWindow)
-        return;
-
-    if (!ImGui::Begin("Hierarchy", &_showHierarchyWindow))
-    {
-        ImGui::End();
-        return;
-    }
-
-    if (_database == nullptr)
-    {
-        ImGui::Text("No workspace loaded.");
-        ImGui::TextDisabled("The hierarchy panel opens automatically once a workspace is active.");
-        ImGui::End();
-        return;
-    }
-
-    if (ImGui::BeginTabBar("##hab_hierarchy_tabs"))
-    {
-        if (ImGui::BeginTabItem("Scene"))
-        {
-            RenderHierarchy(false);
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Definitions"))
-        {
-            RenderHierarchy(true);
-            ImGui::EndTabItem();
-        }
-
-        ImGui::EndTabBar();
-    }
-
-    ImGui::End();
-}
-
-void CharmyBee::RenderHierarchy(bool definitions)
-{
-    if (_database == nullptr)
-        return;
-
-    std::function<void(SlLib::Resources::Scene::SeGraphNode*)> drawTree;
-    drawTree = [&](SlLib::Resources::Scene::SeGraphNode* node) {
-        if (node == nullptr)
-            return;
-
-        std::string label = node->ShortName.empty() ? node->UidName : node->ShortName;
-        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick;
-        if (node->FirstChild == nullptr)
-            flags |= ImGuiTreeNodeFlags_Leaf;
-        if (Editor::Selection::ActiveNode == node)
-            flags |= ImGuiTreeNodeFlags_Selected;
-
-        bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(node), flags, "%s", label.c_str());
-        if (ImGui::IsItemClicked())
-            Editor::Selection::ActiveNode = node;
-
-        if (ImGui::BeginPopupContextItem())
-        {
-            if (ImGui::MenuItem("Delete"))
-                _requestedNodeDeletion = node;
-            ImGui::EndPopup();
-        }
-
-        if (open)
-        {
-            SlLib::Resources::Scene::SeGraphNode* child = node->FirstChild;
-            while (child != nullptr)
-            {
-                drawTree(child);
-                child = child->NextSibling;
-            }
-
-            ImGui::TreePop();
-        }
-    };
-
-    if (definitions)
-    {
-        for (auto* definition : _database->RootDefinitions)
-        {
-            if (definition == nullptr)
-                continue;
-
-            drawTree(definition);
-        }
-    }
-    else
-    {
-        SlLib::Resources::Scene::SeGraphNode* child = _database->Scene.FirstChild;
-        while (child != nullptr)
-        {
-            drawTree(child);
-            child = child->NextSibling;
-        }
-    }
 }
 
 void CharmyBee::RenderAssetView()
@@ -1812,251 +1629,553 @@ void CharmyBee::RenderRacingLineEditor()
     ImGui::End();
 }
 
-void CharmyBee::RenderProjectSelector()
-{
-    ImGui::Begin("Projects");
-    ImGui::Text("No workspace loaded.");
-    ImGui::TextDisabled("Quickstart loads seasidehill2 automatically.");
-    ImGui::End();
-}
-
 void CharmyBee::RenderSifViewer()
 {
+    constexpr float kSifWidth = 560.0f;
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 workPos = viewport ? viewport->WorkPos : ImVec2(0.0f, 0.0f);
+    ImVec2 workSize = viewport ? viewport->WorkSize : ImVec2(1280.0f, 720.0f);
+    float windowHeight = workSize.y - 20.0f;
+    if (windowHeight < 200.0f)
+        windowHeight = 200.0f;
+    ImGui::SetNextWindowPos(ImVec2(workPos.x + workSize.x - kSifWidth, workPos.y + 10.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(kSifWidth, windowHeight), ImGuiCond_Always);
     if (!ImGui::Begin("SIF Viewer"))
     {
         ImGui::End();
         return;
     }
 
-    if (_sifFilePath.empty())
+    if (ImGui::BeginTabBar("SifTabs"))
     {
-        ImGui::TextDisabled("No SIF/ZIF/SIG/ZIG file loaded. Use File > Load SIF/ZIF/SIG/ZIG File...");
-    }
-    else
-    {
-        ImGui::TextWrapped("File: %s", _sifFilePath.c_str());
-        if (!_sifLoadMessage.empty())
-            ImGui::TextColored(ImVec4(0.6f, 0.8f, 0.6f, 1.0f), "%s", _sifLoadMessage.c_str());
-
-        ImGui::Text("Original size: %llu bytes", static_cast<unsigned long long>(_sifOriginalSize));
-        if (_sifFileCompressed)
-            ImGui::Text("Decompressed payload: %llu bytes", static_cast<unsigned long long>(_sifDecompressedSize));
-
-        ImGui::Separator();
-        if (!_sifChunks.empty())
+        if (ImGui::BeginTabItem("SIF Viewer"))
         {
-            ImGui::Text("Chunks: %zu", _sifChunks.size());
-            ImGui::BeginChild("chunkList", ImVec2(ImGui::GetContentRegionAvail().x * 0.45f, 200.0f), true);
-            for (std::size_t i = 0; i < _sifChunks.size(); ++i)
+            if (_sifFilePath.empty())
             {
-                bool selected = static_cast<int>(i) == _selectedChunk;
-                char label[128];
-                std::snprintf(label, sizeof(label), "[%02zu] %s (0x%08X)", i, _sifChunks[i].Name.c_str(),
-                              _sifChunks[i].TypeValue);
-                if (ImGui::Selectable(label, selected))
-                    _selectedChunk = static_cast<int>(i);
+                ImGui::TextDisabled("No SIF/ZIF/SIG/ZIG file loaded. Use File > Load SIF/ZIF/SIG/ZIG File...");
             }
-            ImGui::EndChild();
-            ImGui::SameLine();
-            ImGui::BeginChild("chunkDetails", ImVec2(0, 200.0f), true);
-            if (_selectedChunk >= 0 && _selectedChunk < static_cast<int>(_sifChunks.size()))
+            else
+            {
+                ImGui::TextWrapped("File: %s", _sifFilePath.c_str());
+                if (!_sifLoadMessage.empty())
+                    ImGui::TextColored(ImVec4(0.6f, 0.8f, 0.6f, 1.0f), "%s", _sifLoadMessage.c_str());
+
+                ImGui::Text("Original size: %llu bytes", static_cast<unsigned long long>(_sifOriginalSize));
+                if (_sifFileCompressed)
+                    ImGui::Text("Decompressed payload: %llu bytes", static_cast<unsigned long long>(_sifDecompressedSize));
+
+                ImGui::Separator();
+                if (!_sifChunks.empty())
+                {
+                    ImGui::Text("Chunks: %zu", _sifChunks.size());
+                    ImGui::BeginChild("chunkList", ImVec2(ImGui::GetContentRegionAvail().x * 0.45f, 200.0f), true);
+                    for (std::size_t i = 0; i < _sifChunks.size(); ++i)
+                    {
+                        bool selected = static_cast<int>(i) == _selectedChunk;
+                        char label[128];
+                        std::snprintf(label, sizeof(label), "[%02zu] %s (0x%08X)", i, _sifChunks[i].Name.c_str(),
+                                      _sifChunks[i].TypeValue);
+                        if (ImGui::Selectable(label, selected))
+                            _selectedChunk = static_cast<int>(i);
+                    }
+                    ImGui::EndChild();
+                    ImGui::SameLine();
+                    ImGui::BeginChild("chunkDetails", ImVec2(0, 200.0f), true);
+                    if (_selectedChunk >= 0 && _selectedChunk < static_cast<int>(_sifChunks.size()))
+                    {
+                        auto const& chunk = _sifChunks[static_cast<std::size_t>(_selectedChunk)];
+                        ImGui::Text("Name: %s", chunk.Name.c_str());
+                        ImGui::Text("Type: 0x%08X", chunk.TypeValue);
+                        ImGui::Text("Data: %u bytes", chunk.DataSize);
+                        ImGui::Text("Chunk: %u bytes", chunk.ChunkSize);
+                        ImGui::Text("Relocations: %zu", chunk.Relocations.size());
+                        ImGui::Text("Endian: %s", chunk.BigEndian ? "Big" : "Little");
+                        ImGui::Separator();
+                        if (chunk.TypeValue == MakeTypeCode('C', 'O', 'L', 'I'))
+                        {
+                            if (ImGui::Button("Show Collision Mesh"))
+                            {
+                                _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                                LoadCollisionDebugGeometry();
+                            }
+                            ImGui::SameLine();
+                            ImGui::Checkbox("Draw", &_drawCollisionMesh);
+                        }
+                        else if (chunk.TypeValue == MakeTypeCode('F', 'O', 'R', 'E'))
+                        {
+                            if (ImGui::Button("Show Forest Meshes"))
+                            {
+                                _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                                LoadForestResources();
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Draw", &_drawForestMeshes))
+                                UpdateForestMeshRendering();
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Draw boxes", &_drawForestBoxes))
+                                UpdateForestBoxRenderer();
+                            if (ImGui::Button("Export track.Forest OBJ"))
+                            {
+                                SeEditor::Dialogs::FileDialogOptions options;
+                                options.Title = "Export track.Forest OBJ";
+                                options.FilterPatterns = {"*.obj"};
+                                options.FilterDescription = "Wavefront OBJ";
+                                options.DefaultPathAndFile = _sifFilePath;
+                                if (!options.DefaultPathAndFile.empty())
+                                {
+                                    std::filesystem::path base = options.DefaultPathAndFile;
+                                    base.replace_extension(".obj");
+                                    options.DefaultPathAndFile = base.string();
+                                }
+                                if (auto result = SeEditor::Dialogs::TinyFileDialog::saveFileDialog(options))
+                                    ExportForestObj(*result, "track.Forest");
+                            }
+                        }
+                        else if (chunk.TypeValue == MakeTypeCode('T', 'R', 'A', 'K'))
+                        {
+                            if (ImGui::Button("Show Navigation"))
+                            {
+                                _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                                LoadNavigationResources();
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Draw", &_drawNavigation))
+                                UpdateDebugLines();
+                            if (_sifNavigationTool)
+                            {
+                                ImGui::SameLine();
+                                if (ImGui::Checkbox("Waypoints", &_drawNavigationWaypoints))
+                                    UpdateDebugLines();
+                                if (_drawNavigationWaypoints)
+                                {
+                                    ImGui::SameLine();
+                                    ImGui::SetNextItemWidth(80.0f);
+                                    if (ImGui::DragFloat("Size", &_navigationWaypointBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
+                                        UpdateDebugLines();
+                                }
+                            }
+                        }
+                        else if (chunk.TypeValue == MakeTypeCode('L', 'O', 'G', 'C'))
+                        {
+                            if (ImGui::Button("Show Logic"))
+                            {
+                                _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                                LoadLogicResources();
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Draw", &_drawLogic))
+                            {
+                                UpdateDebugLines();
+                                UpdateForestMeshRendering();
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Triggers", &_drawLogicTriggers))
+                                UpdateDebugLines();
+                            ImGui::SameLine();
+                            if (ImGui::Checkbox("Locators", &_drawLogicLocators))
+                            {
+                                UpdateDebugLines();
+                                UpdateForestMeshRendering();
+                            }
+                            if (_drawLogicLocators)
+                            {
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(80.0f);
+                                if (ImGui::DragFloat("Size", &_logicLocatorBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
+                                    UpdateDebugLines();
+                            }
+                        }
+                        else
+                        {
+                            ImGui::TextDisabled("No visualizer for this chunk yet.");
+                        }
+                    }
+                    ImGui::EndChild();
+                    ImGui::Separator();
+                }
+
+                bool showHex = !_sifParseError.empty() || _sifChunks.empty();
+                if (showHex)
+                {
+                    if (!_sifParseError.empty())
+                        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Parse error: %s", _sifParseError.c_str());
+                    ImGui::TextWrapped("Showing raw hex dump of the data.");
+                    ImGui::BeginChild("SifContents", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+                    for (auto const& line : _sifHexDump)
+                        ImGui::TextUnformatted(line.c_str());
+                    ImGui::EndChild();
+                }
+                else
+                {
+                    ImGui::Text("Chunks: %zu", _sifChunks.size());
+                    ImGui::BeginChild("SifContents", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+                    for (auto const& chunk : _sifChunks)
+                    {
+                        ImGui::Text("%s (0x%08X)", chunk.Name.c_str(), chunk.TypeValue);
+                        ImGui::Text("  Data: %u bytes, Chunk: %u bytes, Relocations: %zu", chunk.DataSize,
+                                    chunk.ChunkSize, chunk.Relocations.size());
+                        std::string relocLine = FormatRelocationList(chunk.Relocations);
+                        if (!relocLine.empty())
+                            ImGui::TextUnformatted(relocLine.c_str());
+                        ImGui::Separator();
+                    }
+                    ImGui::EndChild();
+                }
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Hierarchy"))
+        {
+            if (_selectedChunk < 0 || _selectedChunk >= static_cast<int>(_sifChunks.size()))
+            {
+                ImGui::TextDisabled("Select a chunk to view its hierarchy.");
+            }
+            else
             {
                 auto const& chunk = _sifChunks[static_cast<std::size_t>(_selectedChunk)];
-                ImGui::Text("Name: %s", chunk.Name.c_str());
-                ImGui::Text("Type: 0x%08X", chunk.TypeValue);
-                ImGui::Text("Data: %u bytes", chunk.DataSize);
-                ImGui::Text("Chunk: %u bytes", chunk.ChunkSize);
-                ImGui::Text("Relocations: %zu", chunk.Relocations.size());
-                ImGui::Text("Endian: %s", chunk.BigEndian ? "Big" : "Little");
-                ImGui::Separator();
-                if (chunk.TypeValue == MakeTypeCode('C', 'O', 'L', 'I'))
+                if (chunk.TypeValue == MakeTypeCode('F', 'O', 'R', 'E'))
                 {
-                    if (ImGui::Button("Show Collision Mesh"))
+                    if (_forestBoxLayers.empty())
                     {
-                        _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
-                        LoadCollisionDebugGeometry();
+                        ImGui::Text("No forest data loaded yet.");
                     }
-                    ImGui::SameLine();
-                    ImGui::Checkbox("Draw", &_drawCollisionMesh);
-                }
-                else if (chunk.TypeValue == MakeTypeCode('F', 'O', 'R', 'E'))
-                {
-                    if (ImGui::Button("Show Forest Meshes"))
+                    else
                     {
-                        _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
-                        LoadForestResources();
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Checkbox("Draw", &_drawForestMeshes))
-                        UpdateForestMeshRendering();
-                    ImGui::SameLine();
-                    if (ImGui::Checkbox("Draw boxes", &_drawForestBoxes))
-                        UpdateForestBoxRenderer();
-                    ImGui::SameLine();
-                    if (ImGui::Button("Forest hierarchy"))
-                        _showForestHierarchyWindow = true;
-                    if (ImGui::Button("Export track.Forest OBJ"))
-                    {
-                        SeEditor::Dialogs::FileDialogOptions options;
-                        options.Title = "Export track.Forest OBJ";
-                        options.FilterPatterns = {"*.obj"};
-                        options.FilterDescription = "Wavefront OBJ";
-                        options.DefaultPathAndFile = _sifFilePath;
-                        if (!options.DefaultPathAndFile.empty())
+                        bool hierarchyChanged = false;
+                        for (auto& layer : _forestBoxLayers)
+                            hierarchyChanged |= RenderForestBoxLayer(layer);
+                        if (hierarchyChanged)
                         {
-                            std::filesystem::path base = options.DefaultPathAndFile;
-                            base.replace_extension(".obj");
-                            options.DefaultPathAndFile = base.string();
+                            UpdateForestBoxRenderer();
+                            UpdateForestMeshRendering();
                         }
-                        if (auto result = SeEditor::Dialogs::TinyFileDialog::saveFileDialog(options))
-                            ExportForestObj(*result, "track.Forest");
                     }
                 }
                 else if (chunk.TypeValue == MakeTypeCode('T', 'R', 'A', 'K'))
                 {
-                    if (ImGui::Button("Show Navigation"))
+                    if (_sifNavigation == nullptr || _sifNavigation->RacingLines.empty())
                     {
-                        _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
-                        LoadNavigationResources();
+                        ImGui::Text("No navigation data loaded yet.");
                     }
-                    ImGui::SameLine();
-                    if (ImGui::Checkbox("Draw", &_drawNavigation))
-                        UpdateDebugLines();
-                    if (_sifNavigationTool)
+                    else
                     {
-                        ImGui::SameLine();
-                        if (ImGui::Checkbox("Waypoints", &_drawNavigationWaypoints))
-                            UpdateDebugLines();
-                        if (_drawNavigationWaypoints)
+                        bool changed = false;
+                        for (auto& entry : _navigationLineEntries)
                         {
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(80.0f);
-                            if (ImGui::DragFloat("Size", &_navigationWaypointBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
-                                UpdateDebugLines();
+                            if (ImGui::Checkbox(entry.Name.c_str(), &entry.Visible))
+                                changed = true;
                         }
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("Navigation hierarchy"))
-                        _showNavigationHierarchyWindow = true;
-                }
-                else if (chunk.TypeValue == MakeTypeCode('L', 'O', 'G', 'C'))
-                {
-                    if (ImGui::Button("Show Logic"))
-                    {
-                        _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
-                        LoadLogicResources();
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Checkbox("Draw", &_drawLogic))
-                    {
-                        UpdateDebugLines();
-                        UpdateForestMeshRendering();
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Checkbox("Triggers", &_drawLogicTriggers))
-                        UpdateDebugLines();
-                    ImGui::SameLine();
-                    if (ImGui::Checkbox("Locators", &_drawLogicLocators))
-                    {
-                        UpdateDebugLines();
-                        UpdateForestMeshRendering();
-                    }
-                    if (_drawLogicLocators)
-                    {
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(80.0f);
-                        if (ImGui::DragFloat("Size", &_logicLocatorBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
-                            UpdateDebugLines();
+                        if (changed)
+                            UpdateNavigationLineVisibility();
                     }
                 }
                 else
                 {
-                    ImGui::TextDisabled("No visualizer for this chunk yet.");
+                    ImGui::TextDisabled("No hierarchy for this chunk.");
                 }
             }
-            ImGui::EndChild();
-            ImGui::Separator();
+            ImGui::EndTabItem();
         }
-
-        bool showHex = !_sifParseError.empty() || _sifChunks.empty();
-        if (showHex)
-        {
-            if (!_sifParseError.empty())
-                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Parse error: %s", _sifParseError.c_str());
-            ImGui::TextWrapped("Showing raw hex dump of the data.");
-            ImGui::BeginChild("SifContents", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
-            for (auto const& line : _sifHexDump)
-                ImGui::TextUnformatted(line.c_str());
-            ImGui::EndChild();
-        }
-        else
-        {
-            ImGui::Text("Chunks: %zu", _sifChunks.size());
-            ImGui::BeginChild("SifContents", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
-            for (auto const& chunk : _sifChunks)
-            {
-                ImGui::Text("%s (0x%08X)", chunk.Name.c_str(), chunk.TypeValue);
-                ImGui::Text("  Data: %u bytes, Chunk: %u bytes, Relocations: %zu", chunk.DataSize,
-                            chunk.ChunkSize, chunk.Relocations.size());
-                std::string relocLine = FormatRelocationList(chunk.Relocations);
-                if (!relocLine.empty())
-                    ImGui::TextUnformatted(relocLine.c_str());
-                ImGui::Separator();
-            }
-            ImGui::EndChild();
-        }
-
-        if (_showForestHierarchyWindow)
-        {
-            ImGui::SetNextWindowSize(ImVec2(320.0f, 400.0f), ImGuiCond_FirstUseEver);
-            if (ImGui::Begin("Forest Hierarchy", &_showForestHierarchyWindow))
-            {
-                if (_forestBoxLayers.empty())
-                {
-                    ImGui::Text("No forest data loaded yet.");
-                }
-                else
-                {
-                    bool hierarchyChanged = false;
-                    for (auto& layer : _forestBoxLayers)
-                        hierarchyChanged |= RenderForestBoxLayer(layer);
-                    if (hierarchyChanged)
-                    {
-                        UpdateForestBoxRenderer();
-                        UpdateForestMeshRendering();
-                    }
-                }
-            }
-            ImGui::End();
-        }
-
-        if (_showNavigationHierarchyWindow)
-        {
-            ImGui::SetNextWindowSize(ImVec2(320.0f, 400.0f), ImGuiCond_FirstUseEver);
-            if (ImGui::Begin("Navigation Hierarchy", &_showNavigationHierarchyWindow))
-            {
-                if (_sifNavigation == nullptr || _sifNavigation->RacingLines.empty())
-                {
-                    ImGui::Text("No navigation data loaded yet.");
-                }
-                else
-                {
-                    bool changed = false;
-                    for (auto& entry : _navigationLineEntries)
-                    {
-                        if (ImGui::Checkbox(entry.Name.c_str(), &entry.Visible))
-                            changed = true;
-                    }
-                    if (changed)
-                        UpdateNavigationLineVisibility();
-                }
-            }
-            ImGui::End();
-        }
-
+        ImGui::EndTabBar();
     }
 
     ImGui::End();
+}
+
+std::filesystem::path CharmyBee::GetStuffRoot() const
+{
+    std::filesystem::path repoRoot = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+    std::filesystem::path root = repoRoot / "CppSLib_Stuff";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    return root;
+}
+
+void CharmyBee::RenderStuffTreeNode(std::filesystem::path const& path)
+{
+    std::error_code ec;
+    bool isDir = std::filesystem::is_directory(path, ec);
+    std::string label = path.filename().empty() ? path.string() : path.filename().string();
+
+    if (isDir)
+    {
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+        bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+        if (open)
+        {
+            std::vector<std::filesystem::path> dirs;
+            std::vector<std::filesystem::path> files;
+            for (auto const& entry : std::filesystem::directory_iterator(path, ec))
+            {
+                if (ec)
+                    break;
+                if (entry.is_directory())
+                    dirs.push_back(entry.path());
+                else
+                    files.push_back(entry.path());
+            }
+            auto sorter = [](std::filesystem::path const& a, std::filesystem::path const& b) {
+                return a.filename().string() < b.filename().string();
+            };
+            std::sort(dirs.begin(), dirs.end(), sorter);
+            std::sort(files.begin(), files.end(), sorter);
+
+            for (auto const& dir : dirs)
+                RenderStuffTreeNode(dir);
+            for (auto const& file : files)
+                ImGui::BulletText("%s", file.filename().string().c_str());
+
+            ImGui::TreePop();
+        }
+    }
+    else
+    {
+        ImGui::BulletText("%s", label.c_str());
+    }
+}
+
+void CharmyBee::RenderStuffSifVirtualTree(std::filesystem::path const& root)
+{
+    std::filesystem::path xpacRoot = root / "xpac";
+    std::error_code ec;
+    if (!std::filesystem::exists(xpacRoot, ec))
+        return;
+
+    if (!ImGui::TreeNodeEx("SIF Files", ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth))
+        return;
+
+    std::vector<std::filesystem::path> xpacs;
+    for (auto const& entry : std::filesystem::directory_iterator(xpacRoot, ec))
+    {
+        if (ec)
+            break;
+        if (entry.is_directory())
+            xpacs.push_back(entry.path());
+    }
+    std::sort(xpacs.begin(), xpacs.end(), [](auto const& a, auto const& b) {
+        return a.filename().string() < b.filename().string();
+    });
+
+    for (auto const& xpacDir : xpacs)
+    {
+        std::string xpacName = xpacDir.filename().string();
+        if (!ImGui::TreeNodeEx(xpacName.c_str(), ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth))
+            continue;
+
+        std::vector<std::filesystem::path> sifs;
+        for (auto const& entry : std::filesystem::recursive_directory_iterator(xpacDir, ec))
+        {
+            if (ec)
+                break;
+            if (!entry.is_regular_file())
+                continue;
+            if (_stricmp(entry.path().extension().string().c_str(), ".sif") == 0)
+                sifs.push_back(entry.path());
+        }
+        std::sort(sifs.begin(), sifs.end(), [](auto const& a, auto const& b) {
+            return a.filename().string() < b.filename().string();
+        });
+
+        for (auto const& sifPath : sifs)
+        {
+            std::filesystem::path relPath = std::filesystem::relative(sifPath, xpacDir, ec);
+            std::vector<std::string> parts;
+            for (auto const& part : relPath)
+            {
+                std::string seg = part.string();
+                if (seg.empty())
+                    continue;
+                if (_stricmp(seg.c_str(), "_Resource") == 0)
+                    continue;
+                if (!seg.empty() && seg[0] == '_')
+                    seg.erase(seg.begin());
+                if (!seg.empty())
+                    parts.push_back(seg);
+            }
+            std::string label;
+            if (parts.size() <= 1)
+            {
+                label = parts.empty() ? std::string() : parts.back();
+            }
+            else
+            {
+                for (std::size_t i = 1; i < parts.size(); ++i)
+                {
+                    if (i > 1)
+                        label += "/";
+                    label += parts[i];
+                }
+            }
+            if (label.empty())
+                label = sifPath.filename().string();
+
+            ImGui::PushID(sifPath.string().c_str());
+            ImGui::Selectable(label.c_str());
+            if (ImGui::BeginPopupContextItem())
+            {
+                if (ImGui::MenuItem("Load SIF"))
+                    LoadSifFile(sifPath);
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::TreePop();
+    }
+
+    ImGui::TreePop();
+}
+
+void CharmyBee::RenderStuffWindow()
+{
+    if (!_showStuffWindow)
+        return;
+
+    constexpr float kStuffWidth = 320.0f;
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 workPos = viewport ? viewport->WorkPos : ImVec2(0.0f, 0.0f);
+    ImVec2 workSize = viewport ? viewport->WorkSize : ImVec2(1280.0f, 720.0f);
+    float windowHeight = workSize.y - 20.0f;
+    if (windowHeight < 200.0f)
+        windowHeight = 200.0f;
+    ImGui::SetNextWindowPos(ImVec2(workPos.x + 10.0f, workPos.y + 10.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(kStuffWidth, windowHeight), ImGuiCond_Always);
+    if (!ImGui::Begin("CppSLib Stuff", &_showStuffWindow))
+    {
+        ImGui::End();
+        return;
+    }
+
+    std::filesystem::path root = GetStuffRoot();
+    ImGui::TextWrapped("Root: %s", root.string().c_str());
+    if (!_xpacStatus.empty())
+        ImGui::TextWrapped("%s", _xpacStatus.c_str());
+    if (ImGui::Button("Unpack XPAC..."))
+        UnpackXpac();
+    if (ImGui::Button("Nuke Stuff Folder"))
+        _confirmNukeStuff = true;
+
+    ImGui::Separator();
+    ImGui::BeginChild("StuffTree", ImVec2(0.0f, 0.0f), true);
+    RenderStuffTreeNode(root);
+    RenderStuffSifVirtualTree(root);
+    ImGui::EndChild();
+
+    ImGui::End();
+
+    if (_xpacBusy)
+        ImGui::OpenPopup("XPAC Unpack");
+    if (ImGui::BeginPopupModal("XPAC Unpack", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lock(_xpacMutex);
+            text = _xpacPopupText;
+        }
+        if (!text.empty())
+            ImGui::TextWrapped("%s", text.c_str());
+
+        std::size_t total = _xpacTotal.load();
+        std::size_t current = _xpacProgress.load();
+        float progress = 0.0f;
+        if (total > 0)
+            progress = static_cast<float>(current) / static_cast<float>(total);
+        ImGui::ProgressBar(progress, ImVec2(320.0f, 0.0f));
+        ImGui::Text("Files: %zu / %zu", current, total);
+
+        if (!_xpacBusy)
+            ImGui::CloseCurrentPopup();
+
+        ImGui::EndPopup();
+    }
+
+    if (_confirmNukeStuff)
+        ImGui::OpenPopup("Confirm Nuke");
+    if (ImGui::BeginPopupModal("Confirm Nuke", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextWrapped("Delete everything inside CppSLib_Stuff?");
+        ImGui::TextWrapped("This cannot be undone.");
+        ImGui::Separator();
+        if (ImGui::Button("Yes, delete"))
+        {
+            if (_xpacWorker && _xpacWorker->joinable())
+                _xpacWorker->join();
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+            std::filesystem::create_directories(root, ec);
+            _xpacStatus = "CppSLib_Stuff cleared.";
+            _confirmNukeStuff = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel"))
+        {
+            _confirmNukeStuff = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void CharmyBee::UnpackXpac()
+{
+    using namespace SeEditor::Dialogs;
+    FileDialogOptions options;
+    options.Title = "Unpack XPAC";
+    options.FilterPatterns = {"*.xpac"};
+    options.FilterDescription = "XPAC files";
+    if (!_lastXpacPath.empty())
+        options.DefaultPathAndFile = _lastXpacPath.string();
+
+    auto result = TinyFileDialog::openFileDialog(options);
+    if (!result)
+        return;
+
+    if (_xpacWorker && _xpacWorker->joinable())
+        _xpacWorker->join();
+
+    _lastXpacPath = *result;
+
+    _xpacProgress = 0;
+    _xpacTotal = 0;
+    _xpacBusy = true;
+    {
+        std::lock_guard<std::mutex> lock(_xpacMutex);
+        _xpacPopupText = "Unpacking " + _lastXpacPath.filename().string();
+    }
+
+    _xpacWorker = std::make_unique<std::thread>([this, path = *result]() {
+        Xpac::XpacUnpackOptions unpackOptions;
+        unpackOptions.XpacPath = path;
+        unpackOptions.OutputRoot = GetStuffRoot();
+        unpackOptions.MappingPath = Xpac::FindDefaultMappingPath(unpackOptions.XpacPath, unpackOptions.OutputRoot);
+        unpackOptions.ConvertToSifSig = true;
+        unpackOptions.Progress = [this](std::size_t current, std::size_t total) {
+            _xpacProgress = current;
+            _xpacTotal = total;
+        };
+
+        Xpac::XpacUnpackResult unpackResult = Xpac::UnpackXpac(unpackOptions);
+        std::ostringstream status;
+        status << "[XPAC] Entries: " << unpackResult.TotalEntries
+               << " | ZIF: " << unpackResult.ExtractedZif
+               << " | ZIG: " << unpackResult.ExtractedZig
+               << " | Converted: " << unpackResult.ConvertedPairs
+               << " | Skipped: " << unpackResult.SkippedEntries;
+        if (!unpackResult.Errors.empty())
+            status << " | Errors: " << unpackResult.Errors.size();
+
+        {
+            std::lock_guard<std::mutex> lock(_xpacMutex);
+            _xpacStatus = status.str();
+        }
+        std::cout << status.str() << std::endl;
+        for (auto const& err : unpackResult.Errors)
+            std::cout << "[XPAC] " << err << std::endl;
+
+        _xpacBusy = false;
+    });
 }
 
 void CharmyBee::OpenSifFile()
@@ -2070,119 +2189,149 @@ void CharmyBee::OpenSifFile()
 
     if (auto result = TinyFileDialog::openFileDialog(options))
     {
-        std::ifstream file(*result, std::ios::binary);
-        if (!file)
+        LoadSifFile(*result);
+    }
+}
+
+void CharmyBee::LoadSifFile(std::filesystem::path const& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        _sifHexDump.clear();
+        _sifFilePath.clear();
+        _sifLoadMessage = "Failed to open file.";
+        ReportSifError(_sifLoadMessage);
+        return;
+    }
+
+    std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+    std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+    if (data.empty())
+    {
+        std::filesystem::path fallback = path;
+        if (_stricmp(path.extension().string().c_str(), ".sif") == 0)
+            fallback.replace_extension(".zif");
+        else if (_stricmp(path.extension().string().c_str(), ".sig") == 0)
+            fallback.replace_extension(".zig");
+
+        if (fallback != path && std::filesystem::exists(fallback))
         {
-            _sifHexDump.clear();
-            _sifFilePath.clear();
-            _sifLoadMessage = "Failed to open file.";
-            ReportSifError(_sifLoadMessage);
-            return;
-        }
-
-        std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
-        std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
-
-        _sifHexDump = FormatHexDump(data);
-        _sifFilePath = *result;
-        _sifOriginalSize = data.size();
-        _sifDecompressedSize = data.size();
-        _sifFileCompressed = false;
-        _sifChunks.clear();
-        _sifGpuChunks.clear();
-        _sifGpuRaw.clear();
-        _sifParseError.clear();
-
-        std::string parseError;
-        std::optional<SifParseResult> parseResult = ParseSifFile(data, parseError);
-        if (!parseResult)
-        {
-            _sifParseError = parseError;
-            _sifLoadMessage = "Loaded " + std::to_string(data.size()) + " bytes, parse error: " + parseError;
-            ReportSifError(_sifLoadMessage);
-        }
-        else
-        {
-            _sifChunks = std::move(parseResult->Chunks);
-            _sifFileCompressed = parseResult->WasCompressed;
-            _sifDecompressedSize = parseResult->DecompressedSize;
-            _selectedChunk = !_sifChunks.empty() ? 0 : -1;
-
-            _sifLoadMessage = "Loaded " + std::to_string(data.size()) + " bytes";
-            if (_sifFileCompressed)
-                _sifLoadMessage += " (decompressed to " + std::to_string(_sifDecompressedSize) + " bytes)";
-            if (!_sifChunks.empty())
-                _sifLoadMessage += ", parsed " + std::to_string(_sifChunks.size()) + " chunks.";
-
-            _renderer.SetForestMeshes({});
-            _renderer.SetDrawForestMeshes(false);
-            _drawForestMeshes = false;
-            _forestLibrary.reset();
-            _sifNavigation.reset();
-            _sifNavigationTool.reset();
-            _navigationLineEntries.clear();
-            _showNavigationHierarchyWindow = false;
-            _drawNavigation = false;
-            _sifLogic.reset();
-            _drawLogic = false;
-            _itemsForestLibrary.reset();
-            _itemsForestMeshesByForestTree.clear();
-            _itemsForestMeshesByTreeHash.clear();
-            _logicLocatorMeshes.clear();
-            _logicLocatorHasMesh.clear();
-
-            try
+            std::ifstream fallbackFile(fallback, std::ios::binary);
+            if (fallbackFile)
             {
-                std::filesystem::path gpuPath = _sifFilePath;
-                std::filesystem::path altGpuPath;
-                if (gpuPath.extension() == ".sif")
+                std::vector<char> fallbackBuffer((std::istreambuf_iterator<char>(fallbackFile)), {});
+                std::vector<std::uint8_t> fallbackData(fallbackBuffer.begin(), fallbackBuffer.end());
+                if (!fallbackData.empty())
                 {
-                    gpuPath.replace_extension(".zig");
-                    altGpuPath = _sifFilePath;
-                    altGpuPath.replace_extension(".sig");
-                }
-                else if (gpuPath.extension() == ".zif")
-                {
-                    gpuPath.replace_extension(".zig");
-                    altGpuPath = _sifFilePath;
-                    altGpuPath.replace_extension(".sig");
-                }
-
-                std::filesystem::path chosenGpuPath;
-                if (std::filesystem::exists(gpuPath))
-                    chosenGpuPath = gpuPath;
-                else if (!altGpuPath.empty() && std::filesystem::exists(altGpuPath))
-                    chosenGpuPath = altGpuPath;
-
-                if (!chosenGpuPath.empty())
-                {
-                    std::ifstream gpuFile(chosenGpuPath, std::ios::binary);
-                    if (gpuFile)
-                    {
-                        std::vector<char> gpuBuffer((std::istreambuf_iterator<char>(gpuFile)), {});
-                        std::vector<std::uint8_t> gpuData(gpuBuffer.begin(), gpuBuffer.end());
-                        bool compressed = false;
-                        if (LooksLikeZlib(gpuData))
-                        {
-                            auto inflated = DecompressZlib(gpuData);
-                            if (inflated.size() >= 4)
-                                gpuData.assign(inflated.begin() + 4, inflated.end());
-                            compressed = true;
-                        }
-
-                        if (!compressed)
-                            StripLengthPrefixIfPresent(gpuData);
-
-                        _sifGpuRaw.assign(gpuData.begin(), gpuData.end());
-                        std::cout << "[CharmyBee] Using raw GPU buffer (" << _sifGpuRaw.size() << " bytes) for "
-                                  << chosenGpuPath.string() << '.' << std::endl;
-                    }
+                    if (LooksLikeZlib(fallbackData))
+                        fallbackData = DecompressZlib(fallbackData);
+                    StripLengthPrefixIfPresent(fallbackData);
+                    data = std::move(fallbackData);
                 }
             }
-            catch (...) {}
-
-            LoadCollisionDebugGeometry();
         }
+    }
+
+    _sifHexDump = FormatHexDump(data);
+    _sifFilePath = path.string();
+    _sifOriginalSize = data.size();
+    _sifDecompressedSize = data.size();
+    _sifFileCompressed = false;
+    _sifChunks.clear();
+    _sifGpuChunks.clear();
+    _sifGpuRaw.clear();
+    _sifParseError.clear();
+
+    std::string parseError;
+    std::optional<SifParseResult> parseResult = ParseSifFile(data, parseError);
+    if (!parseResult)
+    {
+        _sifParseError = parseError;
+        _sifLoadMessage = "Loaded " + std::to_string(data.size()) + " bytes, parse error: " + parseError;
+        ReportSifError(_sifLoadMessage);
+    }
+    else
+    {
+        _sifChunks = std::move(parseResult->Chunks);
+        _sifFileCompressed = parseResult->WasCompressed;
+        _sifDecompressedSize = parseResult->DecompressedSize;
+        _selectedChunk = !_sifChunks.empty() ? 0 : -1;
+
+        _sifLoadMessage = "Loaded " + std::to_string(data.size()) + " bytes";
+        if (_sifFileCompressed)
+            _sifLoadMessage += " (decompressed to " + std::to_string(_sifDecompressedSize) + " bytes)";
+        if (!_sifChunks.empty())
+            _sifLoadMessage += ", parsed " + std::to_string(_sifChunks.size()) + " chunks.";
+
+        _renderer.SetForestMeshes({});
+        _renderer.SetDrawForestMeshes(false);
+        _drawForestMeshes = false;
+        _forestLibrary.reset();
+        _sifNavigation.reset();
+        _sifNavigationTool.reset();
+        _navigationLineEntries.clear();
+        _showNavigationHierarchyWindow = false;
+        _drawNavigation = false;
+        _sifLogic.reset();
+        _drawLogic = false;
+        _itemsForestLibrary.reset();
+        _itemsForestMeshesByForestTree.clear();
+        _itemsForestMeshesByTreeHash.clear();
+        _logicLocatorMeshes.clear();
+        _logicLocatorHasMesh.clear();
+
+        try
+        {
+            std::filesystem::path gpuPath = path;
+            std::filesystem::path altGpuPath;
+            if (gpuPath.extension() == ".sif")
+            {
+                gpuPath.replace_extension(".sig");
+                altGpuPath = path;
+                altGpuPath.replace_extension(".zig");
+            }
+            else if (gpuPath.extension() == ".zif")
+            {
+                gpuPath.replace_extension(".zig");
+                altGpuPath = path;
+                altGpuPath.replace_extension(".sig");
+            }
+
+            std::filesystem::path chosenGpuPath;
+            if (std::filesystem::exists(gpuPath))
+                chosenGpuPath = gpuPath;
+            else if (!altGpuPath.empty() && std::filesystem::exists(altGpuPath))
+                chosenGpuPath = altGpuPath;
+
+            if (!chosenGpuPath.empty())
+            {
+                std::ifstream gpuFile(chosenGpuPath, std::ios::binary);
+                if (gpuFile)
+                {
+                    std::vector<char> gpuBuffer((std::istreambuf_iterator<char>(gpuFile)), {});
+                    std::vector<std::uint8_t> gpuData(gpuBuffer.begin(), gpuBuffer.end());
+                    bool compressed = false;
+                    if (LooksLikeZlib(gpuData))
+                    {
+                        auto inflated = DecompressZlib(gpuData);
+                        if (inflated.size() >= 4)
+                            gpuData.assign(inflated.begin() + 4, inflated.end());
+                        compressed = true;
+                    }
+
+                    if (!compressed)
+                        StripLengthPrefixIfPresent(gpuData);
+
+                    _sifGpuRaw.assign(gpuData.begin(), gpuData.end());
+                    std::cout << "[CharmyBee] Using raw GPU buffer (" << _sifGpuRaw.size() << " bytes) for "
+                              << chosenGpuPath.string() << '.' << std::endl;
+                }
+            }
+        }
+        catch (...) {}
+
+        LoadCollisionDebugGeometry();
     }
 }
 
@@ -4237,213 +4386,6 @@ void CharmyBee::PollGlfwKeyInput()
 }
 
 
-void CharmyBee::ConvertSifWithWorkspace()
-{
-    if (_sifFilePath.empty())
-    {
-        _sifLoadMessage = "Load a SIF file before converting.";
-        ReportSifError(_sifLoadMessage);
-        return;
-    }
-
-    namespace fs = std::filesystem;
-    fs::path project = fs::absolute(fs::path("..") / "SlMod" / "SlLib.Workspace" / "SlLib.Workspace.csproj");
-    if (!fs::exists(project))
-    {
-        fs::path repoRoot = fs::path(__FILE__).parent_path().parent_path().parent_path();
-        fs::path alternate = repoRoot / "SlMod" / "SlLib.Workspace" / "SlLib.Workspace.csproj";
-        if (fs::exists(alternate))
-        {
-            project = alternate;
-        }
-        else
-        {
-            _sifLoadMessage = "SlMod workspace project not found: " + project.string();
-            ReportSifError(_sifLoadMessage);
-            return;
-        }
-    }
-
-    fs::path original = fs::path(_sifFilePath);
-    fs::path base = original;
-    base.replace_extension();
-
-    std::vector<fs::path> searchDirs;
-    fs::path originalParent = original.parent_path();
-    if (!originalParent.empty())
-        searchDirs.push_back(originalParent);
-    fs::path grandParent = originalParent.parent_path();
-    fs::path datasetRoot;
-    if (!grandParent.empty())
-    {
-        searchDirs.push_back(grandParent);
-        searchDirs.push_back(grandParent / "Tracks");
-        searchDirs.push_back(grandParent / "Original");
-        datasetRoot = grandParent.parent_path();
-
-        if (!datasetRoot.empty())
-        {
-            searchDirs.push_back(datasetRoot / "Research_Tracks");
-            searchDirs.push_back(datasetRoot / "ResearchTrackStructure" / "Tracks");
-            searchDirs.push_back(datasetRoot / "ResearchTrackStructure" / "Original");
-        }
-    }
-    fs::path repoRoot = fs::path(__FILE__).parent_path().parent_path().parent_path();
-    searchDirs.push_back(repoRoot / "ResearchTrackStructure");
-    searchDirs.push_back(repoRoot / "ResearchTrackStructure" / "Tracks");
-    searchDirs.push_back(repoRoot / "ResearchTrackStructure" / "Original");
-    searchDirs.push_back(repoRoot / "Research_Tracks");
-
-    std::string baseName = original.stem().string();
-    fs::path targetZif = originalParent / (baseName + ".zif");
-    fs::path targetZig = originalParent / (baseName + ".zig");
-
-    const std::vector<std::string> cpuExtensions = {".zif", ".sif", ".sig"};
-    const std::vector<std::string> gpuExtensions = {".zig"};
-    std::optional<fs::path> cpuInput;
-    std::optional<fs::path> gpuInput;
-
-    auto matchesAny = [&](std::string const& candidate, std::vector<std::string> const& list) -> bool {
-        for (auto const& ext : list)
-        {
-            if (_stricmp(candidate.c_str(), ext.c_str()) == 0)
-                return true;
-        }
-        return false;
-    };
-
-    auto considerCandidate = [&](fs::path const& candidate) {
-        std::string stem = candidate.stem().string();
-        if (_stricmp(stem.c_str(), baseName.c_str()) != 0)
-            return;
-
-        std::string entryExt = candidate.extension().string();
-        if (!gpuInput && matchesAny(entryExt, gpuExtensions))
-        {
-            gpuInput = candidate;
-            return;
-        }
-
-        if (!cpuInput && matchesAny(entryExt, cpuExtensions))
-        {
-            cpuInput = candidate;
-        }
-    };
-
-    considerCandidate(original);
-
-    auto searchInDirectory = [&](fs::path const& dir) {
-        if (dir.empty() || !fs::exists(dir))
-            return;
-
-        for (auto const& entry : fs::recursive_directory_iterator(dir))
-        {
-            if (!entry.is_regular_file())
-                continue;
-
-            considerCandidate(entry.path());
-            if (cpuInput && gpuInput)
-                return;
-        }
-    };
-
-    for (auto const& dir : searchDirs)
-    {
-        if (cpuInput && gpuInput)
-            break;
-        searchInDirectory(dir);
-    }
-
-    if (!(cpuInput && gpuInput))
-    {
-        fs::path current = originalParent;
-        while (!current.empty() && !(cpuInput && gpuInput))
-        {
-            searchInDirectory(current);
-            current = current.parent_path();
-        }
-    }
-
-    if (!(cpuInput && gpuInput) && datasetRoot != fs::path())
-    {
-        searchInDirectory(datasetRoot);
-    }
-
-    if (!(cpuInput && gpuInput))
-    {
-        fs::path root = repoRoot;
-        searchInDirectory(root);
-    }
-
-    if (!cpuInput)
-    {
-        _sifLoadMessage = "Unable to locate CPU SIF/ZIF/SIG input for converter: " + base.string();
-        ReportSifError(_sifLoadMessage);
-        return;
-    }
-
-    if (!gpuInput)
-    {
-        _sifLoadMessage =
-            "Converter requires a GPU ZIG file (" + (targetZig.filename().string()) +
-            ") next to the SIF input before conversion can run.";
-        ReportSifError(_sifLoadMessage);
-        return;
-    }
-
-    auto copyInput = [&](fs::path const& source, fs::path const& target) -> bool {
-        if (source == target)
-            return true;
-
-        try
-        {
-            fs::create_directories(target.parent_path());
-            if (fs::exists(target))
-                fs::remove(target);
-            fs::copy_file(source, target, fs::copy_options::overwrite_existing);
-            return true;
-        }
-        catch (std::exception const& ex)
-        {
-            _sifLoadMessage = "Failed to copy " + source.filename().string() +
-                " to workspace directory: " + std::string(ex.what());
-            ReportSifError(_sifLoadMessage);
-            return false;
-        }
-    };
-
-    if (!copyInput(*cpuInput, targetZif))
-        return;
-    if (!copyInput(*gpuInput, targetZig))
-        return;
-
-    if (!fs::exists(targetZif))
-    {
-        _sifLoadMessage = "Unable to prepare ZIF input for converter: " + targetZif.string();
-        ReportSifError(_sifLoadMessage);
-        return;
-    }
-
-    if (!fs::exists(targetZig))
-    {
-        _sifLoadMessage = "Unable to prepare ZIG input for converter: " + targetZig.string();
-        ReportSifError(_sifLoadMessage);
-        return;
-    }
-
-    std::string command = std::string("dotnet run --project ") + QuoteArgument(project.string()) +
-        " convert-siff " + QuoteArgument(base.string()) + " " + QuoteArgument(base.string());
-
-    int exitCode = std::system(command.c_str());
-    if (exitCode == 0)
-        _sifLoadMessage = "SlMod converter wrote " + base.string() + ".dat/.gpu.";
-    else
-    {
-        _sifLoadMessage = "Converter exit code " + std::to_string(exitCode) + ".";
-        ReportSifError(_sifLoadMessage);
-    }
-}
-
 void CharmyBee::RenderMainDockWindow()
 {
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
@@ -4468,31 +4410,13 @@ void CharmyBee::RenderMainDockWindow()
         {
             if (ImGui::BeginMenu("File"))
             {
-                if (ImGui::MenuItem("Close Workspace"))
-                    _requestedWorkspaceClose = true;
-
-                if (ImGui::MenuItem("DEBUG SAVE TO DESKTOP"))
-                {
-                    std::cout << "[CharmyBee] Debug save to desktop invoked.\n";
-                }
-
-                if (ImGui::MenuItem("DEBUG SAVE TO SEASIDEHILL"))
-                {
-                    std::cout << "[CharmyBee] Debug save to Seaside Hill invoked.\n";
-                }
-
-                if (ImGui::MenuItem("DEBUG SAVE ALL"))
-                {
-                    std::cout << "[CharmyBee] Debug save all invoked.\n";
-                }
-
                 if (ImGui::MenuItem("Load SIF File..."))
                 {
                     OpenSifFile();
                 }
-                if (ImGui::MenuItem("Convert SIF via SlMod Workspace"))
+                if (ImGui::MenuItem("Unpack XPAC..."))
                 {
-                    ConvertSifWithWorkspace();
+                    UnpackXpac();
                 }
 
                 ImGui::EndMenu();
@@ -4500,9 +4424,9 @@ void CharmyBee::RenderMainDockWindow()
 
             if (ImGui::BeginMenu("View"))
             {
-                ImGui::MenuItem("Hierarchy", nullptr, &_showHierarchyWindow);
                 if (ImGui::MenuItem("Forest hierarchy", nullptr, &_showForestHierarchyWindow))
                     UpdateForestBoxRenderer();
+                ImGui::MenuItem("CppSLib Stuff", nullptr, &_showStuffWindow);
                 ImGui::EndMenu();
             }
 
@@ -4563,7 +4487,6 @@ void CharmyBee::Run()
     _inspectorPanel = std::make_unique<Editor::Panel::InspectorPanel>();
 
     OnLoad();
-    PrintSceneInfo();
 
     auto previousTime = std::chrono::steady_clock::now();
     while (!_controller->ShouldClose())
@@ -4576,17 +4499,10 @@ void CharmyBee::Run()
         _controller->NewFrame();
 
         RenderMainDockWindow();
-        if (_database)
-            RenderWorkspace();
-        else
-            RenderProjectSelector();
-
-        RenderHierarchyWindow();
+        RenderRacingLineEditor();
+        RenderStuffWindow();
 
         RenderSifViewer();
-
-        if (_requestedWorkspaceClose)
-            TriggerCloseWorkspace();
 
         _renderer.Render();
         _controller->Render();

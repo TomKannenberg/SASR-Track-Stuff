@@ -9,7 +9,10 @@
 #include <optional>
 #include <string>
 #include <array>
+#include <atomic>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 
@@ -68,7 +71,6 @@ private:
     std::unique_ptr<Editor::Panel::AssetPanel> _assetPanel;
     std::unique_ptr<Editor::Panel::ScenePanel> _scenePanel;
     std::unique_ptr<Editor::Panel::InspectorPanel> _inspectorPanel;
-    bool _requestedWorkspaceClose = false;
     bool _quickstart = true;
     Renderer::SlRenderer _renderer;
     std::vector<SlLib::Math::Vector3> _collisionVertices;
@@ -84,6 +86,16 @@ private:
     bool _drawLogicTriggers = true;
     bool _drawLogicLocators = true;
     float _logicLocatorBoxSize = 2.0f;
+    bool _showStuffWindow = true;
+    std::string _xpacStatus;
+    std::filesystem::path _lastXpacPath;
+    std::atomic<bool> _xpacBusy{false};
+    std::atomic<std::size_t> _xpacProgress{0};
+    std::atomic<std::size_t> _xpacTotal{0};
+    std::string _xpacPopupText;
+    bool _confirmNukeStuff = false;
+    std::mutex _xpacMutex;
+    std::unique_ptr<std::thread> _xpacWorker;
     std::shared_ptr<SeEditor::Forest::ForestLibrary> _forestLibrary;
     using ForestMeshList = std::vector<Renderer::SlRenderer::ForestCpuMesh>;
     std::shared_ptr<SeEditor::Forest::ForestLibrary> _itemsForestLibrary;
@@ -104,7 +116,6 @@ private:
     };
     bool _showForestHierarchyWindow = false;
     bool _showNavigationHierarchyWindow = false;
-    bool _showHierarchyWindow = true;
     std::vector<ForestBoxLayer> _forestBoxLayers;
     std::vector<Renderer::SlRenderer::ForestCpuMesh> _allForestMeshes;
     struct NavigationLineEntry
@@ -158,18 +169,14 @@ private:
     std::size_t _totalForestMeshes = 0;
 
     void RenderMainDockWindow();
-    void RenderWorkspace();
-    void RenderHierarchy(bool definitions);
-    void RenderHierarchyWindow();
+    void RenderStuffWindow();
     void RenderAssetView();
     void RenderSceneView();
     void RenderRacingLineEditor();
-    void RenderProjectSelector();
     void RenderPanelWindow(char const* title, Editor::Panel::IEditorPanel* panel);
     void OnLoad();
     void SetupNavigationRendering(SlLib::SumoTool::Siff::Navigation* navigation);
     void OnWorkspaceLoad();
-    void TriggerCloseWorkspace();
     void LoadCollisionDebugGeometry();
     void LoadForestDebugGeometry();
     void LoadForestResources();
@@ -197,13 +204,17 @@ private:
     void DrawNodeCreationMenu();
     void AddItemNode(std::string const& name, SlLib::Resources::Scene::SeDefinitionNode* definition = nullptr);
     void RenderSifViewer();
+    void UnpackXpac();
     void OpenSifFile();
-    void ConvertSifWithWorkspace();
+    void LoadSifFile(std::filesystem::path const& path);
     void PollGlfwKeyInput();
 
     TreeNode* AddFolderNode(std::string const& path);
     void ResetAssetTree();
     std::vector<std::string> GetPathComponents(std::string const& value) const;
+    std::filesystem::path GetStuffRoot() const;
+    void RenderStuffTreeNode(std::filesystem::path const& path);
+    void RenderStuffSifVirtualTree(std::filesystem::path const& root);
 };
 
 } // namespace SeEditor

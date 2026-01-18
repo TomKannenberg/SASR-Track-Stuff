@@ -13,4 +13,5 @@ build_release/
 imgui.ini
 track.Forest
 *_forestXYZ.txt
+CppSLib_Stuff/
 gitignore.bak/
