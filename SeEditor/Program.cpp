@@ -134,8 +134,7 @@ std::unordered_map<int, std::string> LoadExcelLookup(std::filesystem::path const
 
 std::filesystem::path GetDefaultStuffRoot()
 {
-    std::filesystem::path repoRoot = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
-    std::filesystem::path root = repoRoot / "CppSLib_Stuff";
+    std::filesystem::path root = std::filesystem::current_path() / "CppSLib_Stuff";
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     return root;

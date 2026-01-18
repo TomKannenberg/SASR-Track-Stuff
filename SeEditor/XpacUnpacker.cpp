@@ -8,6 +8,8 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <span>
 
@@ -19,6 +21,10 @@
 namespace SeEditor::Xpac {
 
 namespace {
+
+#if defined(SEEDITOR_EMBED_MAPPING)
+#include "EmbeddedMapping.hpp"
+#endif
 
 constexpr std::uint32_t MakeTypeCode(char a, char b, char c, char d)
 {
@@ -121,36 +127,51 @@ std::vector<std::uint8_t> DecompressZlib(std::span<const std::uint8_t> data, std
     return result;
 }
 
-std::unordered_map<std::uint32_t, std::string> LoadMapping(std::filesystem::path const& mappingPath)
+std::unordered_map<std::uint32_t, std::string> LoadMappingFromText(std::string_view text)
 {
     std::unordered_map<std::uint32_t, std::string> mapping;
+    std::size_t start = 0;
+    while (start < text.size())
+    {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string_view::npos)
+            end = text.size();
+        std::string_view line = text.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (!line.empty())
+        {
+            auto colon = line.find(':');
+            auto semi = line.find(';', colon != std::string_view::npos ? colon + 1 : 0);
+            if (colon != std::string_view::npos && semi != std::string_view::npos)
+            {
+                std::string key(line.substr(0, colon));
+                std::string value(line.substr(colon + 1, semi - colon - 1));
+                try
+                {
+                    std::uint32_t hash = static_cast<std::uint32_t>(std::stoul(key));
+                    mapping.emplace(hash, value);
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+        if (end == text.size())
+            break;
+        start = end + 1;
+    }
+    return mapping;
+}
+
+std::unordered_map<std::uint32_t, std::string> LoadMapping(std::filesystem::path const& mappingPath)
+{
     std::ifstream file(mappingPath);
     if (!file)
-        return mapping;
+        return {};
 
-    std::string line;
-    while (std::getline(file, line))
-    {
-        if (line.empty())
-            continue;
-        auto colon = line.find(':');
-        auto semi = line.find(';', colon != std::string::npos ? colon + 1 : 0);
-        if (colon == std::string::npos || semi == std::string::npos)
-            continue;
-        std::string key = line.substr(0, colon);
-        std::string value = line.substr(colon + 1, semi - colon - 1);
-        try
-        {
-            std::uint32_t hash = static_cast<std::uint32_t>(std::stoul(key));
-            mapping.emplace(hash, value);
-        }
-        catch (...)
-        {
-            continue;
-        }
-    }
-
-    return mapping;
+    std::string contents((std::istreambuf_iterator<char>(file)), {});
+    return LoadMappingFromText(contents);
 }
 
 std::filesystem::path CleanMappingPath(std::string value)
@@ -276,6 +297,37 @@ bool ReadFileBytes(std::filesystem::path const& path, std::vector<std::uint8_t>&
     return true;
 }
 
+struct UnknownDecodeResult
+{
+    std::vector<std::uint8_t> Data;
+    bool IsSif = false;
+    bool Decoded = false;
+};
+
+UnknownDecodeResult DecodeUnknownPayload(std::vector<std::uint8_t> const& payload)
+{
+    UnknownDecodeResult result;
+    if (LooksLikeSif(payload))
+    {
+        result.Data = payload;
+        result.IsSif = true;
+        return result;
+    }
+
+    std::string error;
+    std::vector<std::uint8_t> decoded;
+    if (DecodeZifZig(payload, decoded, error) && !decoded.empty())
+    {
+        result.Data = std::move(decoded);
+        result.IsSif = LooksLikeSif(result.Data);
+        result.Decoded = true;
+        return result;
+    }
+
+    result.Data = payload;
+    return result;
+}
+
 } // namespace
 
 std::optional<std::filesystem::path> FindDefaultMappingPath(std::filesystem::path const& xpacPath,
@@ -334,6 +386,13 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
     std::unordered_map<std::uint32_t, std::string> mapping;
     if (mappingPath)
         mapping = LoadMapping(*mappingPath);
+#if defined(SEEDITOR_EMBED_MAPPING)
+    if (mapping.empty() && kEmbeddedMappingSize > 0)
+    {
+        mapping = LoadMappingFromText(
+            std::string_view(reinterpret_cast<char const*>(kEmbeddedMapping), kEmbeddedMappingSize));
+    }
+#endif
 
     std::ifstream file(options.XpacPath, std::ios::binary);
     if (!file)
@@ -454,50 +513,59 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
         }
 
         bool wroteFile = false;
-        if (!extension.empty() && (extension == ".zif" || extension == ".zig"))
+        std::string error;
+        if (!relativePath.empty())
         {
             outputPath = xpacRoot / relativePath;
-            std::string error;
             if (WriteFile(outputPath, payload, error))
             {
                 wroteFile = true;
-                if (extension == ".zif")
-                    result.ExtractedZif++;
-                else
-                    result.ExtractedZig++;
+                if (!extension.empty() && (extension == ".zif" || extension == ".zig"))
+                {
+                    if (extension == ".zif")
+                        result.ExtractedZif++;
+                    else
+                        result.ExtractedZig++;
 
-                std::filesystem::path base = outputPath;
-                base.replace_extension();
-                PairPaths& pair = pairMap[base.string()];
-                if (extension == ".zif")
-                    pair.Zif = outputPath;
-                else
-                    pair.Zig = outputPath;
+                    std::filesystem::path base = outputPath;
+                    base.replace_extension();
+                    PairPaths& pair = pairMap[base.string()];
+                    if (extension == ".zif")
+                        pair.Zif = outputPath;
+                    else
+                        pair.Zig = outputPath;
+                }
             }
             else
             {
                 result.Errors.push_back(error);
-            }
-        }
-        else if (isSif)
-        {
-            std::filesystem::path unknownDir = xpacRoot / "unknown_cpu";
-            std::filesystem::path name = "hash_" + HashHex(entry.Hash) + ".zif";
-            outputPath = unknownDir / name;
-            std::string error;
-            if (WriteFile(outputPath, payload, error))
-            {
-                wroteFile = true;
-                result.ExtractedZif++;
-            }
-            else
-            {
-                result.Errors.push_back(error);
+                result.SkippedEntries++;
             }
         }
         else
         {
-            result.SkippedEntries++;
+            std::filesystem::path unknownDir = xpacRoot / "unknown";
+            UnknownDecodeResult unknown = DecodeUnknownPayload(payload);
+            isSif = unknown.IsSif;
+            std::string ext;
+            if (unknown.Decoded)
+                ext = unknown.IsSif ? ".sif" : ".sig";
+            else
+                ext = unknown.IsSif ? ".zif" : ".bin";
+
+            std::filesystem::path name = "hash_" + HashHex(entry.Hash) + ext;
+            outputPath = unknownDir / name;
+            if (WriteFile(outputPath, unknown.Data, error))
+            {
+                wroteFile = true;
+                if (ext == ".zif")
+                    result.ExtractedZif++;
+            }
+            else
+            {
+                result.Errors.push_back(error);
+                result.SkippedEntries++;
+            }
         }
 
         if (manifest && wroteFile)
@@ -517,10 +585,23 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
 
     if (options.ConvertToSifSig)
     {
+        std::vector<std::reference_wrapper<const PairPaths>> convertPairs;
+        convertPairs.reserve(pairMap.size());
         for (auto const& [base, pair] : pairMap)
         {
             if (pair.Zif.empty() || pair.Zig.empty())
                 continue;
+            convertPairs.emplace_back(pair);
+        }
+        if (options.ProgressConvert)
+            options.ProgressConvert(0, convertPairs.size());
+
+        std::size_t convertProcessed = 0;
+        for (auto const& pairRef : convertPairs)
+        {
+            auto const& pair = pairRef.get();
+            if (options.ProgressConvert)
+                options.ProgressConvert(convertProcessed, convertPairs.size());
 
             std::vector<std::uint8_t> sif;
             std::vector<std::uint8_t> sig;
@@ -573,7 +654,10 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
             }
 
             result.ConvertedPairs++;
+            ++convertProcessed;
         }
+        if (options.ProgressConvert)
+            options.ProgressConvert(convertProcessed, convertPairs.size());
     }
 
     return result;

@@ -26,6 +26,7 @@ struct XpacUnpackOptions
     std::optional<std::filesystem::path> MappingPath;
     bool ConvertToSifSig = true;
     std::function<void(std::size_t current, std::size_t total)> Progress;
+    std::function<void(std::size_t current, std::size_t total)> ProgressConvert;
 };
 
 struct XpacUnpackResult

@@ -26,6 +26,7 @@
 #include <SlLib/SumoTool/Siff/Navigation.hpp>
 
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include <limits>
 #include <functional>
@@ -1160,6 +1161,42 @@ void BuildForestTreeMeshMaps(SeEditor::Forest::ForestLibrary const& library,
 
 namespace SeEditor {
 
+void* CharmyBee::SettingsReadOpen(ImGuiContext*, ImGuiSettingsHandler* handler, const char* name)
+{
+    if (!handler || !name || std::strcmp(name, "Data") != 0)
+        return nullptr;
+    return handler->UserData;
+}
+
+void CharmyBee::SettingsReadLine(ImGuiContext*, ImGuiSettingsHandler* handler, void* entry, const char* line)
+{
+    auto* self = static_cast<CharmyBee*>(entry ? entry : (handler ? handler->UserData : nullptr));
+    if (!self || !line)
+        return;
+    constexpr char key[] = "StuffRoot=";
+    if (std::strncmp(line, key, sizeof(key) - 1) == 0)
+    {
+        const char* value = line + sizeof(key) - 1;
+        if (!value || *value == '\0')
+        {
+            self->_stuffRootOverride.reset();
+            return;
+        }
+        self->_stuffRootOverride = std::filesystem::path(value);
+    }
+}
+
+void CharmyBee::SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf)
+{
+    auto* self = static_cast<CharmyBee*>(handler ? handler->UserData : nullptr);
+    if (!self || !buf)
+        return;
+    buf->appendf("[%s][Data]\n", handler->TypeName);
+    if (self->_stuffRootOverride && !self->_stuffRootOverride->empty())
+        buf->appendf("StuffRoot=%s\n", self->_stuffRootOverride->string().c_str());
+    buf->append("\n");
+}
+
 CharmyBee::CharmyBee(std::string title, int width, int height, bool debugKeyInput)
     : _title(std::move(title))
     , _width(width)
@@ -1192,6 +1229,30 @@ void CharmyBee::OnLoad()
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigDragClickToInputText = true;
     io.ConfigWindowsMoveFromTitleBarOnly = true;
+
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    if (context)
+    {
+        ImGuiSettingsHandler handler;
+        handler.TypeName = "CppSLib";
+        handler.TypeHash = ImHashStr("CppSLib");
+        handler.UserData = this;
+        handler.ReadOpenFn = &CharmyBee::SettingsReadOpen;
+        handler.ReadLineFn = &CharmyBee::SettingsReadLine;
+        handler.WriteAllFn = &CharmyBee::SettingsWriteAll;
+
+        bool alreadyRegistered = false;
+        for (auto const& existing : context->SettingsHandlers)
+        {
+            if (existing.TypeHash == handler.TypeHash)
+            {
+                alreadyRegistered = true;
+                break;
+            }
+        }
+        if (!alreadyRegistered)
+            ImGui::AddSettingsHandler(&handler);
+    }
 
     _renderer.Initialize();
 }
@@ -1885,8 +1946,15 @@ void CharmyBee::RenderSifViewer()
 
 std::filesystem::path CharmyBee::GetStuffRoot() const
 {
-    std::filesystem::path repoRoot = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
-    std::filesystem::path root = repoRoot / "CppSLib_Stuff";
+    std::filesystem::path root;
+    if (_stuffRootOverride && !_stuffRootOverride->empty())
+    {
+        root = *_stuffRootOverride;
+    }
+    else
+    {
+        root = std::filesystem::current_path() / "CppSLib_Stuff";
+    }
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     return root;
@@ -2049,6 +2117,18 @@ void CharmyBee::RenderStuffWindow()
 
     std::filesystem::path root = GetStuffRoot();
     ImGui::TextWrapped("Root: %s", root.string().c_str());
+    if (ImGui::Button("Change Root..."))
+    {
+        auto selected = SeEditor::Dialogs::TinyFileDialog::selectFolderDialog("Select CppSLib Stuff Root",
+                                                                              root.string());
+        if (selected && !selected->empty())
+        {
+            _stuffRootOverride = std::filesystem::path(*selected);
+            std::error_code ec;
+            std::filesystem::create_directories(*_stuffRootOverride, ec);
+            _xpacStatus = "Stuff root changed.";
+        }
+    }
     if (!_xpacStatus.empty())
         ImGui::TextWrapped("%s", _xpacStatus.c_str());
     if (ImGui::Button("Unpack XPAC..."))
@@ -2083,6 +2163,15 @@ void CharmyBee::RenderStuffWindow()
             progress = static_cast<float>(current) / static_cast<float>(total);
         ImGui::ProgressBar(progress, ImVec2(320.0f, 0.0f));
         ImGui::Text("Files: %zu / %zu", current, total);
+
+        std::size_t convertTotal = _xpacConvertTotal.load();
+        if (convertTotal > 0)
+        {
+            std::size_t convertCurrent = _xpacConvertProgress.load();
+            float convertProgress = static_cast<float>(convertCurrent) / static_cast<float>(convertTotal);
+            ImGui::ProgressBar(convertProgress, ImVec2(320.0f, 0.0f));
+            ImGui::Text("Decompress: %zu / %zu", convertCurrent, convertTotal);
+        }
 
         if (!_xpacBusy)
             ImGui::CloseCurrentPopup();
@@ -2139,6 +2228,8 @@ void CharmyBee::UnpackXpac()
 
     _xpacProgress = 0;
     _xpacTotal = 0;
+    _xpacConvertProgress = 0;
+    _xpacConvertTotal = 0;
     _xpacBusy = true;
     {
         std::lock_guard<std::mutex> lock(_xpacMutex);
@@ -2154,6 +2245,10 @@ void CharmyBee::UnpackXpac()
         unpackOptions.Progress = [this](std::size_t current, std::size_t total) {
             _xpacProgress = current;
             _xpacTotal = total;
+        };
+        unpackOptions.ProgressConvert = [this](std::size_t current, std::size_t total) {
+            _xpacConvertProgress = current;
+            _xpacConvertTotal = total;
         };
 
         Xpac::XpacUnpackResult unpackResult = Xpac::UnpackXpac(unpackOptions);

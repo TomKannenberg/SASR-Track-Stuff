@@ -37,6 +37,10 @@
 #include "SlLib/SumoTool/Siff/Navigation.hpp"
 #include "SlLib/SumoTool/Siff/LogicData.hpp"
 
+struct ImGuiSettingsHandler;
+struct ImGuiTextBuffer;
+struct ImGuiContext;
+
 namespace SeEditor {
 
 namespace Graphics::ImGui {
@@ -52,6 +56,10 @@ public:
     void Run();
 
 private:
+    static void* SettingsReadOpen(ImGuiContext* ctx, ImGuiSettingsHandler* handler, const char* name);
+    static void SettingsReadLine(ImGuiContext* ctx, ImGuiSettingsHandler* handler, void* entry, const char* line);
+    static void SettingsWriteAll(ImGuiContext* ctx, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf);
+
     struct TreeNode
     {
         explicit TreeNode(std::string name, bool isFolder = false);
@@ -89,9 +97,12 @@ private:
     bool _showStuffWindow = true;
     std::string _xpacStatus;
     std::filesystem::path _lastXpacPath;
+    std::optional<std::filesystem::path> _stuffRootOverride;
     std::atomic<bool> _xpacBusy{false};
     std::atomic<std::size_t> _xpacProgress{0};
     std::atomic<std::size_t> _xpacTotal{0};
+    std::atomic<std::size_t> _xpacConvertProgress{0};
+    std::atomic<std::size_t> _xpacConvertTotal{0};
     std::string _xpacPopupText;
     bool _confirmNukeStuff = false;
     std::mutex _xpacMutex;

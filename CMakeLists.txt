@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(SLLIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/SlLib")
 set(SEEDITOR_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/SeEditor")
 set(SLLIB_MARIOKART_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/SlLib.MarioKart")
+set(MAPPING_GC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/SeEditor/Resources/MAPPING.GC")
 
 # Collect sources for each logical target.
 file(GLOB_RECURSE SLLIB_SOURCES
@@ -62,6 +63,18 @@ target_link_libraries(SeEditorLib PUBLIC SeEditorCore SlLib imgui::imgui glfw gl
 target_include_directories(SeEditorLib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+if (EXISTS "${MAPPING_GC_PATH}")
+    set(EMBEDDED_MAPPING_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/EmbeddedMapping.hpp")
+    file(READ "${MAPPING_GC_PATH}" MAPPING_GC_TEXT)
+    file(WRITE "${EMBEDDED_MAPPING_HEADER}"
+        "#pragma once\n"
+        "#include <cstddef>\n"
+        "inline constexpr char kEmbeddedMapping[] = R\"MAPPINGGC(\n${MAPPING_GC_TEXT}\n)MAPPINGGC\";\n"
+        "inline constexpr std::size_t kEmbeddedMappingSize = sizeof(kEmbeddedMapping) - 1;\n"
+        )
+    target_include_directories(SeEditorLib PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_compile_definitions(SeEditorLib PRIVATE SEEDITOR_EMBED_MAPPING=1)
+endif()
 
 add_executable(CppSLib main.cpp)
 target_link_libraries(CppSLib PRIVATE SeEditorLib SlLibMarioKart)
