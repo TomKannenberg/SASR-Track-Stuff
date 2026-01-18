@@ -1591,7 +1591,7 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
 
     if (isDown(GLFW_KEY_Z)) _movementSpeed /= 1.05f;
     if (isDown(GLFW_KEY_X)) _movementSpeed *= 1.05f;
-    _movementSpeed = std::clamp(_movementSpeed, 1.0f, 40.0f);
+    _movementSpeed = std::max(_movementSpeed, 0.01f);
 
     double cursorX = 0.0;
     double cursorY = 0.0;

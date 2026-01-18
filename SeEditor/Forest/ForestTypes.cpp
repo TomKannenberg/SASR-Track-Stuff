@@ -1765,10 +1765,16 @@ void ForestLibrary::Load(SlLib::Serialization::ResourceLoadContext& context)
 
         std::span<const std::uint8_t> cpuSpan = context.Data().subspan(static_cast<std::size_t>(forestData));
         std::span<const std::uint8_t> gpuSpan;
-        if (!context.GpuData().empty() && gpuStart > 0 &&
-            static_cast<std::size_t>(gpuStart) < context.GpuData().size())
+        if (!context.GpuData().empty())
         {
-            gpuSpan = context.GpuData().subspan(static_cast<std::size_t>(gpuStart));
+            if (gpuStart == 0)
+            {
+                gpuSpan = context.GpuData();
+            }
+            else if (gpuStart > 0 && static_cast<std::size_t>(gpuStart) < context.GpuData().size())
+            {
+                gpuSpan = context.GpuData().subspan(static_cast<std::size_t>(gpuStart));
+            }
         }
 
         SlLib::Serialization::ResourceLoadContext subcontext(cpuSpan, gpuSpan);
