@@ -45,6 +45,7 @@ target_include_directories(SlLibMarioKart PUBLIC
 find_package(OpenGL REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glad CONFIG REQUIRED)
+set(ZLIB_USE_STATIC_LIBS ON)
 find_package(ZLIB REQUIRED)
 
 add_library(SeEditorLib STATIC ${SEEDITOR_SOURCES})

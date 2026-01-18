@@ -6,6 +6,7 @@
 #include <commdlg.h>
 #include <shlobj.h>
 #include <cstring>
+#include <iostream>
 
 extern "C" {
 static thread_local std::string g_tinyfdResult;
@@ -38,6 +39,14 @@ static std::vector<char> buildFilter(int numPatterns,
     return filter;
 }
 
+static HWND pickOwnerWindow()
+{
+    HWND owner = GetActiveWindow();
+    if (!owner)
+        owner = GetForegroundWindow();
+    return owner;
+}
+
 const char* tinyfd_openFileDialog(const char* aTitle,
                                   const char* aDefaultPathAndFile,
                                   int aNumOfFilterPatterns,
@@ -53,7 +62,7 @@ const char* tinyfd_openFileDialog(const char* aTitle,
 
     OPENFILENAMEA ofn{};
     ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = GetActiveWindow();
+    ofn.hwndOwner = pickOwnerWindow();
     ofn.lpstrTitle = aTitle;
     ofn.lpstrFile = fileBuffer;
     ofn.nMaxFile = MAX_PATH;
@@ -65,6 +74,9 @@ const char* tinyfd_openFileDialog(const char* aTitle,
     if (GetOpenFileNameA(&ofn))
         return saveResult(fileBuffer);
 
+    DWORD err = CommDlgExtendedError();
+    if (err != 0)
+        std::cerr << "[TinyFileDialog] openFileDialog failed err=" << err << "\n";
     return nullptr;
 }
 
@@ -82,7 +94,7 @@ const char* tinyfd_saveFileDialog(const char* aTitle,
 
     OPENFILENAMEA ofn{};
     ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = GetActiveWindow();
+    ofn.hwndOwner = pickOwnerWindow();
     ofn.lpstrTitle = aTitle;
     ofn.lpstrFile = fileBuffer;
     ofn.nMaxFile = MAX_PATH;
@@ -92,6 +104,9 @@ const char* tinyfd_saveFileDialog(const char* aTitle,
     if (GetSaveFileNameA(&ofn))
         return saveResult(fileBuffer);
 
+    DWORD err = CommDlgExtendedError();
+    if (err != 0)
+        std::cerr << "[TinyFileDialog] saveFileDialog failed err=" << err << "\n";
     return nullptr;
 }
 
@@ -99,7 +114,7 @@ const char* tinyfd_selectFolderDialog(const char* aTitle, const char* aDefaultPa
 {
     BROWSEINFOA bi{};
     char path[MAX_PATH] = {0};
-    bi.hwndOwner = GetActiveWindow();
+    bi.hwndOwner = pickOwnerWindow();
     bi.lpszTitle = aTitle;
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
 
