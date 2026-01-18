@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -11,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <span>
 
 #ifdef Z_SOLO
@@ -40,6 +42,16 @@ std::uint32_t ReadU32LE(std::span<const std::uint8_t> data, std::size_t offset)
            (static_cast<std::uint32_t>(data[offset + 1]) << 8) |
            (static_cast<std::uint32_t>(data[offset + 2]) << 16) |
            (static_cast<std::uint32_t>(data[offset + 3]) << 24);
+}
+
+void WriteU32LE(std::vector<std::uint8_t>& data, std::size_t offset, std::uint32_t value)
+{
+    if (offset + 4 > data.size())
+        return;
+    data[offset + 0] = static_cast<std::uint8_t>(value & 0xFF);
+    data[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    data[offset + 2] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+    data[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
 }
 
 bool LooksLikeZlib(std::span<const std::uint8_t> data)
@@ -285,6 +297,101 @@ bool DecodeZifZig(std::span<const std::uint8_t> data, std::vector<std::uint8_t>&
     return true;
 }
 
+bool EncodeZifZigImpl(std::span<const std::uint8_t> raw, std::vector<std::uint8_t>& out, std::string& error)
+{
+    if (raw.empty())
+    {
+        error = "Source payload is empty.";
+        return false;
+    }
+
+    // ZIF/ZIG are zlib streams. If the raw data doesn't include a length prefix,
+    // prepend one. This matches on-disk variants.
+    std::vector<std::uint8_t> payload;
+    if (raw.size() >= 4)
+    {
+        std::uint32_t expected = ReadU32LE(raw, 0);
+        if (expected == raw.size() - 4 || expected == raw.size())
+            payload.assign(raw.begin(), raw.end());
+    }
+    if (payload.empty())
+    {
+        payload.resize(raw.size() + 4);
+        std::uint32_t size = static_cast<std::uint32_t>(raw.size());
+        payload[0] = static_cast<std::uint8_t>(size & 0xFF);
+        payload[1] = static_cast<std::uint8_t>((size >> 8) & 0xFF);
+        payload[2] = static_cast<std::uint8_t>((size >> 16) & 0xFF);
+        payload[3] = static_cast<std::uint8_t>((size >> 24) & 0xFF);
+        std::memcpy(payload.data() + 4, raw.data(), raw.size());
+    }
+
+    z_stream stream{};
+    stream.next_in = payload.data();
+    stream.avail_in = static_cast<decltype(stream.avail_in)>(payload.size());
+
+    constexpr int level = 9;
+    constexpr int wbits = 15;
+    constexpr int memLevel = 8;
+    constexpr int strategy = Z_DEFAULT_STRATEGY;
+    if (deflateInit2(&stream, level, Z_DEFLATED, wbits, memLevel, strategy) != Z_OK)
+    {
+        error = "Failed to init zlib deflater.";
+        return false;
+    }
+
+    out.clear();
+    std::vector<std::uint8_t> buffer(1 << 14);
+    int status = Z_OK;
+    while (status == Z_OK)
+    {
+        stream.next_out = buffer.data();
+        stream.avail_out = static_cast<decltype(stream.avail_out)>(buffer.size());
+        status = deflate(&stream, Z_FINISH);
+        if (status != Z_OK && status != Z_STREAM_END)
+        {
+            deflateEnd(&stream);
+            error = "XPAC compression failed.";
+            return false;
+        }
+        std::size_t have = buffer.size() - stream.avail_out;
+        out.insert(out.end(), buffer.begin(), buffer.begin() + have);
+    }
+
+    deflateEnd(&stream);
+    return true;
+}
+
+std::vector<std::uint8_t> CompressZlib(std::span<const std::uint8_t> input)
+{
+    z_stream stream{};
+    stream.next_in = const_cast<std::uint8_t*>(input.data());
+    stream.avail_in = static_cast<decltype(stream.avail_in)>(input.size());
+
+    if (deflateInit(&stream, Z_BEST_COMPRESSION) != Z_OK)
+        throw std::runtime_error("Failed to init zlib deflater.");
+
+    std::vector<std::uint8_t> output;
+    std::vector<std::uint8_t> buffer(1 << 14);
+
+    int status = Z_OK;
+    while (status == Z_OK)
+    {
+        stream.next_out = buffer.data();
+        stream.avail_out = static_cast<decltype(stream.avail_out)>(buffer.size());
+        status = deflate(&stream, Z_FINISH);
+        if (status != Z_OK && status != Z_STREAM_END)
+        {
+            deflateEnd(&stream);
+            throw std::runtime_error("XPAC compression failed.");
+        }
+        std::size_t have = buffer.size() - stream.avail_out;
+        output.insert(output.end(), buffer.begin(), buffer.begin() + have);
+    }
+
+    deflateEnd(&stream);
+    return output;
+}
+
 bool ReadFileBytes(std::filesystem::path const& path, std::vector<std::uint8_t>& out, std::string& error)
 {
     std::ifstream file(path, std::ios::binary);
@@ -329,6 +436,11 @@ UnknownDecodeResult DecodeUnknownPayload(std::vector<std::uint8_t> const& payloa
 }
 
 } // namespace
+
+bool EncodeZifZig(std::span<const std::uint8_t> raw, std::vector<std::uint8_t>& out, std::string& error)
+{
+    return EncodeZifZigImpl(raw, out, error);
+}
 
 std::optional<std::filesystem::path> FindDefaultMappingPath(std::filesystem::path const& xpacPath,
                                                             std::filesystem::path const& outputRoot)
@@ -547,24 +659,27 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
             std::filesystem::path unknownDir = xpacRoot / "unknown";
             UnknownDecodeResult unknown = DecodeUnknownPayload(payload);
             isSif = unknown.IsSif;
-            std::string ext;
-            if (unknown.Decoded)
-                ext = unknown.IsSif ? ".sif" : ".sig";
-            else
-                ext = unknown.IsSif ? ".zif" : ".bin";
-
-            std::filesystem::path name = "hash_" + HashHex(entry.Hash) + ext;
-            outputPath = unknownDir / name;
-            if (WriteFile(outputPath, unknown.Data, error))
+            std::filesystem::path binPath = unknownDir / ("hash_" + HashHex(entry.Hash) + ".bin");
+            outputPath = binPath;
+            if (WriteFile(binPath, payload, error))
             {
                 wroteFile = true;
-                if (ext == ".zif")
-                    result.ExtractedZif++;
             }
             else
             {
                 result.Errors.push_back(error);
                 result.SkippedEntries++;
+            }
+
+            if (unknown.Decoded)
+            {
+                std::filesystem::path decodedPath =
+                    unknownDir / ("hash_" + HashHex(entry.Hash) + (unknown.IsSif ? ".sif" : ".sig"));
+                if (!WriteFile(decodedPath, unknown.Data, error))
+                {
+                    result.Errors.push_back(error);
+                    result.SkippedEntries++;
+                }
             }
         }
 
@@ -660,6 +775,424 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
             options.ProgressConvert(convertProcessed, convertPairs.size());
     }
 
+    return result;
+}
+
+XpacRepackResult RepackXpac(XpacRepackOptions const& options)
+{
+    XpacRepackResult result;
+    if (options.XpacPath.empty())
+    {
+        result.Errors.push_back("XPAC path missing.");
+        return result;
+    }
+    if (options.InputRoot.empty())
+    {
+        result.Errors.push_back("Input root missing.");
+        return result;
+    }
+
+    std::optional<std::filesystem::path> mappingPath = options.MappingPath;
+    if (!mappingPath)
+        mappingPath = FindDefaultMappingPath(options.XpacPath, options.InputRoot);
+    std::unordered_map<std::uint32_t, std::string> mapping;
+    if (mappingPath)
+        mapping = LoadMapping(*mappingPath);
+#if defined(SEEDITOR_EMBED_MAPPING)
+    if (mapping.empty() && kEmbeddedMappingSize > 0)
+    {
+        mapping = LoadMappingFromText(
+            std::string_view(reinterpret_cast<char const*>(kEmbeddedMapping), kEmbeddedMappingSize));
+    }
+#endif
+
+    std::ifstream file(options.XpacPath, std::ios::binary);
+    if (!file)
+    {
+        result.Errors.push_back("Unable to open XPAC file: " + options.XpacPath.string());
+        return result;
+    }
+
+    std::array<std::uint8_t, 24> header{};
+    if (!file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size())))
+    {
+        result.Errors.push_back("Failed to read XPAC header.");
+        return result;
+    }
+
+    std::uint32_t totalFiles = ReadU32LE(header, 12);
+    result.TotalEntries = totalFiles;
+
+    struct XpacEntryFull
+    {
+        XpacEntry Entry;
+        bool WasCompressed = false;
+    };
+    std::vector<XpacEntryFull> entries;
+    entries.reserve(totalFiles);
+    for (std::uint32_t i = 0; i < totalFiles; ++i)
+    {
+        std::array<std::uint8_t, 20> entryBuf{};
+        if (!file.read(reinterpret_cast<char*>(entryBuf.data()), static_cast<std::streamsize>(entryBuf.size())))
+        {
+            result.Errors.push_back("Failed to read XPAC entry table.");
+            return result;
+        }
+        XpacEntry entry;
+        entry.Hash = ReadU32LE(entryBuf, 0);
+        entry.Offset = ReadU32LE(entryBuf, 4);
+        entry.Size = ReadU32LE(entryBuf, 8);
+        entry.CompressedSize = ReadU32LE(entryBuf, 12);
+        entry.Flags = ReadU32LE(entryBuf, 16);
+        entries.push_back({entry, entry.CompressedSize != entry.Size});
+    }
+
+    std::unordered_set<std::string> selectedSet;
+    selectedSet.reserve(options.SelectedSifRelativePaths.size());
+    for (auto const& p : options.SelectedSifRelativePaths)
+        selectedSet.insert(p.generic_string());
+    bool anyReplacement = !selectedSet.empty();
+    std::filesystem::path replacementRoot;
+    if (options.ReplacementRoot)
+        replacementRoot = *options.ReplacementRoot;
+
+    auto readOriginalStored = [&](XpacEntryFull const& entry, std::vector<std::uint8_t>& out) -> bool {
+        if (entry.Entry.CompressedSize == 0)
+            return false;
+        file.seekg(entry.Entry.Offset, std::ios::beg);
+        out.resize(entry.Entry.CompressedSize);
+        if (!file.read(reinterpret_cast<char*>(out.data()),
+                       static_cast<std::streamsize>(out.size())))
+            return false;
+        return true;
+    };
+
+    if (!anyReplacement)
+    {
+        file.seekg(0, std::ios::end);
+        std::streamsize fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+        if (fileSize > 0)
+        {
+            std::vector<std::uint8_t> original(static_cast<std::size_t>(fileSize));
+            if (file.read(reinterpret_cast<char*>(original.data()), fileSize))
+            {
+                std::ofstream out(options.OutputPath, std::ios::binary);
+                if (out)
+                {
+                    out.write(reinterpret_cast<const char*>(original.data()),
+                              static_cast<std::streamsize>(original.size()));
+                    result.RepackedEntries = totalFiles;
+                    return result;
+                }
+            }
+        }
+    }
+
+    bool allReplacementsIdentical = true;
+    if (anyReplacement)
+    {
+        for (auto const& entry : entries)
+        {
+            std::filesystem::path relativePath;
+            auto it = mapping.find(entry.Entry.Hash);
+            if (it != mapping.end())
+                relativePath = BuildXpacToolRelativePath(it->second);
+            if (relativePath.empty())
+                continue;
+
+            std::filesystem::path expected = relativePath;
+            if (expected.extension() == ".zif")
+                expected.replace_extension(".sif");
+            else if (expected.extension() == ".zig")
+                expected.replace_extension(".sig");
+            std::string expectedName = expected.filename().generic_string();
+            if (selectedSet.find(expectedName) == selectedSet.end())
+                continue;
+
+            std::filesystem::path replacement = replacementRoot.empty()
+                ? (options.InputRoot / expected.filename())
+                : (replacementRoot / expected.filename());
+            if (!std::filesystem::exists(replacement))
+            {
+                allReplacementsIdentical = false;
+                break;
+            }
+
+            std::vector<std::uint8_t> rawBytes;
+            std::string error;
+            if (!ReadFileBytes(replacement, rawBytes, error))
+            {
+                allReplacementsIdentical = false;
+                break;
+            }
+
+            std::vector<std::uint8_t> payload;
+            if (!EncodeZifZig(rawBytes, payload, error))
+            {
+                allReplacementsIdentical = false;
+                break;
+            }
+
+            std::vector<std::uint8_t> stored = payload;
+            if (entry.WasCompressed)
+            {
+                try
+                {
+                    stored = CompressZlib(payload);
+                }
+                catch (...)
+                {
+                    allReplacementsIdentical = false;
+                    break;
+                }
+            }
+
+            std::vector<std::uint8_t> originalStored;
+            if (!readOriginalStored(entry, originalStored) ||
+                originalStored.size() != stored.size() ||
+                !std::equal(originalStored.begin(), originalStored.end(), stored.begin()))
+            {
+                allReplacementsIdentical = false;
+                break;
+            }
+        }
+
+        if (allReplacementsIdentical)
+        {
+            file.seekg(0, std::ios::end);
+            std::streamsize fileSize = file.tellg();
+            file.seekg(0, std::ios::beg);
+            if (fileSize > 0)
+            {
+                std::vector<std::uint8_t> original(static_cast<std::size_t>(fileSize));
+                if (file.read(reinterpret_cast<char*>(original.data()), fileSize))
+                {
+                    std::ofstream out(options.OutputPath, std::ios::binary);
+                    if (out)
+                    {
+                        out.write(reinterpret_cast<const char*>(original.data()),
+                                  static_cast<std::streamsize>(original.size()));
+                        result.RepackedEntries = totalFiles;
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<std::uint8_t> output;
+    std::size_t headerSize = header.size();
+    std::size_t tableSize = static_cast<std::size_t>(totalFiles) * 20;
+    std::size_t cursor = headerSize + tableSize;
+    output.resize(cursor);
+
+    std::uint32_t tableSizeU32 = static_cast<std::uint32_t>(tableSize);
+    WriteU32LE(output, 0, ReadU32LE(header, 0));
+    WriteU32LE(output, 4, ReadU32LE(header, 4));
+    WriteU32LE(output, 8, tableSizeU32);
+    WriteU32LE(output, 12, totalFiles);
+    std::uint32_t dirTable = ReadU32LE(header, 16);
+    if (dirTable == 0)
+        dirTable = static_cast<std::uint32_t>(headerSize);
+    WriteU32LE(output, 16, dirTable);
+    WriteU32LE(output, 20, ReadU32LE(header, 20));
+
+    auto ensureCapacity = [&](std::size_t size) {
+        if (output.size() < size)
+            output.resize(size);
+    };
+
+    for (std::size_t i = 0; i < entries.size(); ++i)
+    {
+        if (options.Progress)
+            options.Progress(i, entries.size());
+        auto& entry = entries[i];
+        std::filesystem::path relativePath;
+        auto it = mapping.find(entry.Entry.Hash);
+        if (it != mapping.end())
+            relativePath = BuildXpacToolRelativePath(it->second);
+
+        std::vector<std::uint8_t> payload;
+        std::string error;
+        bool usedSif = false;
+        auto readFromXpac = [&](std::vector<std::uint8_t>& out) -> bool {
+            if (entry.Entry.CompressedSize == 0)
+                return false;
+            file.seekg(entry.Entry.Offset, std::ios::beg);
+            std::vector<std::uint8_t> raw(entry.Entry.CompressedSize);
+            if (!file.read(reinterpret_cast<char*>(raw.data()),
+                           static_cast<std::streamsize>(raw.size())))
+                return false;
+            if (entry.WasCompressed)
+            {
+                try
+                {
+                    out = DecompressZlib(raw, entry.Entry.Size);
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                out = std::move(raw);
+            }
+            return true;
+        };
+
+        if (!relativePath.empty())
+        {
+            std::filesystem::path sourcePath = options.InputRoot / relativePath;
+            std::filesystem::path replacement;
+            if (!options.SelectedSifRelativePaths.empty())
+            {
+                std::filesystem::path expected = relativePath;
+                if (expected.extension() == ".zif")
+                    expected.replace_extension(".sif");
+                else if (expected.extension() == ".zig")
+                    expected.replace_extension(".sig");
+                std::string expectedName = expected.filename().generic_string();
+                if (selectedSet.find(expectedName) != selectedSet.end())
+                {
+                    if (!replacementRoot.empty())
+                        replacement = replacementRoot / expected.filename();
+                    else
+                        replacement = options.InputRoot / expected.filename();
+                }
+            }
+
+            if (!replacement.empty() && std::filesystem::exists(replacement))
+            {
+                std::vector<std::uint8_t> sifBytes;
+                if (!ReadFileBytes(replacement, sifBytes, error))
+                {
+                    result.Errors.push_back("Failed to read " + replacement.string() + ": " + error);
+                    return result;
+                }
+                if (!EncodeZifZig(sifBytes, payload, error))
+                {
+                    result.Errors.push_back("Failed to encode " + replacement.string() + ": " + error);
+                    return result;
+                }
+                usedSif = true;
+            }
+            else
+            {
+                if (!ReadFileBytes(sourcePath, payload, error))
+                {
+                    std::filesystem::path alt = sourcePath;
+                    if (alt.extension() == ".zif")
+                        alt.replace_extension(".sif");
+                    else if (alt.extension() == ".zig")
+                        alt.replace_extension(".sig");
+                    if (std::filesystem::exists(alt))
+                    {
+                        std::vector<std::uint8_t> rawBytes;
+                        if (!ReadFileBytes(alt, rawBytes, error) ||
+                            !EncodeZifZig(rawBytes, payload, error))
+                        {
+                            result.Errors.push_back("Failed to encode " + alt.string() + ": " + error);
+                            return result;
+                        }
+                    }
+                    else
+                    {
+                        if (!readFromXpac(payload))
+                        {
+                            result.Errors.push_back("Failed to read " + sourcePath.string() + ": " + error);
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            std::filesystem::path unknownDir = options.InputRoot / "unknown";
+            std::string name = "hash_" + HashHex(entry.Entry.Hash);
+            std::filesystem::path sifPath = unknownDir / (name + ".sif");
+            std::filesystem::path sigPath = unknownDir / (name + ".sig");
+            std::filesystem::path binPath = unknownDir / (name + ".bin");
+            if (std::filesystem::exists(binPath))
+            {
+                if (!ReadFileBytes(binPath, payload, error))
+                {
+                    result.Errors.push_back("Failed to read " + binPath.string() + ": " + error);
+                    return result;
+                }
+            }
+            else if (std::filesystem::exists(sifPath))
+            {
+                std::vector<std::uint8_t> rawBytes;
+                if (!ReadFileBytes(sifPath, rawBytes, error) ||
+                    !EncodeZifZig(rawBytes, payload, error))
+                {
+                    result.Errors.push_back("Failed to encode " + sifPath.string() + ": " + error);
+                    return result;
+                }
+            }
+            else if (std::filesystem::exists(sigPath))
+            {
+                std::vector<std::uint8_t> rawBytes;
+                if (!ReadFileBytes(sigPath, rawBytes, error) ||
+                    !EncodeZifZig(rawBytes, payload, error))
+                {
+                    result.Errors.push_back("Failed to encode " + sigPath.string() + ": " + error);
+                    return result;
+                }
+            }
+            else
+            {
+                result.Errors.push_back("Missing payload for hash " + HashHex(entry.Entry.Hash));
+                return result;
+            }
+        }
+
+        std::vector<std::uint8_t> stored = payload;
+        if (entry.WasCompressed)
+        {
+            try
+            {
+                stored = CompressZlib(payload);
+            }
+            catch (std::exception const& ex)
+            {
+                result.Errors.push_back("Compression failed for hash " + HashHex(entry.Entry.Hash) + ": " + ex.what());
+                return result;
+            }
+        }
+
+        entry.Entry.Offset = static_cast<std::uint32_t>(cursor);
+        entry.Entry.Size = static_cast<std::uint32_t>(payload.size());
+        entry.Entry.CompressedSize = static_cast<std::uint32_t>(stored.size());
+
+        ensureCapacity(cursor + stored.size());
+        std::memcpy(output.data() + cursor, stored.data(), stored.size());
+        cursor += stored.size();
+        ++result.RepackedEntries;
+    }
+    if (options.Progress)
+        options.Progress(entries.size(), entries.size());
+
+    for (std::size_t i = 0; i < entries.size(); ++i)
+    {
+        std::size_t entryOffset = headerSize + i * 20;
+        WriteU32LE(output, entryOffset + 0, entries[i].Entry.Hash);
+        WriteU32LE(output, entryOffset + 4, entries[i].Entry.Offset);
+        WriteU32LE(output, entryOffset + 8, entries[i].Entry.Size);
+        WriteU32LE(output, entryOffset + 12, entries[i].Entry.CompressedSize);
+        WriteU32LE(output, entryOffset + 16, entries[i].Entry.Flags);
+    }
+
+    std::ofstream out(options.OutputPath, std::ios::binary);
+    if (!out)
+    {
+        result.Errors.push_back("Failed to write XPAC: " + options.OutputPath.string());
+        return result;
+    }
+    out.write(reinterpret_cast<const char*>(output.data()), static_cast<std::streamsize>(output.size()));
     return result;
 }
 

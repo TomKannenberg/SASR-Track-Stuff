@@ -15,9 +15,13 @@ struct SifChunkInfo
     std::string Name;
     std::uint32_t DataSize = 0;
     std::uint32_t ChunkSize = 0;
+    std::uint32_t RelocDataSize = 0;
+    std::uint32_t RelocChunkSize = 0;
     std::vector<std::uint32_t> Relocations;
     bool BigEndian = false;
     std::vector<std::uint8_t> Data;
+    std::vector<std::uint8_t> RawChunk;
+    std::vector<std::uint8_t> RelocRaw;
 };
 
 struct SifParseResult

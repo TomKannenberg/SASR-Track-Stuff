@@ -59,6 +59,303 @@ void DumpNavHeader(NavigationProbeInfo const& info)
     std::cout << std::dec << std::setfill(' ') << "\n";
 }
 
+std::size_t AlignUp(std::size_t value, std::size_t align)
+{
+    if (align == 0)
+        return value;
+    std::size_t mask = align - 1;
+    return (value + mask) & ~mask;
+}
+
+std::uint64_t HashFnv1a64(std::span<const std::uint8_t> data)
+{
+    std::uint64_t hash = 14695981039346656037ull;
+    for (auto byte : data)
+    {
+        hash ^= static_cast<std::uint64_t>(byte);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::vector<std::uint8_t> CompressWithParams(std::span<const std::uint8_t> input,
+                                             int level,
+                                             int wbits,
+                                             int memLevel,
+                                             int strategy,
+                                             bool& ok)
+{
+    ok = false;
+    z_stream stream{};
+    stream.next_in = const_cast<std::uint8_t*>(input.data());
+    stream.avail_in = static_cast<decltype(stream.avail_in)>(input.size());
+
+    if (deflateInit2(&stream, level, Z_DEFLATED, wbits, memLevel, strategy) != Z_OK)
+        return {};
+
+    std::vector<std::uint8_t> output;
+    std::vector<std::uint8_t> buffer(1 << 14);
+
+    int status = Z_OK;
+    while (status == Z_OK)
+    {
+        stream.next_out = buffer.data();
+        stream.avail_out = static_cast<decltype(stream.avail_out)>(buffer.size());
+        status = deflate(&stream, Z_FINISH);
+        if (status != Z_OK && status != Z_STREAM_END)
+        {
+            deflateEnd(&stream);
+            return {};
+        }
+        std::size_t have = buffer.size() - stream.avail_out;
+        output.insert(output.end(), buffer.begin(), buffer.begin() + have);
+    }
+
+    deflateEnd(&stream);
+    ok = true;
+    return output;
+}
+
+void WriteInt32LE(std::vector<std::uint8_t>& out, std::size_t offset, std::int32_t value);
+void WriteFloatLE(std::vector<std::uint8_t>& out, std::size_t offset, float value);
+
+std::vector<std::uint8_t> BuildSifWithRewrittenLogic(std::vector<SifChunkInfo> chunks,
+                                                     std::vector<std::uint8_t> const& logicData,
+                                                     bool includeLengthPrefix)
+{
+    const std::uint32_t logicType = 0x43474F4C;
+    for (auto& chunk : chunks)
+    {
+        if (chunk.TypeValue != logicType)
+            continue;
+        chunk.Data = logicData;
+        chunk.DataSize = static_cast<std::uint32_t>(logicData.size());
+        chunk.Relocations.clear();
+        if (logicData.size() >= 0x20)
+        {
+            auto read32 = [](std::span<const std::uint8_t> data, std::size_t offset) -> std::int32_t {
+                return static_cast<std::int32_t>(static_cast<std::uint32_t>(data[offset]) |
+                                                 (static_cast<std::uint32_t>(data[offset + 1]) << 8) |
+                                                 (static_cast<std::uint32_t>(data[offset + 2]) << 16) |
+                                                 (static_cast<std::uint32_t>(data[offset + 3]) << 24));
+            };
+            if (read32(logicData, 0x10) != 0)
+                chunk.Relocations.push_back(0x10);
+            if (read32(logicData, 0x14) != 0)
+                chunk.Relocations.push_back(0x14);
+            if (read32(logicData, 0x18) != 0)
+                chunk.Relocations.push_back(0x18);
+        }
+        break;
+    }
+
+    std::size_t totalSize = 0;
+    for (auto const& chunk : chunks)
+    {
+        std::size_t minDataSize = 0x10 + chunk.Data.size();
+        std::size_t dataChunkSize = chunk.ChunkSize >= minDataSize
+            ? chunk.ChunkSize
+            : AlignUp(minDataSize, 0x10);
+        std::size_t relDataSize = 0x4 + (chunk.Relocations.size() + 1) * 0x8;
+        std::size_t minRelSize = 0x10 + relDataSize;
+        std::size_t relChunkSize = chunk.RelocChunkSize >= minRelSize
+            ? chunk.RelocChunkSize
+            : AlignUp(minRelSize, 0x10);
+        totalSize += dataChunkSize + relChunkSize;
+    }
+
+    std::vector<std::uint8_t> output(totalSize, 0);
+    std::size_t cursor = 0;
+    for (auto const& chunk : chunks)
+    {
+        std::size_t minDataSize = 0x10 + chunk.Data.size();
+        std::size_t dataChunkSize = chunk.ChunkSize >= minDataSize
+            ? chunk.ChunkSize
+            : AlignUp(minDataSize, 0x10);
+        std::size_t relDataSize = 0x4 + (chunk.Relocations.size() + 1) * 0x8;
+        std::size_t minRelSize = 0x10 + relDataSize;
+        std::size_t relChunkSize = chunk.RelocChunkSize >= minRelSize
+            ? chunk.RelocChunkSize
+            : AlignUp(minRelSize, 0x10);
+
+        if (chunk.RawChunk.size() == dataChunkSize)
+            std::memcpy(output.data() + cursor, chunk.RawChunk.data(), chunk.RawChunk.size());
+
+        WriteInt32LE(output, cursor + 0x0, static_cast<std::int32_t>(chunk.TypeValue));
+        WriteInt32LE(output, cursor + 0x4, static_cast<std::int32_t>(dataChunkSize));
+        WriteInt32LE(output, cursor + 0x8, static_cast<std::int32_t>(chunk.Data.size()));
+        WriteInt32LE(output, cursor + 0xC, 0x44332211);
+        if (!chunk.Data.empty())
+            std::memcpy(output.data() + cursor + 0x10, chunk.Data.data(), chunk.Data.size());
+
+        cursor += dataChunkSize;
+
+        if (chunk.RelocRaw.size() == relChunkSize)
+            std::memcpy(output.data() + cursor, chunk.RelocRaw.data(), chunk.RelocRaw.size());
+
+        WriteInt32LE(output, cursor + 0x0, static_cast<std::int32_t>(0x4F4C4552));
+        WriteInt32LE(output, cursor + 0x4, static_cast<std::int32_t>(relChunkSize));
+        WriteInt32LE(output, cursor + 0x8, static_cast<std::int32_t>(relDataSize));
+        WriteInt32LE(output, cursor + 0xC, 0x44332211);
+        WriteInt32LE(output, cursor + 0x10, static_cast<std::int32_t>(chunk.TypeValue));
+        for (std::size_t i = 0; i < chunk.Relocations.size(); ++i)
+        {
+            std::size_t entry = cursor + 0x10 + 0x4 + i * 0x8;
+            output[entry + 0] = 1;
+            output[entry + 1] = 0;
+            output[entry + 2] = 0;
+            output[entry + 3] = 0;
+            WriteInt32LE(output, entry + 4, static_cast<std::int32_t>(chunk.Relocations[i]));
+        }
+
+        cursor += relChunkSize;
+    }
+
+    if (!includeLengthPrefix)
+        return output;
+
+    std::vector<std::uint8_t> wrapped;
+    wrapped.resize(output.size() + 4);
+    std::uint32_t length = static_cast<std::uint32_t>(output.size());
+    wrapped[0] = static_cast<std::uint8_t>(length & 0xFF);
+    wrapped[1] = static_cast<std::uint8_t>((length >> 8) & 0xFF);
+    wrapped[2] = static_cast<std::uint8_t>((length >> 16) & 0xFF);
+    wrapped[3] = static_cast<std::uint8_t>((length >> 24) & 0xFF);
+    std::memcpy(wrapped.data() + 4, output.data(), output.size());
+    return wrapped;
+}
+
+void WriteInt32LE(std::vector<std::uint8_t>& out, std::size_t offset, std::int32_t value)
+{
+    if (offset + 4 > out.size())
+        return;
+    out[offset + 0] = static_cast<std::uint8_t>(value & 0xFF);
+    out[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    out[offset + 2] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+    out[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
+}
+
+void WriteFloatLE(std::vector<std::uint8_t>& out, std::size_t offset, float value)
+{
+    std::uint32_t raw = 0;
+    static_assert(sizeof(raw) == sizeof(value));
+    std::memcpy(&raw, &value, sizeof(raw));
+    WriteInt32LE(out, offset, static_cast<std::int32_t>(raw));
+}
+
+std::vector<std::uint8_t> BuildLogicChunkDataFromLogic(SlLib::SumoTool::Siff::LogicData const& logic)
+{
+    const int numTriggers = static_cast<int>(logic.Triggers.size());
+    const int numLocators = static_cast<int>(logic.Locators.size());
+    const int numAttributes = static_cast<int>(logic.Attributes.size());
+
+    const std::size_t headerSize = 0x20;
+    std::size_t cursor = headerSize;
+
+    std::size_t triggersOffset = 0;
+    if (numTriggers > 0)
+    {
+        triggersOffset = AlignUp(cursor, 0x10);
+        cursor = triggersOffset + static_cast<std::size_t>(numTriggers) * 0x70;
+    }
+
+    std::size_t attributesOffset = 0;
+    if (numAttributes > 0)
+    {
+        attributesOffset = AlignUp(cursor, 4);
+        cursor = attributesOffset + static_cast<std::size_t>(numAttributes) * 0x8;
+    }
+
+    std::size_t locatorsOffset = 0;
+    if (numLocators > 0)
+    {
+        locatorsOffset = AlignUp(cursor, 0x10);
+        cursor = locatorsOffset + static_cast<std::size_t>(numLocators) * 0x50;
+    }
+
+    std::size_t totalSize = AlignUp(cursor, 0x10);
+    std::vector<std::uint8_t> out(totalSize, 0);
+
+    WriteInt32LE(out, 0x0, logic.NameHash);
+    WriteInt32LE(out, 0x4, logic.LogicVersion);
+    WriteInt32LE(out, 0x8, numTriggers);
+    WriteInt32LE(out, 0xC, numLocators);
+    WriteInt32LE(out, 0x10, numTriggers > 0 ? static_cast<std::int32_t>(triggersOffset) : 0);
+    WriteInt32LE(out, 0x14, numAttributes > 0 ? static_cast<std::int32_t>(attributesOffset) : 0);
+    WriteInt32LE(out, 0x18, numLocators > 0 ? static_cast<std::int32_t>(locatorsOffset) : 0);
+
+    auto writeVec4 = [&](std::size_t offset, SlLib::Math::Vector4 const& v) {
+        WriteFloatLE(out, offset + 0x0, v.X);
+        WriteFloatLE(out, offset + 0x4, v.Y);
+        WriteFloatLE(out, offset + 0x8, v.Z);
+        WriteFloatLE(out, offset + 0xC, v.W);
+    };
+
+    if (numTriggers > 0 && triggersOffset != 0)
+    {
+        std::size_t offset = triggersOffset;
+        for (auto const& trigger : logic.Triggers)
+        {
+            if (trigger)
+            {
+                WriteInt32LE(out, offset + 0x0, trigger->NameHash);
+                WriteInt32LE(out, offset + 0x4, trigger->NumAttributes);
+                WriteInt32LE(out, offset + 0x8, trigger->AttributeStartIndex);
+                WriteInt32LE(out, offset + 0xC, trigger->Flags);
+                writeVec4(offset + 0x10, trigger->Position);
+                writeVec4(offset + 0x20, trigger->Normal);
+                writeVec4(offset + 0x30, trigger->Vertex0);
+                writeVec4(offset + 0x40, trigger->Vertex1);
+                writeVec4(offset + 0x50, trigger->Vertex2);
+                writeVec4(offset + 0x60, trigger->Vertex3);
+            }
+            offset += 0x70;
+        }
+    }
+
+    if (numAttributes > 0 && attributesOffset != 0)
+    {
+        std::size_t offset = attributesOffset;
+        for (auto const& attr : logic.Attributes)
+        {
+            if (attr)
+            {
+                WriteInt32LE(out, offset + 0x0, attr->NameHash);
+                WriteInt32LE(out, offset + 0x4, attr->PackedValue);
+            }
+            offset += 0x8;
+        }
+    }
+
+    if (numLocators > 0 && locatorsOffset != 0)
+    {
+        std::size_t offset = locatorsOffset;
+        for (auto const& locator : logic.Locators)
+        {
+            if (locator)
+            {
+                WriteInt32LE(out, offset + 0x0, locator->GroupNameHash);
+                WriteInt32LE(out, offset + 0x4, locator->LocatorNameHash);
+                WriteInt32LE(out, offset + 0x8, locator->MeshForestNameHash);
+                WriteInt32LE(out, offset + 0xC, locator->MeshTreeNameHash);
+                WriteInt32LE(out, offset + 0x10, locator->SetupObjectNameHash);
+                WriteInt32LE(out, offset + 0x14, locator->AnimatedInstanceNameHash);
+                WriteInt32LE(out, offset + 0x18, locator->SubDataHash);
+                WriteInt32LE(out, offset + 0x1C, locator->Flags);
+                WriteInt32LE(out, offset + 0x20, locator->Health);
+                WriteFloatLE(out, offset + 0x24, locator->SequenceStartFrameMultiplier);
+                WriteFloatLE(out, offset + 0x28, locator->SequencerInterSpawnMultiplier);
+                WriteFloatLE(out, offset + 0x2C, locator->AnimatedInstancePlaybackSpeed);
+                writeVec4(offset + 0x30, locator->PositionAsFloats);
+                writeVec4(offset + 0x40, locator->RotationAsFloats);
+            }
+            offset += 0x50;
+        }
+    }
+
+    return out;
+}
+
 std::unordered_map<int, std::string> LoadExcelLookup(std::filesystem::path const& path)
 {
     std::unordered_map<int, std::string> result;
@@ -732,6 +1029,52 @@ int Program::Run(int argc, char** argv)
         return result.Errors.empty() ? 0 : 1;
     }
 
+    if (argc >= 6 && std::string(argv[1]) == "--repack-xpac")
+    {
+        std::filesystem::path xpacPath = argv[2];
+        std::filesystem::path unpackRoot = argv[3];
+        std::filesystem::path exportSif = argv[4];
+        std::filesystem::path outputPath = argv[5];
+
+        if (!std::filesystem::exists(xpacPath))
+        {
+            std::cerr << "[XPAC] XPAC not found: " << xpacPath.string() << std::endl;
+            return 1;
+        }
+        if (!std::filesystem::exists(unpackRoot))
+        {
+            std::cerr << "[XPAC] Unpacked root not found: " << unpackRoot.string() << std::endl;
+            return 1;
+        }
+        if (!std::filesystem::exists(exportSif))
+        {
+            std::cerr << "[XPAC] Export SIF not found: " << exportSif.string() << std::endl;
+            return 1;
+        }
+
+        Xpac::XpacRepackOptions options;
+        options.XpacPath = xpacPath;
+        options.InputRoot = unpackRoot;
+        options.OutputPath = outputPath;
+        options.ReplacementRoot = exportSif.parent_path();
+        options.MappingPath = Xpac::FindDefaultMappingPath(options.XpacPath, options.InputRoot);
+        options.SelectedSifRelativePaths.push_back(exportSif.filename());
+        if (_stricmp(exportSif.extension().string().c_str(), ".sif") == 0)
+        {
+            std::filesystem::path sigPath = exportSif;
+            sigPath.replace_extension(".sig");
+            if (std::filesystem::exists(sigPath))
+                options.SelectedSifRelativePaths.push_back(sigPath.filename());
+        }
+
+        Xpac::XpacRepackResult result = Xpac::RepackXpac(options);
+        std::cout << "[XPAC] Repacked=" << result.RepackedEntries
+                  << " / " << result.TotalEntries << std::endl;
+        for (auto const& err : result.Errors)
+            std::cerr << "[XPAC] " << err << std::endl;
+        return result.Errors.empty() ? 0 : 1;
+    }
+
     if (argc >= 3 && std::string(argv[1]) == "--rebuild-sif")
     {
         std::filesystem::path root = argv[2];
@@ -1003,6 +1346,263 @@ int Program::Run(int argc, char** argv)
                   << " Locators=" << logic.Locators.size()
                   << std::endl;
 
+        return 0;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--logic-size")
+    {
+        std::filesystem::path path = argv[2];
+        std::cout << "[LogicCLI] Loading " << path.string() << std::endl;
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            std::cerr << "[LogicCLI] Failed to open file." << std::endl;
+            return 1;
+        }
+
+        std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+        std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+
+        std::string error;
+        auto parsed = ParseSifFile(std::span<const std::uint8_t>(data.data(), data.size()), error);
+        if (!parsed)
+        {
+            std::cerr << "[LogicCLI] Parse error: " << error << std::endl;
+            return 2;
+        }
+
+        const std::uint32_t logicType = 0x43474F4C;
+        std::optional<std::size_t> originalSize;
+        std::optional<std::uint64_t> originalHash;
+        for (auto const& c : parsed->Chunks)
+        {
+            if (c.TypeValue == logicType)
+            {
+                originalSize = c.DataSize;
+                originalHash = HashFnv1a64(std::span<const std::uint8_t>(c.Data.data(), c.Data.size()));
+                break;
+            }
+        }
+
+        if (!originalSize)
+        {
+            std::cerr << "[LogicCLI] LOGC chunk not found." << std::endl;
+            return 3;
+        }
+
+        SlLib::SumoTool::Siff::LogicData logic;
+        LogicProbeInfo probe{};
+        if (!LoadLogicFromSifChunks(parsed->Chunks, logic, probe, error))
+        {
+            std::cerr << "[LogicCLI] Logic parse failed: " << error << std::endl;
+            return 4;
+        }
+
+        auto rebuilt = BuildLogicChunkDataFromLogic(logic);
+        std::uint64_t rebuiltHash = HashFnv1a64(std::span<const std::uint8_t>(rebuilt.data(), rebuilt.size()));
+        std::cout << "[LogicCLI] LOGC original data size=" << *originalSize
+                  << " rebuilt size=" << rebuilt.size() << std::endl;
+        if (originalHash)
+        {
+            std::cout << "[LogicCLI] LOGC original hash=0x" << std::hex << std::uppercase
+                      << *originalHash << std::dec << std::nouppercase << "\n";
+        }
+        std::cout << "[LogicCLI] LOGC rebuilt  hash=0x" << std::hex << std::uppercase
+                  << rebuiltHash << std::dec << std::nouppercase << std::endl;
+        return 0;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--sif-hash")
+    {
+        std::filesystem::path path = argv[2];
+        std::cout << "[SIFHash] Loading " << path.string() << std::endl;
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            std::cerr << "[SIFHash] Failed to open file." << std::endl;
+            return 1;
+        }
+
+        std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+        std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+        std::uint64_t hash = HashFnv1a64(std::span<const std::uint8_t>(data.data(), data.size()));
+        std::cout << "[SIFHash] size=" << data.size()
+                  << " hash=0x" << std::hex << std::uppercase << hash
+                  << std::dec << std::nouppercase << std::endl;
+        return 0;
+    }
+
+    if (argc >= 4 && std::string(argv[1]) == "--find-zif-params")
+    {
+        std::filesystem::path zifPath = argv[2];
+        std::filesystem::path rawPath = argv[3];
+        std::vector<std::uint8_t> zif;
+        std::vector<std::uint8_t> raw;
+        if (!ReadFileBytes(zifPath, zif) || !ReadFileBytes(rawPath, raw))
+        {
+            std::cerr << "[ZIFMatch] Failed to read inputs.\n";
+            return 1;
+        }
+
+        std::vector<std::uint8_t> payloadWithLen;
+        payloadWithLen.resize(raw.size() + 4);
+        std::uint32_t size = static_cast<std::uint32_t>(raw.size());
+        payloadWithLen[0] = static_cast<std::uint8_t>(size & 0xFF);
+        payloadWithLen[1] = static_cast<std::uint8_t>((size >> 8) & 0xFF);
+        payloadWithLen[2] = static_cast<std::uint8_t>((size >> 16) & 0xFF);
+        payloadWithLen[3] = static_cast<std::uint8_t>((size >> 24) & 0xFF);
+        std::memcpy(payloadWithLen.data() + 4, raw.data(), raw.size());
+
+        struct Candidate
+        {
+            int level;
+            int wbits;
+            int memLevel;
+            int strategy;
+            bool withLength;
+        };
+
+        std::vector<int> levels{0,1,2,3,4,5,6,7,8,9};
+        std::vector<int> wbitsList{-15, 15};
+        std::vector<int> memLevels{1,2,3,4,5,6,7,8,9};
+        std::vector<int> strategies{Z_DEFAULT_STRATEGY, Z_FILTERED, Z_HUFFMAN_ONLY, Z_RLE, Z_FIXED};
+
+        std::vector<Candidate> candidates;
+        candidates.reserve(levels.size() * wbitsList.size() * memLevels.size() * strategies.size() * 2);
+        for (int level : levels)
+            for (int wbits : wbitsList)
+                for (int memLevel : memLevels)
+                    for (int strategy : strategies)
+                        for (int withLen = 0; withLen < 2; ++withLen)
+                            candidates.push_back({level, wbits, memLevel, strategy, withLen != 0});
+
+        std::atomic<std::size_t> index{0};
+        std::atomic<std::size_t> tested{0};
+        std::vector<Candidate> matches;
+        std::mutex matchMutex;
+        std::mutex logMutex;
+
+        unsigned int threadCount = std::thread::hardware_concurrency();
+        if (threadCount == 0)
+            threadCount = 4;
+        std::vector<std::thread> workers;
+        workers.reserve(threadCount);
+        for (unsigned int t = 0; t < threadCount; ++t)
+        {
+            workers.emplace_back([&]() {
+                while (true)
+                {
+                    std::size_t i = index.fetch_add(1);
+                    if (i >= candidates.size())
+                        break;
+                    auto const& c = candidates[i];
+                    {
+                        std::lock_guard<std::mutex> lock(logMutex);
+                        std::cout << "[ZIFMatch] try level=" << c.level
+                                  << " wbits=" << c.wbits
+                                  << " memLevel=" << c.memLevel
+                                  << " strategy=" << c.strategy
+                                  << " lengthPrefix=" << (c.withLength ? "yes" : "no")
+                                  << "\n";
+                    }
+                    bool ok = false;
+                    auto const& payload = c.withLength ? payloadWithLen : raw;
+                    auto out = CompressWithParams(payload, c.level, c.wbits, c.memLevel, c.strategy, ok);
+                    tested.fetch_add(1);
+                    if (!ok)
+                        continue;
+                    if (out == zif)
+                    {
+                        std::lock_guard<std::mutex> lock(matchMutex);
+                        matches.push_back(c);
+                    }
+                }
+            });
+        }
+        for (auto& t : workers)
+            t.join();
+
+        const std::size_t total = candidates.size();
+
+        std::cout << "[ZIFMatch] Tested " << tested.load() << " combinations.\n";
+        if (matches.empty())
+        {
+            std::cout << "[ZIFMatch] No exact match found.\n";
+            return 2;
+        }
+
+        for (auto const& m : matches)
+        {
+            std::cout << "[ZIFMatch] match level=" << m.level
+                      << " wbits=" << m.wbits
+                      << " memLevel=" << m.memLevel
+                      << " strategy=" << m.strategy
+                      << " lengthPrefix=" << (m.withLength ? "yes" : "no")
+                      << "\n";
+        }
+        return 0;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--rewrite-logc")
+    {
+        std::filesystem::path inputPath = argv[2];
+        std::filesystem::path outputPath;
+        if (argc >= 4)
+            outputPath = argv[3];
+        else
+            outputPath = GetDefaultStuffRoot() / "export" / (inputPath.stem().string() + "_logc.sif");
+
+        std::ifstream file(inputPath, std::ios::binary);
+        if (!file)
+        {
+            std::cerr << "[LogicCLI] Failed to open file." << std::endl;
+            return 1;
+        }
+
+        std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+        std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+
+        std::string error;
+        auto parsed = ParseSifFile(std::span<const std::uint8_t>(data.data(), data.size()), error);
+        if (!parsed)
+        {
+            std::cerr << "[LogicCLI] Parse error: " << error << std::endl;
+            return 2;
+        }
+
+        SlLib::SumoTool::Siff::LogicData logic;
+        LogicProbeInfo probe{};
+        if (!LoadLogicFromSifChunks(parsed->Chunks, logic, probe, error))
+        {
+            std::cerr << "[LogicCLI] Logic parse failed: " << error << std::endl;
+            return 3;
+        }
+
+        auto logicData = BuildLogicChunkDataFromLogic(logic);
+        bool hasPrefix = false;
+        if (data.size() >= 4)
+        {
+            std::uint32_t possible = ReadU32LE(std::span<const std::uint8_t>(data.data(), data.size()), 0);
+            if (possible == data.size() - 4 || possible == data.size())
+                hasPrefix = true;
+        }
+
+        auto rebuilt = BuildSifWithRewrittenLogic(parsed->Chunks, logicData, hasPrefix);
+
+        std::error_code ec;
+        std::filesystem::create_directories(outputPath.parent_path(), ec);
+        std::ofstream out(outputPath, std::ios::binary);
+        if (!out)
+        {
+            std::cerr << "[LogicCLI] Failed to write " << outputPath.string() << std::endl;
+            return 4;
+        }
+        out.write(reinterpret_cast<const char*>(rebuilt.data()), static_cast<std::streamsize>(rebuilt.size()));
+        out.close();
+
+        std::cout << "[LogicCLI] Wrote " << outputPath.string() << " size=" << rebuilt.size() << std::endl;
         return 0;
     }
 

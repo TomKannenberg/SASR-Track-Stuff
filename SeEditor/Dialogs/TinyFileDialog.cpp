@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <cstring>
 #include <iostream>
 
@@ -45,6 +46,30 @@ static HWND pickOwnerWindow()
     if (!owner)
         owner = GetForegroundWindow();
     return owner;
+}
+
+static std::wstring widenUtf8(char const* text)
+{
+    if (text == nullptr || *text == '\0')
+        return {};
+    int size = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (size <= 0)
+        return {};
+    std::wstring result(static_cast<std::size_t>(size - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, result.data(), size);
+    return result;
+}
+
+static std::string narrowUtf8(wchar_t const* text)
+{
+    if (text == nullptr || *text == L'\0')
+        return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+        return {};
+    std::string result(static_cast<std::size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr);
+    return result;
 }
 
 const char* tinyfd_openFileDialog(const char* aTitle,
@@ -112,6 +137,67 @@ const char* tinyfd_saveFileDialog(const char* aTitle,
 
 const char* tinyfd_selectFolderDialog(const char* aTitle, const char* aDefaultPathAndFile)
 {
+    HRESULT initResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool coInit = SUCCEEDED(initResult) || initResult == RPC_E_CHANGED_MODE;
+
+    IFileDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&dialog));
+    if (SUCCEEDED(hr))
+    {
+        DWORD options = 0;
+        if (SUCCEEDED(dialog->GetOptions(&options)))
+            dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+
+        if (aTitle != nullptr)
+        {
+            std::wstring title = widenUtf8(aTitle);
+            if (!title.empty())
+                dialog->SetTitle(title.c_str());
+        }
+
+        if (aDefaultPathAndFile != nullptr && *aDefaultPathAndFile != '\0')
+        {
+            std::wstring defaultPath = widenUtf8(aDefaultPathAndFile);
+            if (!defaultPath.empty())
+            {
+                IShellItem* folderItem = nullptr;
+                if (SUCCEEDED(SHCreateItemFromParsingName(defaultPath.c_str(), nullptr,
+                                                          IID_PPV_ARGS(&folderItem))))
+                {
+                    dialog->SetFolder(folderItem);
+                    dialog->SetDefaultFolder(folderItem);
+                    folderItem->Release();
+                }
+            }
+        }
+
+        hr = dialog->Show(pickOwnerWindow());
+        if (SUCCEEDED(hr))
+        {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&item)) && item != nullptr)
+            {
+                PWSTR wpath = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &wpath)) && wpath != nullptr)
+                {
+                    std::string path = narrowUtf8(wpath);
+                    CoTaskMemFree(wpath);
+                    item->Release();
+                    dialog->Release();
+                    if (coInit && initResult != RPC_E_CHANGED_MODE)
+                        CoUninitialize();
+                    return path.empty() ? nullptr : saveResult(path);
+                }
+                item->Release();
+            }
+        }
+        dialog->Release();
+    }
+
+    if (coInit && initResult != RPC_E_CHANGED_MODE)
+        CoUninitialize();
+
     BROWSEINFOA bi{};
     char path[MAX_PATH] = {0};
     bi.hwndOwner = pickOwnerWindow();

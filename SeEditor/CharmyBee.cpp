@@ -19,6 +19,7 @@
 #include "Forest/ForestArchive.hpp"
 
 #include <SlLib/Excel/ExcelData.hpp>
+#include <SlLib/Enums/TriggerPhantomHashInfo.hpp>
 #include <SlLib/Enums/TriggerPhantomShape.hpp>
 #include <SlLib/Resources/Scene/Definitions/TriggerPhantomDefinitionNode.hpp>
 #include <SlLib/Resources/Scene/SeDefinitionNode.hpp>
@@ -64,6 +65,51 @@
 namespace {
 
 using SeEditor::SifChunkInfo;
+
+std::string DescribeTriggerHash(int hash)
+{
+    using SlLib::Enums::TriggerPhantomHashInfo;
+    for (auto info : SlLib::Enums::allTriggerPhantomHashInfos())
+    {
+        if (static_cast<int>(info) == hash)
+            return SlLib::Enums::toString(info);
+    }
+    return std::string("Hash ") + std::to_string(hash);
+}
+
+std::size_t AlignUp(std::size_t value, std::size_t align)
+{
+    if (align == 0)
+        return value;
+    std::size_t mask = align - 1;
+    return (value + mask) & ~mask;
+}
+
+void WriteInt32LE(std::vector<std::uint8_t>& out, std::size_t offset, std::int32_t value)
+{
+    if (offset + 4 > out.size())
+        return;
+    out[offset + 0] = static_cast<std::uint8_t>(value & 0xFF);
+    out[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    out[offset + 2] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+    out[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
+}
+
+void WriteFloatLE(std::vector<std::uint8_t>& out, std::size_t offset, float value)
+{
+    std::uint32_t raw = 0;
+    static_assert(sizeof(raw) == sizeof(value));
+    std::memcpy(&raw, &value, sizeof(raw));
+    WriteInt32LE(out, offset, static_cast<std::int32_t>(raw));
+}
+
+std::int32_t ReadInt32LE(const std::uint8_t* ptr)
+{
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(ptr[0]) |
+                                     (static_cast<std::uint32_t>(ptr[1]) << 8) |
+                                     (static_cast<std::uint32_t>(ptr[2]) << 16) |
+                                     (static_cast<std::uint32_t>(ptr[3]) << 24));
+}
 
 std::string DescribeGlfwKey(int key)
 {
@@ -1769,10 +1815,8 @@ void CharmyBee::RenderSifViewer()
                                 _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
                                 LoadForestResources();
                             }
-                            ImGui::SameLine();
                             if (ImGui::Checkbox("Draw", &_drawForestMeshes))
                                 UpdateForestMeshRendering();
-                            ImGui::SameLine();
                             if (ImGui::Checkbox("Draw boxes", &_drawForestBoxes))
                                 UpdateForestBoxRenderer();
                             if (ImGui::Button("Export track.Forest OBJ"))
@@ -1799,17 +1843,14 @@ void CharmyBee::RenderSifViewer()
                                 _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
                                 LoadNavigationResources();
                             }
-                            ImGui::SameLine();
                             if (ImGui::Checkbox("Draw", &_drawNavigation))
                                 UpdateDebugLines();
                             if (_sifNavigationTool)
                             {
-                                ImGui::SameLine();
                                 if (ImGui::Checkbox("Waypoints", &_drawNavigationWaypoints))
                                     UpdateDebugLines();
                                 if (_drawNavigationWaypoints)
                                 {
-                                    ImGui::SameLine();
                                     ImGui::SetNextItemWidth(80.0f);
                                     if (ImGui::DragFloat("Size", &_navigationWaypointBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
                                         UpdateDebugLines();
@@ -1823,27 +1864,10 @@ void CharmyBee::RenderSifViewer()
                                 _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
                                 LoadLogicResources();
                             }
-                            ImGui::SameLine();
                             if (ImGui::Checkbox("Draw", &_drawLogic))
                             {
                                 UpdateDebugLines();
                                 UpdateForestMeshRendering();
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Checkbox("Triggers", &_drawLogicTriggers))
-                                UpdateDebugLines();
-                            ImGui::SameLine();
-                            if (ImGui::Checkbox("Locators", &_drawLogicLocators))
-                            {
-                                UpdateDebugLines();
-                                UpdateForestMeshRendering();
-                            }
-                            if (_drawLogicLocators)
-                            {
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(80.0f);
-                                if (ImGui::DragFloat("Size", &_logicLocatorBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
-                                    UpdateDebugLines();
                             }
                         }
                         else
@@ -1929,6 +1953,160 @@ void CharmyBee::RenderSifViewer()
                         }
                         if (changed)
                             UpdateNavigationLineVisibility();
+                    }
+                }
+                else if (chunk.TypeValue == MakeTypeCode('L', 'O', 'G', 'C'))
+                {
+                    if (_sifLogic == nullptr)
+                    {
+                        ImGui::Text("No logic data loaded yet.");
+                    }
+                    else
+                    {
+                        bool changed = false;
+
+                        if (ImGui::Button("Export LOGC Rewrite"))
+                            ExportLogicRewrite();
+
+                        if (ImGui::TreeNodeEx("Triggers", ImGuiTreeNodeFlags_DefaultOpen))
+                        {
+                            if (ImGui::Checkbox("Trigger Quads", &_drawLogicTriggers))
+                                changed = true;
+                            if (ImGui::Checkbox("Trigger Volumes", &_drawTriggerBoxes))
+                                UpdateTriggerPhantomBoxes();
+                            if (ImGui::Checkbox("Trigger Normals", &_drawLogicTriggerNormals))
+                                changed = true;
+                            if (_drawLogicTriggerNormals)
+                            {
+                                ImGui::SetNextItemWidth(80.0f);
+                                if (ImGui::DragFloat("Normal Size", &_logicTriggerNormalSize, 0.2f, 0.5f, 100.0f, "%.1f"))
+                                    changed = true;
+                            }
+                            if (!_logicTriggerGroups.empty())
+                            {
+                                ImGui::SeparatorText("Types");
+                                for (auto& group : _logicTriggerGroups)
+                                {
+                                    std::string label = group.Name + " (" + std::to_string(group.Count) + ")";
+                                    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+                                    bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+                                    ImGui::SameLine();
+                                    std::string checkLabel = "##logic_type_" + std::to_string(group.Hash);
+                                    if (ImGui::Checkbox(checkLabel.c_str(), &group.Visible))
+                                        changed = true;
+                                    if (open)
+                                    {
+                                        for (int idx : group.Indices)
+                                        {
+                                            if (idx < 0 || idx >= static_cast<int>(_sifLogic->Triggers.size()))
+                                                continue;
+                                            auto const& trig = _sifLogic->Triggers[static_cast<std::size_t>(idx)];
+                                            if (!trig)
+                                                continue;
+                                            ImGui::Text("Trigger %d @ (%.3f, %.3f, %.3f)",
+                                                        idx,
+                                                        trig->Position.X,
+                                                        trig->Position.Y,
+                                                        trig->Position.Z);
+                                        }
+                                        ImGui::TreePop();
+                                    }
+                                }
+                            }
+                            ImGui::TreePop();
+                        }
+
+                        if (ImGui::TreeNodeEx("Locators", ImGuiTreeNodeFlags_DefaultOpen))
+                        {
+                            if (ImGui::Checkbox("Locator Meshes + Boxes", &_drawLogicLocators))
+                                changed = true;
+                            if (_drawLogicLocators)
+                            {
+                                ImGui::SetNextItemWidth(80.0f);
+                                if (ImGui::DragFloat("Box Size", &_logicLocatorBoxSize, 0.1f, 0.2f, 50.0f, "%.1f"))
+                                    changed = true;
+                            }
+                            if (ImGui::Checkbox("Locator Axes", &_drawLogicLocatorAxes))
+                                changed = true;
+                            if (_drawLogicLocatorAxes)
+                            {
+                                ImGui::SetNextItemWidth(80.0f);
+                                if (ImGui::DragFloat("Axis Size", &_logicLocatorAxisSize, 0.2f, 0.5f, 100.0f, "%.1f"))
+                                    changed = true;
+                            }
+
+                            ImGui::SeparatorText("Groups");
+                            std::unordered_map<int, std::vector<int>> groups;
+                            for (int i = 0; i < static_cast<int>(_sifLogic->Locators.size()); ++i)
+                            {
+                                auto const& locator = _sifLogic->Locators[static_cast<std::size_t>(i)];
+                                if (!locator)
+                                    continue;
+                                groups[locator->GroupNameHash].push_back(i);
+                            }
+                            std::vector<int> groupKeys;
+                            groupKeys.reserve(groups.size());
+                            for (auto const& pair : groups)
+                                groupKeys.push_back(pair.first);
+                            std::sort(groupKeys.begin(), groupKeys.end());
+
+                            for (int hash : groupKeys)
+                            {
+                                auto const& indices = groups[hash];
+                                std::string label = "Group " + std::to_string(hash) + " (" + std::to_string(indices.size()) + ")";
+                                if (ImGui::TreeNodeEx(label.c_str(), ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth))
+                                {
+                                    for (int idx : indices)
+                                    {
+                                        if (idx < 0 || idx >= static_cast<int>(_sifLogic->Locators.size()))
+                                            continue;
+                                        auto const& loc = _sifLogic->Locators[static_cast<std::size_t>(idx)];
+                                        if (!loc)
+                                            continue;
+                                        ImGui::Text("Locator %d", idx);
+                                        ImGui::SameLine();
+                                        if (ImGui::SmallButton("Focus Camera"))
+                                        {
+                                            _orbitTarget = {loc->PositionAsFloats.X,
+                                                            loc->PositionAsFloats.Y,
+                                                            loc->PositionAsFloats.Z};
+                                            _orbitOffset = {0.0f, 0.0f, 0.0f};
+                                        }
+                                        float pos[3] = {loc->PositionAsFloats.X,
+                                                        loc->PositionAsFloats.Y,
+                                                        loc->PositionAsFloats.Z};
+                                        ImGui::PushID(idx);
+                                        ImGui::SetNextItemWidth(80.0f);
+                                        bool posChanged = ImGui::DragFloat("X", &pos[0], 0.1f);
+                                        ImGui::SetNextItemWidth(80.0f);
+                                        posChanged |= ImGui::DragFloat("Y", &pos[1], 0.1f);
+                                        ImGui::SetNextItemWidth(80.0f);
+                                        posChanged |= ImGui::DragFloat("Z", &pos[2], 0.1f);
+                                        ImGui::PopID();
+
+                                        if (posChanged)
+                                        {
+                                            loc->PositionAsFloats.X = pos[0];
+                                            loc->PositionAsFloats.Y = pos[1];
+                                            loc->PositionAsFloats.Z = pos[2];
+                                            BuildLogicLocatorMeshes();
+                                            UpdateForestMeshRendering();
+                                            UpdateDebugLines();
+                                        }
+                                    }
+                                    ImGui::TreePop();
+                                }
+                            }
+                            ImGui::TreePop();
+                        }
+
+                        if (changed)
+                        {
+                            UpdateDebugLines();
+                            UpdateForestMeshRendering();
+                            if (_drawTriggerBoxes)
+                                UpdateTriggerPhantomBoxes();
+                        }
                     }
                 }
                 else
@@ -2133,6 +2311,8 @@ void CharmyBee::RenderStuffWindow()
         ImGui::TextWrapped("%s", _xpacStatus.c_str());
     if (ImGui::Button("Unpack XPAC..."))
         UnpackXpac();
+    if (ImGui::Button("Repack XPAC..."))
+        RepackXpac();
     if (ImGui::Button("Nuke Stuff Folder"))
         _confirmNukeStuff = true;
 
@@ -2143,6 +2323,110 @@ void CharmyBee::RenderStuffWindow()
     ImGui::EndChild();
 
     ImGui::End();
+
+    if (_showXpacRepackPopup)
+        ImGui::OpenPopup("Select SIFs to Repack");
+    if (ImGui::BeginPopupModal("Select SIFs to Repack", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        if (_xpacRepackEntries.empty())
+            ImGui::TextDisabled("No export SIFs found (repack will use unpacked data only).");
+        else
+        {
+            if (ImGui::Button("Select All"))
+            {
+                for (auto& entry : _xpacRepackEntries)
+                    entry.Selected = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear"))
+            {
+                for (auto& entry : _xpacRepackEntries)
+                    entry.Selected = false;
+            }
+
+            ImGui::BeginChild("RepackList", ImVec2(420.0f, 300.0f), true);
+            for (auto& entry : _xpacRepackEntries)
+                ImGui::Checkbox(entry.Label.c_str(), &entry.Selected);
+            ImGui::EndChild();
+        }
+
+        if (ImGui::Button("Repack"))
+        {
+            _showXpacRepackPopup = false;
+            std::unordered_map<std::string, std::filesystem::path> selectedByName;
+            for (auto const& entry : _xpacRepackEntries)
+            {
+                if (!entry.Selected)
+                    continue;
+                std::string key = entry.Path.filename().string();
+                selectedByName[key] = entry.Path;
+            }
+
+            if (_xpacWorker && _xpacWorker->joinable())
+                _xpacWorker->join();
+
+            _xpacRepackBusy = true;
+            _xpacRepackPopupText = "Repacking " + _lastXpacPath.filename().string();
+
+            auto xpacPath = _lastXpacPath;
+            auto repackRoot = _xpacRepackRoot;
+            auto exportRoot = GetStuffRoot() / "export";
+            _xpacWorker = std::make_unique<std::thread>([this, xpacPath, repackRoot, selectedByName, exportRoot]() {
+                std::filesystem::path outPath = exportRoot /
+                    (xpacPath.stem().string() + "_repack.xpac");
+
+                Xpac::XpacRepackOptions options;
+                options.XpacPath = xpacPath;
+                options.InputRoot = repackRoot;
+                options.OutputPath = outPath;
+                options.ReplacementRoot = exportRoot;
+                options.MappingPath = Xpac::FindDefaultMappingPath(options.XpacPath, options.InputRoot);
+                options.Progress = [this](std::size_t current, std::size_t total) {
+                    _xpacRepackProgress = current;
+                    _xpacRepackTotal = total;
+                };
+                for (auto const& pair : selectedByName)
+                {
+                    std::filesystem::path src = pair.second;
+                    std::filesystem::path rel = src.filename();
+                    options.SelectedSifRelativePaths.push_back(rel);
+                    if (_stricmp(src.extension().string().c_str(), ".sif") == 0)
+                    {
+                        std::filesystem::path sigPath = src;
+                        sigPath.replace_extension(".sig");
+                        if (std::filesystem::exists(sigPath))
+                            options.SelectedSifRelativePaths.push_back(sigPath.filename());
+                    }
+                }
+
+                Xpac::XpacRepackResult repackResult = Xpac::RepackXpac(options);
+                std::ostringstream status;
+                status << "[XPAC] Repacked: " << repackResult.RepackedEntries
+                       << " / " << repackResult.TotalEntries;
+                if (!repackResult.Errors.empty())
+                    status << " | Errors: " << repackResult.Errors.size();
+                {
+                    std::lock_guard<std::mutex> lock(_xpacMutex);
+                    _xpacStatus = status.str();
+                }
+                std::cout << status.str() << std::endl;
+                for (auto const& err : repackResult.Errors)
+                    std::cout << "[XPAC] " << err << std::endl;
+
+                _xpacRepackBusy = false;
+            });
+
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel"))
+        {
+            _showXpacRepackPopup = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
 
     if (_xpacBusy)
         ImGui::OpenPopup("XPAC Unpack");
@@ -2176,6 +2460,24 @@ void CharmyBee::RenderStuffWindow()
         if (!_xpacBusy)
             ImGui::CloseCurrentPopup();
 
+        ImGui::EndPopup();
+    }
+
+    if (_xpacRepackBusy)
+        ImGui::OpenPopup("XPAC Repack");
+    if (ImGui::BeginPopupModal("XPAC Repack", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        if (!_xpacRepackPopupText.empty())
+            ImGui::TextWrapped("%s", _xpacRepackPopupText.c_str());
+        std::size_t total = _xpacRepackTotal.load();
+        std::size_t current = _xpacRepackProgress.load();
+        float progress = 0.0f;
+        if (total > 0)
+            progress = static_cast<float>(current) / static_cast<float>(total);
+        ImGui::ProgressBar(progress, ImVec2(320.0f, 0.0f));
+        ImGui::Text("Repack: %zu / %zu", current, total);
+        if (!_xpacRepackBusy)
+            ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 
@@ -2271,6 +2573,96 @@ void CharmyBee::UnpackXpac()
 
         _xpacBusy = false;
     });
+}
+
+void CharmyBee::RepackXpac()
+{
+    using namespace SeEditor::Dialogs;
+    if (_lastXpacPath.empty())
+    {
+        FileDialogOptions options;
+        options.Title = "Repack XPAC";
+        options.FilterPatterns = {"*.xpac"};
+        options.FilterDescription = "XPAC files";
+        auto result = TinyFileDialog::openFileDialog(options);
+        if (!result)
+            return;
+        _lastXpacPath = *result;
+    }
+
+    std::filesystem::path xpacRoot = GetStuffRoot() / "xpac" / _lastXpacPath.stem();
+    std::filesystem::path repackRoot = xpacRoot;
+    if (auto selected = SeEditor::Dialogs::TinyFileDialog::selectFolderDialog(
+            "Select unpacked XPAC folder", repackRoot.string()))
+    {
+        if (!selected->empty())
+            repackRoot = *selected;
+    }
+
+    if (!std::filesystem::exists(repackRoot))
+    {
+        _xpacStatus = "Selected unpacked XPAC folder does not exist.";
+        return;
+    }
+
+    _xpacRepackRoot = repackRoot;
+    _xpacRepackEntries.clear();
+
+    std::error_code ec;
+    std::filesystem::path exportRoot = GetStuffRoot() / "export";
+    if (!std::filesystem::exists(exportRoot))
+    {
+        _xpacStatus = "Export folder missing.";
+        return;
+    }
+
+    for (auto const& entry : std::filesystem::recursive_directory_iterator(exportRoot, ec))
+    {
+        if (ec)
+            break;
+        if (!entry.is_regular_file())
+            continue;
+        if (_stricmp(entry.path().extension().string().c_str(), ".sif") != 0)
+            continue;
+
+        std::filesystem::path relPath = std::filesystem::relative(entry.path(), exportRoot, ec);
+        std::vector<std::string> parts;
+        for (auto const& part : relPath)
+        {
+            std::string seg = part.string();
+            if (seg.empty())
+                continue;
+            if (_stricmp(seg.c_str(), "_Resource") == 0)
+                continue;
+            if (!seg.empty() && seg[0] == '_')
+                seg.erase(seg.begin());
+            if (!seg.empty())
+                parts.push_back(seg);
+        }
+        std::string label;
+        if (parts.size() <= 1)
+        {
+            label = parts.empty() ? entry.path().filename().string() : parts.back();
+        }
+        else
+        {
+            for (std::size_t i = 1; i < parts.size(); ++i)
+            {
+                if (i > 1)
+                    label += "/";
+                label += parts[i];
+            }
+        }
+        if (label.empty())
+            label = entry.path().filename().string();
+
+        _xpacRepackEntries.push_back({entry.path(), label, false});
+    }
+
+    if (_xpacRepackEntries.empty())
+        _xpacStatus = "No SIF files found for repack.";
+
+    _showXpacRepackPopup = true;
 }
 
 void CharmyBee::OpenSifFile()
@@ -3354,6 +3746,45 @@ void CharmyBee::LoadLogicResources()
     BuildLogicLocatorMeshes();
     UpdateForestMeshRendering();
     UpdateDebugLines();
+
+    _logicTriggerGroups.clear();
+    _logicTriggerGroupIndex.clear();
+    if (_sifLogic)
+    {
+        int triggerIndex = 0;
+        for (auto const& trigger : _sifLogic->Triggers)
+        {
+            if (!trigger)
+            {
+                ++triggerIndex;
+                continue;
+            }
+            int hash = trigger->NameHash;
+            auto it = _logicTriggerGroupIndex.find(hash);
+            if (it == _logicTriggerGroupIndex.end())
+            {
+                LogicTriggerGroup group;
+                group.Hash = hash;
+                group.Name = DescribeTriggerHash(hash);
+                group.Count = 1;
+                group.Visible = true;
+                group.Indices.push_back(triggerIndex);
+                _logicTriggerGroups.push_back(std::move(group));
+                _logicTriggerGroupIndex.emplace(hash, _logicTriggerGroups.size() - 1);
+            }
+            else
+            {
+                _logicTriggerGroups[it->second].Count += 1;
+                _logicTriggerGroups[it->second].Indices.push_back(triggerIndex);
+            }
+            ++triggerIndex;
+        }
+        std::sort(_logicTriggerGroups.begin(), _logicTriggerGroups.end(),
+                  [](auto const& a, auto const& b) { return a.Name < b.Name; });
+        _logicTriggerGroupIndex.clear();
+        for (std::size_t i = 0; i < _logicTriggerGroups.size(); ++i)
+            _logicTriggerGroupIndex.emplace(_logicTriggerGroups[i].Hash, i);
+    }
 }
 
 void CharmyBee::LoadItemsForestResources()
@@ -3492,6 +3923,263 @@ void CharmyBee::LoadItemsForestResources()
     BuildForestTreeMeshMaps(*library, bigEndian, _itemsForestMeshesByForestTree, _itemsForestMeshesByTreeHash);
     _itemsForestLibrary = std::move(library);
     std::cout << "[Logic] Loaded items.Forest tree meshes: " << _itemsForestMeshesByTreeHash.size() << std::endl;
+}
+
+std::vector<std::uint8_t> CharmyBee::BuildLogicChunkData() const
+{
+    if (_sifLogic == nullptr)
+        return {};
+
+    const int numTriggers = static_cast<int>(_sifLogic->Triggers.size());
+    const int numLocators = static_cast<int>(_sifLogic->Locators.size());
+    const int numAttributes = static_cast<int>(_sifLogic->Attributes.size());
+
+    const std::size_t headerSize = 0x20;
+    std::size_t cursor = headerSize;
+
+    std::size_t triggersOffset = 0;
+    if (numTriggers > 0)
+    {
+        triggersOffset = AlignUp(cursor, 0x10);
+        cursor = triggersOffset + static_cast<std::size_t>(numTriggers) * 0x70;
+    }
+
+    std::size_t attributesOffset = 0;
+    if (numAttributes > 0)
+    {
+        attributesOffset = AlignUp(cursor, 4);
+        cursor = attributesOffset + static_cast<std::size_t>(numAttributes) * 0x8;
+    }
+
+    std::size_t locatorsOffset = 0;
+    if (numLocators > 0)
+    {
+        locatorsOffset = AlignUp(cursor, 0x10);
+        cursor = locatorsOffset + static_cast<std::size_t>(numLocators) * 0x50;
+    }
+
+    std::size_t totalSize = AlignUp(cursor, 0x10);
+    std::vector<std::uint8_t> out(totalSize, 0);
+
+    WriteInt32LE(out, 0x0, _sifLogic->NameHash);
+    WriteInt32LE(out, 0x4, _sifLogic->LogicVersion);
+    WriteInt32LE(out, 0x8, numTriggers);
+    WriteInt32LE(out, 0xC, numLocators);
+    WriteInt32LE(out, 0x10, numTriggers > 0 ? static_cast<std::int32_t>(triggersOffset) : 0);
+    WriteInt32LE(out, 0x14, numAttributes > 0 ? static_cast<std::int32_t>(attributesOffset) : 0);
+    WriteInt32LE(out, 0x18, numLocators > 0 ? static_cast<std::int32_t>(locatorsOffset) : 0);
+
+    auto writeVec4 = [&](std::size_t offset, SlLib::Math::Vector4 const& v) {
+        WriteFloatLE(out, offset + 0x0, v.X);
+        WriteFloatLE(out, offset + 0x4, v.Y);
+        WriteFloatLE(out, offset + 0x8, v.Z);
+        WriteFloatLE(out, offset + 0xC, v.W);
+    };
+
+    if (numTriggers > 0 && triggersOffset != 0)
+    {
+        std::size_t offset = triggersOffset;
+        for (auto const& trigger : _sifLogic->Triggers)
+        {
+            if (trigger)
+            {
+                WriteInt32LE(out, offset + 0x0, trigger->NameHash);
+                WriteInt32LE(out, offset + 0x4, trigger->NumAttributes);
+                WriteInt32LE(out, offset + 0x8, trigger->AttributeStartIndex);
+                WriteInt32LE(out, offset + 0xC, trigger->Flags);
+                writeVec4(offset + 0x10, trigger->Position);
+                writeVec4(offset + 0x20, trigger->Normal);
+                writeVec4(offset + 0x30, trigger->Vertex0);
+                writeVec4(offset + 0x40, trigger->Vertex1);
+                writeVec4(offset + 0x50, trigger->Vertex2);
+                writeVec4(offset + 0x60, trigger->Vertex3);
+            }
+            offset += 0x70;
+        }
+    }
+
+    if (numAttributes > 0 && attributesOffset != 0)
+    {
+        std::size_t offset = attributesOffset;
+        for (auto const& attr : _sifLogic->Attributes)
+        {
+            if (attr)
+            {
+                WriteInt32LE(out, offset + 0x0, attr->NameHash);
+                WriteInt32LE(out, offset + 0x4, attr->PackedValue);
+            }
+            offset += 0x8;
+        }
+    }
+
+    if (numLocators > 0 && locatorsOffset != 0)
+    {
+        std::size_t offset = locatorsOffset;
+        for (auto const& locator : _sifLogic->Locators)
+        {
+            if (locator)
+            {
+                WriteInt32LE(out, offset + 0x0, locator->GroupNameHash);
+                WriteInt32LE(out, offset + 0x4, locator->LocatorNameHash);
+                WriteInt32LE(out, offset + 0x8, locator->MeshForestNameHash);
+                WriteInt32LE(out, offset + 0xC, locator->MeshTreeNameHash);
+                WriteInt32LE(out, offset + 0x10, locator->SetupObjectNameHash);
+                WriteInt32LE(out, offset + 0x14, locator->AnimatedInstanceNameHash);
+                WriteInt32LE(out, offset + 0x18, locator->SubDataHash);
+                WriteInt32LE(out, offset + 0x1C, locator->Flags);
+                WriteInt32LE(out, offset + 0x20, locator->Health);
+                WriteFloatLE(out, offset + 0x24, locator->SequenceStartFrameMultiplier);
+                WriteFloatLE(out, offset + 0x28, locator->SequencerInterSpawnMultiplier);
+                WriteFloatLE(out, offset + 0x2C, locator->AnimatedInstancePlaybackSpeed);
+                writeVec4(offset + 0x30, locator->PositionAsFloats);
+                writeVec4(offset + 0x40, locator->RotationAsFloats);
+            }
+            offset += 0x50;
+        }
+    }
+
+    return out;
+}
+
+void CharmyBee::ExportLogicRewrite()
+{
+    if (_sifLogic == nullptr || _sifChunks.empty())
+    {
+        ReportSifError("No logic data loaded.");
+        return;
+    }
+
+    auto logicData = BuildLogicChunkData();
+    if (logicData.empty())
+    {
+        ReportSifError("Failed to build LOGC data.");
+        return;
+    }
+
+    auto chunks = _sifChunks;
+    const std::uint32_t logicType = MakeTypeCode('L', 'O', 'G', 'C');
+    for (auto& chunk : chunks)
+    {
+        if (chunk.TypeValue != logicType)
+            continue;
+        chunk.Data = logicData;
+        chunk.DataSize = static_cast<std::uint32_t>(logicData.size());
+        chunk.Relocations.clear();
+        if (logicData.size() >= 0x20)
+        {
+            if (ReadInt32LE(logicData.data() + 0x10) != 0)
+                chunk.Relocations.push_back(0x10);
+            if (ReadInt32LE(logicData.data() + 0x14) != 0)
+                chunk.Relocations.push_back(0x14);
+            if (ReadInt32LE(logicData.data() + 0x18) != 0)
+                chunk.Relocations.push_back(0x18);
+        }
+        break;
+    }
+
+    std::size_t totalSize = 0;
+    for (auto const& chunk : chunks)
+    {
+        std::size_t minDataSize = 0x10 + chunk.Data.size();
+        std::size_t dataChunkSize = chunk.ChunkSize >= minDataSize
+            ? chunk.ChunkSize
+            : AlignUp(minDataSize, 0x10);
+        std::size_t relDataSize = 0x4 + (chunk.Relocations.size() + 1) * 0x8;
+        std::size_t minRelSize = 0x10 + relDataSize;
+        std::size_t relChunkSize = chunk.RelocChunkSize >= minRelSize
+            ? chunk.RelocChunkSize
+            : AlignUp(minRelSize, 0x10);
+        totalSize += dataChunkSize + relChunkSize;
+    }
+
+    std::vector<std::uint8_t> output(totalSize, 0);
+    std::size_t cursor = 0;
+    for (auto const& chunk : chunks)
+    {
+        std::size_t minDataSize = 0x10 + chunk.Data.size();
+        std::size_t dataChunkSize = chunk.ChunkSize >= minDataSize
+            ? chunk.ChunkSize
+            : AlignUp(minDataSize, 0x10);
+        std::size_t relDataSize = 0x4 + (chunk.Relocations.size() + 1) * 0x8;
+        std::size_t minRelSize = 0x10 + relDataSize;
+        std::size_t relChunkSize = chunk.RelocChunkSize >= minRelSize
+            ? chunk.RelocChunkSize
+            : AlignUp(minRelSize, 0x10);
+
+        if (chunk.RawChunk.size() == dataChunkSize)
+            std::memcpy(output.data() + cursor, chunk.RawChunk.data(), chunk.RawChunk.size());
+
+        WriteInt32LE(output, cursor + 0x0, static_cast<std::int32_t>(chunk.TypeValue));
+        WriteInt32LE(output, cursor + 0x4, static_cast<std::int32_t>(dataChunkSize));
+        WriteInt32LE(output, cursor + 0x8, static_cast<std::int32_t>(chunk.Data.size()));
+        WriteInt32LE(output, cursor + 0xC, 0x44332211);
+        if (!chunk.Data.empty())
+            std::memcpy(output.data() + cursor + 0x10, chunk.Data.data(), chunk.Data.size());
+
+        cursor += dataChunkSize;
+
+        if (chunk.RelocRaw.size() == relChunkSize)
+            std::memcpy(output.data() + cursor, chunk.RelocRaw.data(), chunk.RelocRaw.size());
+
+        WriteInt32LE(output, cursor + 0x0, static_cast<std::int32_t>(SifResourceType::Relocations));
+        WriteInt32LE(output, cursor + 0x4, static_cast<std::int32_t>(relChunkSize));
+        WriteInt32LE(output, cursor + 0x8, static_cast<std::int32_t>(relDataSize));
+        WriteInt32LE(output, cursor + 0xC, 0x44332211);
+        WriteInt32LE(output, cursor + 0x10, static_cast<std::int32_t>(chunk.TypeValue));
+        for (std::size_t i = 0; i < chunk.Relocations.size(); ++i)
+        {
+            std::size_t entry = cursor + 0x10 + 0x4 + i * 0x8;
+            output[entry + 0] = 1;
+            output[entry + 1] = 0;
+            output[entry + 2] = 0;
+            output[entry + 3] = 0;
+            WriteInt32LE(output, entry + 4, static_cast<std::int32_t>(chunk.Relocations[i]));
+        }
+
+        cursor += relChunkSize;
+    }
+
+    std::filesystem::path exportRoot = GetStuffRoot() / "export";
+    std::error_code ec;
+    std::filesystem::create_directories(exportRoot, ec);
+
+    std::filesystem::path outPath;
+    if (!_sifFilePath.empty())
+    {
+        outPath = std::filesystem::path(_sifFilePath).filename();
+        outPath.replace_extension(".sif");
+    }
+    else
+    {
+        outPath = "logic_rewrite.sif";
+    }
+    outPath = exportRoot / outPath;
+
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out)
+    {
+        ReportSifError("Unable to write export file.");
+        return;
+    }
+    out.write(reinterpret_cast<const char*>(output.data()), static_cast<std::streamsize>(output.size()));
+    out.close();
+
+    std::string zifError;
+    std::vector<std::uint8_t> zifData;
+    if (Xpac::EncodeZifZig(std::span<const std::uint8_t>(output.data(), output.size()), zifData, zifError))
+    {
+        std::filesystem::path zifPath = outPath;
+        zifPath.replace_extension(".zif");
+        std::ofstream zifOut(zifPath, std::ios::binary);
+        if (zifOut)
+        {
+            zifOut.write(reinterpret_cast<const char*>(zifData.data()),
+                         static_cast<std::streamsize>(zifData.size()));
+            zifOut.close();
+        }
+    }
+
+    std::cout << "[Logic] Exported LOGC rewrite to " << outPath.string() << std::endl;
 }
 
 void CharmyBee::BuildLogicLocatorMeshes()
@@ -3716,6 +4404,12 @@ void CharmyBee::UpdateDebugLines()
             {
                 if (!trigger)
                     continue;
+                if (!_logicTriggerGroups.empty())
+                {
+                    auto it = _logicTriggerGroupIndex.find(trigger->NameHash);
+                    if (it != _logicTriggerGroupIndex.end() && !_logicTriggerGroups[it->second].Visible)
+                        continue;
+                }
                 auto v0 = SlLib::Math::Vector3{trigger->Vertex0.X, trigger->Vertex0.Y, trigger->Vertex0.Z};
                 auto v1 = SlLib::Math::Vector3{trigger->Vertex1.X, trigger->Vertex1.Y, trigger->Vertex1.Z};
                 auto v2 = SlLib::Math::Vector3{trigger->Vertex2.X, trigger->Vertex2.Y, trigger->Vertex2.Z};
@@ -3724,6 +4418,30 @@ void CharmyBee::UpdateDebugLines()
                 logicLines.push_back(Renderer::SlRenderer::DebugLine{v1, v2, color});
                 logicLines.push_back(Renderer::SlRenderer::DebugLine{v2, v3, color});
                 logicLines.push_back(Renderer::SlRenderer::DebugLine{v3, v0, color});
+
+                if (_drawLogicTriggerNormals)
+                {
+                    SlLib::Math::Vector3 n{trigger->Normal.X, trigger->Normal.Y, trigger->Normal.Z};
+                    float len = std::sqrt(n.X * n.X + n.Y * n.Y + n.Z * n.Z);
+                    if (len <= 1e-4f)
+                    {
+                        SlLib::Math::Vector3 e0{v1.X - v0.X, v1.Y - v0.Y, v1.Z - v0.Z};
+                        SlLib::Math::Vector3 e1{v3.X - v0.X, v3.Y - v0.Y, v3.Z - v0.Z};
+                        n = SlLib::Math::cross(e0, e1);
+                        len = std::sqrt(n.X * n.X + n.Y * n.Y + n.Z * n.Z);
+                    }
+                    if (len > 1e-4f)
+                    {
+                        float inv = 1.0f / len;
+                        SlLib::Math::Vector3 dir{n.X * inv, n.Y * inv, n.Z * inv};
+                        float size = std::max(0.1f, _logicTriggerNormalSize);
+                        SlLib::Math::Vector3 center{trigger->Position.X, trigger->Position.Y, trigger->Position.Z};
+                        SlLib::Math::Vector3 end{center.X + dir.X * size,
+                                                 center.Y + dir.Y * size,
+                                                 center.Z + dir.Z * size};
+                        logicLines.push_back(Renderer::SlRenderer::DebugLine{center, end, {0.9f, 0.2f, 0.9f}});
+                    }
+                }
             }
         }
 
@@ -3754,6 +4472,42 @@ void CharmyBee::UpdateDebugLines()
                 add(v0, v1); add(v1, v2); add(v2, v3); add(v3, v0);
                 add(v4, v5); add(v5, v6); add(v6, v7); add(v7, v4);
                 add(v0, v4); add(v1, v5); add(v2, v6); add(v3, v7);
+            }
+        }
+
+        if (_drawLogicLocatorAxes)
+        {
+            float size = std::max(0.1f, _logicLocatorAxisSize);
+            for (auto const& locator : _sifLogic->Locators)
+            {
+                if (!locator)
+                    continue;
+                SlLib::Math::Quaternion q{locator->RotationAsFloats.X,
+                                          locator->RotationAsFloats.Y,
+                                          locator->RotationAsFloats.Z,
+                                          locator->RotationAsFloats.W};
+                float qLen = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+                if (qLen > 0.0f)
+                {
+                    float inv = 1.0f / qLen;
+                    q = q * inv;
+                }
+                else
+                {
+                    q = {0.0f, 0.0f, 0.0f, 1.0f};
+                }
+
+                SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
+                SlLib::Math::Vector3 x{rot(0, 0), rot(1, 0), rot(2, 0)};
+                SlLib::Math::Vector3 y{rot(0, 1), rot(1, 1), rot(2, 1)};
+                SlLib::Math::Vector3 z{rot(0, 2), rot(1, 2), rot(2, 2)};
+
+                SlLib::Math::Vector3 c{locator->PositionAsFloats.X,
+                                       locator->PositionAsFloats.Y,
+                                       locator->PositionAsFloats.Z};
+                logicLines.push_back(Renderer::SlRenderer::DebugLine{c, {c.X + x.X * size, c.Y + x.Y * size, c.Z + x.Z * size}, {1.0f, 0.2f, 0.2f}});
+                logicLines.push_back(Renderer::SlRenderer::DebugLine{c, {c.X + y.X * size, c.Y + y.Y * size, c.Z + y.Z * size}, {0.2f, 1.0f, 0.2f}});
+                logicLines.push_back(Renderer::SlRenderer::DebugLine{c, {c.X + z.X * size, c.Y + z.Y * size, c.Z + z.Z * size}, {0.2f, 0.4f, 1.0f}});
             }
         }
 
@@ -3794,8 +4548,67 @@ void CharmyBee::UpdateTriggerPhantomBoxes()
     std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> boxes;
     if (_database == nullptr)
     {
-        _renderer.SetTriggerBoxes({});
-        _renderer.SetDrawTriggerBoxes(false);
+        if (_sifLogic == nullptr || _sifLogic->Triggers.empty())
+        {
+            _renderer.SetTriggerBoxes({});
+            _renderer.SetDrawTriggerBoxes(false);
+            return;
+        }
+
+        auto addBoxFromPoints = [&](std::span<SlLib::Math::Vector3 const> points) {
+            SlLib::Math::Vector3 min = points.front();
+            SlLib::Math::Vector3 max = points.front();
+            for (auto const& p : points)
+            {
+                min.X = std::min(min.X, p.X);
+                min.Y = std::min(min.Y, p.Y);
+                min.Z = std::min(min.Z, p.Z);
+                max.X = std::max(max.X, p.X);
+                max.Y = std::max(max.Y, p.Y);
+                max.Z = std::max(max.Z, p.Z);
+            }
+            boxes.emplace_back(min, max);
+        };
+
+        for (auto const& trigger : _sifLogic->Triggers)
+        {
+            if (!trigger)
+                continue;
+            if (!_logicTriggerGroups.empty())
+            {
+                auto it = _logicTriggerGroupIndex.find(trigger->NameHash);
+                if (it != _logicTriggerGroupIndex.end() && !_logicTriggerGroups[it->second].Visible)
+                    continue;
+            }
+
+            SlLib::Math::Vector3 v0{trigger->Vertex0.X, trigger->Vertex0.Y, trigger->Vertex0.Z};
+            SlLib::Math::Vector3 v1{trigger->Vertex1.X, trigger->Vertex1.Y, trigger->Vertex1.Z};
+            SlLib::Math::Vector3 v2{trigger->Vertex2.X, trigger->Vertex2.Y, trigger->Vertex2.Z};
+            SlLib::Math::Vector3 v3{trigger->Vertex3.X, trigger->Vertex3.Y, trigger->Vertex3.Z};
+            SlLib::Math::Vector3 center{trigger->Position.X, trigger->Position.Y, trigger->Position.Z};
+            SlLib::Math::Vector3 normal{trigger->Normal.X, trigger->Normal.Y, trigger->Normal.Z};
+
+            float len = std::sqrt(normal.X * normal.X + normal.Y * normal.Y + normal.Z * normal.Z);
+            SlLib::Math::Vector3 dir = (len > 1e-4f)
+                ? SlLib::Math::Vector3{normal.X / len, normal.Y / len, normal.Z / len}
+                : SlLib::Math::Vector3{0.0f, 1.0f, 0.0f};
+            float depth = std::max(1.0f, len);
+            SlLib::Math::Vector3 offset{dir.X * depth, dir.Y * depth, dir.Z * depth};
+
+            std::array<SlLib::Math::Vector3, 9> points{
+                v0, v1, v2, v3,
+                SlLib::Math::Vector3{v0.X + offset.X, v0.Y + offset.Y, v0.Z + offset.Z},
+                SlLib::Math::Vector3{v1.X + offset.X, v1.Y + offset.Y, v1.Z + offset.Z},
+                SlLib::Math::Vector3{v2.X + offset.X, v2.Y + offset.Y, v2.Z + offset.Z},
+                SlLib::Math::Vector3{v3.X + offset.X, v3.Y + offset.Y, v3.Z + offset.Z},
+                center
+            };
+
+            addBoxFromPoints(points);
+        }
+
+        _renderer.SetTriggerBoxes(std::move(boxes));
+        _renderer.SetDrawTriggerBoxes(_drawTriggerBoxes);
         return;
     }
 

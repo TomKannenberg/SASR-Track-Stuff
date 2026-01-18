@@ -215,6 +215,7 @@ std::optional<SifParseResult> ParseSifFile(std::span<const std::uint8_t> raw, st
         chunk.ChunkSize = chunkSize;
         chunk.BigEndian = bigEndian;
         chunk.Data.assign(header + 0x10, header + 0x10 + dataSize);
+        chunk.RawChunk.assign(header, header + chunkSize);
 
         offset += chunkSize;
 
@@ -226,6 +227,8 @@ std::optional<SifParseResult> ParseSifFile(std::span<const std::uint8_t> raw, st
             {
                 std::uint32_t relocSize = read32(relocHeader + 4);
                 std::uint32_t relocDataSize = read32(relocHeader + 8);
+                chunk.RelocChunkSize = relocSize;
+                chunk.RelocDataSize = relocDataSize;
 
                 if (relocSize >= 0x10 && relocSize <= size - offset && relocDataSize >= 4 &&
                     relocSize >= 0x10 + relocDataSize)
@@ -248,6 +251,9 @@ std::optional<SifParseResult> ParseSifFile(std::span<const std::uint8_t> raw, st
                         }
                     }
                 }
+
+                if (relocSize >= 0x10 && relocSize <= size - offset)
+                    chunk.RelocRaw.assign(relocHeader, relocHeader + relocSize);
 
                 offset += relocSize;
             }

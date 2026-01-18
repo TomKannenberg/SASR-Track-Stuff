@@ -93,7 +93,21 @@ private:
     bool _drawLogic = false;
     bool _drawLogicTriggers = true;
     bool _drawLogicLocators = true;
+    bool _drawLogicTriggerNormals = false;
+    bool _drawLogicLocatorAxes = false;
     float _logicLocatorBoxSize = 2.0f;
+    float _logicLocatorAxisSize = 4.0f;
+    float _logicTriggerNormalSize = 6.0f;
+    struct LogicTriggerGroup
+    {
+        int Hash = 0;
+        std::string Name;
+        int Count = 0;
+        bool Visible = true;
+        std::vector<int> Indices;
+    };
+    std::vector<LogicTriggerGroup> _logicTriggerGroups;
+    std::unordered_map<int, std::size_t> _logicTriggerGroupIndex;
     bool _showStuffWindow = true;
     std::string _xpacStatus;
     std::filesystem::path _lastXpacPath;
@@ -104,9 +118,22 @@ private:
     std::atomic<std::size_t> _xpacConvertProgress{0};
     std::atomic<std::size_t> _xpacConvertTotal{0};
     std::string _xpacPopupText;
+    std::atomic<bool> _xpacRepackBusy{false};
+    std::string _xpacRepackPopupText;
+    std::atomic<std::size_t> _xpacRepackProgress{0};
+    std::atomic<std::size_t> _xpacRepackTotal{0};
     bool _confirmNukeStuff = false;
     std::mutex _xpacMutex;
     std::unique_ptr<std::thread> _xpacWorker;
+    struct XpacRepackEntry
+    {
+        std::filesystem::path Path;
+        std::string Label;
+        bool Selected = false;
+    };
+    bool _showXpacRepackPopup = false;
+    std::filesystem::path _xpacRepackRoot;
+    std::vector<XpacRepackEntry> _xpacRepackEntries;
     std::shared_ptr<SeEditor::Forest::ForestLibrary> _forestLibrary;
     using ForestMeshList = std::vector<Renderer::SlRenderer::ForestCpuMesh>;
     std::shared_ptr<SeEditor::Forest::ForestLibrary> _itemsForestLibrary;
@@ -195,6 +222,8 @@ private:
     void LoadLogicResources();
     void LoadItemsForestResources();
     void BuildLogicLocatorMeshes();
+    std::vector<std::uint8_t> BuildLogicChunkData() const;
+    void ExportLogicRewrite();
     void ExportForestObj(std::filesystem::path const& outputPath,
                          std::string const& forestNameFilter);
     void RebuildForestBoxHierarchy();
@@ -216,6 +245,7 @@ private:
     void AddItemNode(std::string const& name, SlLib::Resources::Scene::SeDefinitionNode* definition = nullptr);
     void RenderSifViewer();
     void UnpackXpac();
+    void RepackXpac();
     void OpenSifFile();
     void LoadSifFile(std::filesystem::path const& path);
     void PollGlfwKeyInput();
