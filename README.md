@@ -8,17 +8,24 @@ CppSLib C++ port of tools from https://github.com/ennuo/SlMod (direct port). Tha
   ```
 - Configure CMake with your vcpkg toolchain (static triplet recommended):
   ```bash
-  cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-mingw-static
+  cmake -S . -B build_mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-mingw-static
   ```
 - Build and run:
   ```bash
-  cmake --build build
-  ./build/CppSLib.exe
+  cmake --build build_mingw
+  ./build_mingw/CppSLib.exe
   ```
-- Release build:
+- Release build (smaller/faster, recommended):
   ```bash
-  cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-mingw-static
+  cmake -S . -B build_release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-mingw-static
   cmake --build build_release
+  ./build_release/CppSLib.exe
+  ```
+  
+- Optional CLI tool targets:
+  ```bash
+  cmake --build build_mingw --target sif_to_unity
+  cmake --build build_mingw --target sif_unpacker
   ```
 
 ## Usage
