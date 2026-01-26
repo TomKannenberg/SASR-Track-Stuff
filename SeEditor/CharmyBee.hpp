@@ -218,13 +218,11 @@ private:
         bool Visible = true;
     };
     std::vector<NavigationLineEntry> _navigationLineEntries;
-    float _orbitYaw = 0.6f;
-    float _orbitPitch = 0.35f;
-    float _orbitDistance = 10.0f;
+    float _cameraYaw = 0.6f;
+    float _cameraPitch = 0.35f;
+    SlLib::Math::Vector3 _cameraPosition{3.5f, 3.0f, 3.5f};
     int _selectedChunk = -1;
     SlLib::Math::Vector3 _collisionCenter{0.0f, 0.0f, 0.0f};
-    SlLib::Math::Vector3 _orbitTarget{0.0f, 0.5f, 0.0f};
-    SlLib::Math::Vector3 _orbitOffset{0.0f, 0.0f, 0.0f};
     bool _debugKeyInput = false;
     std::array<bool, GLFW_KEY_LAST + 1> _glfwKeyStates{};
     std::array<bool, GLFW_MOUSE_BUTTON_LAST + 1> _glfwMouseButtonStates{};
@@ -309,7 +307,7 @@ private:
     void UpdateTriggerPhantomBoxes();
     bool RenderForestBoxLayer(ForestBoxLayer& layer);
     void SetForestLayerVisibilityRecursive(ForestBoxLayer& layer, bool visible);
-    void UpdateOrbitFromInput(float delta);
+    void UpdateCameraFromInput(float delta);
     void DrawNodeCreationMenu();
     void AddItemNode(std::string const& name, SlLib::Resources::Scene::SeDefinitionNode* definition = nullptr);
     void RenderSifViewer();

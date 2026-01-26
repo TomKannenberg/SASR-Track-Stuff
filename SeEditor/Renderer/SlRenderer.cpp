@@ -252,12 +252,25 @@ void SlRenderer::Render()
     SlLib::Math::Vector3 eye{3.5f, 3.0f, 3.5f};
     SlLib::Math::Vector3 target{0.0f, 0.5f, 0.0f};
     {
-        float r = std::max(1.0f, _orbitDistance);
-        eye = {
-            _orbitTarget.X + r * std::cos(_orbitPitch) * std::cos(_orbitYaw),
-            _orbitTarget.Y + r * std::sin(_orbitPitch),
-            _orbitTarget.Z + r * std::cos(_orbitPitch) * std::sin(_orbitYaw)};
-        target = _orbitTarget;
+        if (_cameraMode == CameraMode::FreeFly)
+        {
+            eye = _flyPosition;
+            float cp = std::cos(_flyPitch);
+            float sp = std::sin(_flyPitch);
+            float cy = std::cos(_flyYaw);
+            float sy = std::sin(_flyYaw);
+            SlLib::Math::Vector3 forward{cp * cy, sp, cp * sy};
+            target = eye + forward;
+        }
+        else
+        {
+            float r = std::max(1.0f, _orbitDistance);
+            eye = {
+                _orbitTarget.X + r * std::cos(_orbitPitch) * std::cos(_orbitYaw),
+                _orbitTarget.Y + r * std::sin(_orbitPitch),
+                _orbitTarget.Z + r * std::cos(_orbitPitch) * std::sin(_orbitYaw)};
+            target = _orbitTarget;
+        }
     }
 
     auto proj = makePerspective(60.0f * 3.14159265f / 180.0f, aspect, 0.1f, 200000.0f);
@@ -507,10 +520,19 @@ void SlRenderer::SetDebugLines(std::vector<DebugLine> lines)
 
 void SlRenderer::SetOrbitCamera(float yaw, float pitch, float distance, SlLib::Math::Vector3 target)
 {
+    _cameraMode = CameraMode::Orbit;
     _orbitYaw = yaw;
     _orbitPitch = std::clamp(pitch, -1.4f, 1.4f);
     _orbitDistance = std::max(0.3f, distance);
     _orbitTarget = target;
+}
+
+void SlRenderer::SetFreeFlyCamera(SlLib::Math::Vector3 position, float yaw, float pitch)
+{
+    _cameraMode = CameraMode::FreeFly;
+    _flyPosition = position;
+    _flyYaw = yaw;
+    _flyPitch = std::clamp(pitch, -1.4f, 1.4f);
 }
 
 } // namespace SeEditor::Renderer

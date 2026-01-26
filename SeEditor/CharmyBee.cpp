@@ -1599,15 +1599,12 @@ void CharmyBee::RenderSceneView()
             _navigationTool->OnRender();
     }
 
-    // Orbit controls (right-drag rotate, scroll zoom) when hovering scene.
+    // Free-fly camera controls (RMB look, WASD move) when hovering scene.
     ImGuiIO& io = ImGui::GetIO();
     float dt = io.DeltaTime > 0.0f ? io.DeltaTime : 1.0f / 60.0f;
     bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem |
                                           ImGuiHoveredFlags_AllowWhenBlockedByPopup);
-    if (hovered && io.MouseWheel != 0.0f)
-    {
-        _orbitDistance *= std::pow(0.9f, io.MouseWheel);
-    }
+    _sceneViewHovered = hovered;
 
     if (_debugKeyInput)
         PollGlfwKeyInput();
@@ -1616,7 +1613,7 @@ void CharmyBee::RenderSceneView()
     ImGui::PopStyleVar();
 }
 
-void CharmyBee::UpdateOrbitFromInput(float delta)
+void CharmyBee::UpdateCameraFromInput(float delta)
 {
     if (_controller == nullptr)
         return;
@@ -1625,22 +1622,18 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
     if (window == nullptr)
         return;
 
+    if (!_sceneViewHovered)
+    {
+        _mouseOrbitTracking = false;
+        return;
+    }
+
     auto isDown = [&](int key) {
         int state = glfwGetKey(window, key);
         return state == GLFW_PRESS || state == GLFW_REPEAT;
     };
 
-    float rotSpeed = 1.8f;
-    float moveSpeed = _movementSpeed;
-
-    if (isDown(GLFW_KEY_J)) _orbitYaw   -= rotSpeed * delta;
-    if (isDown(GLFW_KEY_L)) _orbitYaw   += rotSpeed * delta;
-    if (isDown(GLFW_KEY_I)) _orbitPitch -= rotSpeed * delta;
-    if (isDown(GLFW_KEY_K)) _orbitPitch += rotSpeed * delta;
-
-    if (isDown(GLFW_KEY_Z)) _movementSpeed /= 1.05f;
-    if (isDown(GLFW_KEY_X)) _movementSpeed *= 1.05f;
-    _movementSpeed = std::max(_movementSpeed, 0.01f);
+    _movementSpeed = std::clamp(_movementSpeed, 0.05f, 200.0f);
 
     double cursorX = 0.0;
     double cursorY = 0.0;
@@ -1653,15 +1646,15 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
             int state = glfwGetMouseButton(window, button);
             return state == GLFW_PRESS || state == GLFW_REPEAT;
         };
-        if (isMouseDown(GLFW_MOUSE_BUTTON_LEFT) || isMouseDown(GLFW_MOUSE_BUTTON_RIGHT))
+        if (isMouseDown(GLFW_MOUSE_BUTTON_RIGHT))
         {
             SlLib::Math::Vector2 current = cursorPos;
             if (_mouseOrbitTracking)
             {
                 SlLib::Math::Vector2 delta = {current.X - _mouseOrbitLastPos.X, current.Y - _mouseOrbitLastPos.Y};
                 constexpr float mouseSensitivity = 0.01f;
-                _orbitYaw   -= delta.X * mouseSensitivity;
-                _orbitPitch -= delta.Y * mouseSensitivity;
+                _cameraYaw   += delta.X * mouseSensitivity;
+                _cameraPitch -= delta.Y * mouseSensitivity;
                 if (_debugKeyInput && (std::abs(delta.X) > 0.0f || std::abs(delta.Y) > 0.0f))
                 {
                     std::cout << "[CharmyBee][MouseDrag] dx=" << delta.X << " dy=" << delta.Y << std::endl;
@@ -1683,34 +1676,35 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
         _mouseOrbitTracking = false;
     }
 
-    float cp = std::cos(_orbitPitch);
-    float sp = std::sin(_orbitPitch);
-    float cy = std::cos(_orbitYaw);
-    float sy = std::sin(_orbitYaw);
+    _cameraPitch = std::clamp(_cameraPitch, -1.4f, 1.4f);
 
-    // Camera-forward points toward the target; right is orthogonal in camera space.
-    SlLib::Math::Vector3 forward{-cp * cy, -sp, -cp * sy};
-    SlLib::Math::Vector3 right{sy, 0.0f, -cy};
+    float cp = std::cos(_cameraPitch);
+    float sp = std::sin(_cameraPitch);
+    float cy = std::cos(_cameraYaw);
+    float sy = std::sin(_cameraYaw);
+
+    SlLib::Math::Vector3 forward{cp * cy, sp, cp * sy};
+    SlLib::Math::Vector3 right{-sy, 0.0f, cy};
+    SlLib::Math::Vector3 up{0.0f, 1.0f, 0.0f};
 
     SlLib::Math::Vector3 deltaVec{0.0f, 0.0f, 0.0f};
     if (isDown(GLFW_KEY_W)) deltaVec = deltaVec + forward;
     if (isDown(GLFW_KEY_S)) deltaVec = deltaVec - forward;
     if (isDown(GLFW_KEY_A)) deltaVec = deltaVec - right;
     if (isDown(GLFW_KEY_D)) deltaVec = deltaVec + right;
+    if (isDown(GLFW_KEY_E)) deltaVec = deltaVec + up;
+    if (isDown(GLFW_KEY_Q)) deltaVec = deltaVec - up;
 
-        if (deltaVec.X != 0.0f || deltaVec.Y != 0.0f || deltaVec.Z != 0.0f)
-        {
-            float len = SlLib::Math::length(deltaVec);
-            if (len > 0.0f)
-                deltaVec = deltaVec * (1.0f / len);
-            deltaVec = deltaVec * (moveSpeed * delta * std::max(1.0f, _orbitDistance * 0.2f));
-            _orbitOffset = _orbitOffset + deltaVec;
-        }
+    if (deltaVec.X != 0.0f || deltaVec.Y != 0.0f || deltaVec.Z != 0.0f)
+    {
+        float len = SlLib::Math::length(deltaVec);
+        if (len > 0.0f)
+            deltaVec = deltaVec * (1.0f / len);
+        deltaVec = deltaVec * (_movementSpeed * delta);
+        _cameraPosition = _cameraPosition + deltaVec;
+    }
 
-    _orbitPitch = std::clamp(_orbitPitch, -1.4f, 1.4f);
-    _orbitDistance = std::max(0.3f, _orbitDistance);
-
-    _renderer.SetOrbitCamera(_orbitYaw, _orbitPitch, _orbitDistance, _orbitTarget + _orbitOffset);
+    _renderer.SetFreeFlyCamera(_cameraPosition, _cameraYaw, _cameraPitch);
     _renderer.SetDrawCollisionMesh(_drawCollisionMesh);
 }
 
@@ -2078,10 +2072,9 @@ void CharmyBee::RenderSifViewer()
                                         ImGui::SameLine();
                                         if (ImGui::SmallButton("Focus Camera"))
                                         {
-                                            _orbitTarget = {loc->PositionAsFloats.X,
-                                                            loc->PositionAsFloats.Y,
-                                                            loc->PositionAsFloats.Z};
-                                            _orbitOffset = {0.0f, 0.0f, 0.0f};
+                                            _cameraPosition = {loc->PositionAsFloats.X,
+                                                               loc->PositionAsFloats.Y,
+                                                               loc->PositionAsFloats.Z};
                                         }
                                         float pos[3] = {loc->PositionAsFloats.X,
                                                         loc->PositionAsFloats.Y,
@@ -3150,8 +3143,7 @@ void CharmyBee::LoadCollisionDebugGeometry()
             }
             _collisionCenter = {(min.X + max.X) * 0.5f, (min.Y + max.Y) * 0.5f, (min.Z + max.Z) * 0.5f};
         }
-        _orbitTarget = _collisionCenter;
-        _orbitOffset = {0.0f, 0.0f, 0.0f};
+        _cameraPosition = _collisionCenter;
         std::cout << "[CharmyBee] Collision mesh loaded: " << _collisionVertices.size()
                   << " vertices, " << _collisionTriangles.size() << " tris." << std::endl;
     }
@@ -6391,7 +6383,7 @@ void CharmyBee::Run()
         _controller->PollEvents();
         PollGlfwKeyInput();
 
-        UpdateOrbitFromInput(delta.count());
+        UpdateCameraFromInput(delta.count());
     }
 
     _controller->Dispose();
