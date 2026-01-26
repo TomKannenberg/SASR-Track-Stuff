@@ -272,46 +272,7 @@ void SlRenderer::Render()
     PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 1.5f, 0.0f}, {0.1f, 1.0f, 0.1f});
     PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.5f}, {0.1f, 0.1f, 1.0f});
 
-    // Animated cube for a 3D visual (only when no collision mesh)
-    if (_collisionTriangles.empty())
-    {
-        static auto start = std::chrono::steady_clock::now();
-        float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
-        float s = 0.75f;
-        std::array<Vector3, 8> cube = {
-            Vector3{-s, -s, -s}, Vector3{s, -s, -s}, Vector3{s, s, -s}, Vector3{-s, s, -s},
-            Vector3{-s, -s, s},  Vector3{s, -s, s},  Vector3{s, s, s},  Vector3{-s, s, s}};
-
-        auto rotateY = [](Vector3 v, float angle) {
-            float c = std::cos(angle), s2 = std::sin(angle);
-            return Vector3{v.X * c + v.Z * s2, v.Y, -v.X * s2 + v.Z * c};
-        };
-
-        for (auto& v : cube)
-            v = rotateY(v, t * 0.6f) + Vector3{0.0f, 0.6f, 0.0f};
-
-        auto addEdge = [&](int a, int b, Vector3 color) {
-            PrimitiveRenderer::DrawLine(cube[a], cube[b], color);
-        };
-
-        // Edges
-        addEdge(0, 1, {0.9f, 0.9f, 0.9f});
-        addEdge(1, 2, {0.9f, 0.9f, 0.9f});
-        addEdge(2, 3, {0.9f, 0.9f, 0.9f});
-        addEdge(3, 0, {0.9f, 0.9f, 0.9f});
-
-        addEdge(4, 5, {0.9f, 0.9f, 0.9f});
-        addEdge(5, 6, {0.9f, 0.9f, 0.9f});
-        addEdge(6, 7, {0.9f, 0.9f, 0.9f});
-        addEdge(7, 4, {0.9f, 0.9f, 0.9f});
-
-        addEdge(0, 4, {0.9f, 0.9f, 0.9f});
-        addEdge(1, 5, {0.9f, 0.9f, 0.9f});
-        addEdge(2, 6, {0.9f, 0.9f, 0.9f});
-        addEdge(3, 7, {0.9f, 0.9f, 0.9f});
-    }
-
-    else if (_drawCollisionMesh && !_collisionTriangles.empty())
+    if (_drawCollisionMesh && !_collisionTriangles.empty())
     {
         SlLib::Math::Vector3 col = {0.4f, 0.9f, 0.9f};
         for (auto const& tri : _collisionTriangles)

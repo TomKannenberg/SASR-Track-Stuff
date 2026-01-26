@@ -26,6 +26,9 @@ public:
         std::vector<float> Vertices; // pos(3) + normal(3) + uv(2)
         std::vector<std::uint32_t> Indices;
         std::shared_ptr<SeEditor::Forest::SuRenderTextureResource> Texture;
+        int ForestIndex = -1;
+        int TreeIndex = -1;
+        int BranchIndex = -1;
     };
 
     struct DebugLine

@@ -2116,6 +2116,249 @@ void CharmyBee::RenderSifViewer()
             }
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Animator"))
+        {
+            if (!_forestLibrary)
+            {
+                ImGui::TextDisabled("No forest data loaded yet.");
+                if (ImGui::Button("Load Forest"))
+                {
+                    LoadForestResources();
+                    _animatorDirty = true;
+                }
+            }
+            else if (_forestLibrary->Forests.empty())
+            {
+                ImGui::TextDisabled("Forest list is empty.");
+            }
+            else
+            {
+                if (_animatorSelectedForest < 0)
+                    _animatorSelectedForest = 0;
+                if (static_cast<std::size_t>(_animatorSelectedForest) >= _forestLibrary->Forests.size())
+                    _animatorSelectedForest = static_cast<int>(_forestLibrary->Forests.size()) - 1;
+
+                auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(_animatorSelectedForest)];
+                std::string forestLabel = forestEntry.Name.empty()
+                                              ? std::string("Forest ") + std::to_string(_animatorSelectedForest)
+                                              : forestEntry.Name;
+
+                if (ImGui::BeginCombo("Forest", forestLabel.c_str()))
+                {
+                    for (std::size_t i = 0; i < _forestLibrary->Forests.size(); ++i)
+                    {
+                        auto const& entry = _forestLibrary->Forests[i];
+                        std::string name = entry.Name.empty()
+                                               ? std::string("Forest ") + std::to_string(i)
+                                               : entry.Name;
+                        bool selected = static_cast<int>(i) == _animatorSelectedForest;
+                        if (ImGui::Selectable(name.c_str(), selected))
+                        {
+                            _animatorSelectedForest = static_cast<int>(i);
+                            _animatorSelectedTree = 0;
+                            _animatorSelectedAnimation = -1;
+                            _animatorSelectedBranch = 0;
+                            _animatorFrame = 0;
+                            _animatorTime = 0.0f;
+                            _animatorDirty = true;
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+
+                SeEditor::Forest::SuRenderTree* tree = nullptr;
+                if (forestEntry.Forest && !forestEntry.Forest->Trees.empty())
+                {
+                    if (_animatorSelectedTree < 0)
+                        _animatorSelectedTree = 0;
+                    if (static_cast<std::size_t>(_animatorSelectedTree) >= forestEntry.Forest->Trees.size())
+                        _animatorSelectedTree = static_cast<int>(forestEntry.Forest->Trees.size()) - 1;
+
+                    tree = forestEntry.Forest->Trees[static_cast<std::size_t>(_animatorSelectedTree)].get();
+                    std::string treeLabel = tree && tree->Hash != 0
+                                                ? std::string("Tree ") + std::to_string(tree->Hash)
+                                                : std::string("Tree ") + std::to_string(_animatorSelectedTree);
+                    if (ImGui::BeginCombo("Tree", treeLabel.c_str()))
+                    {
+                        for (std::size_t i = 0; i < forestEntry.Forest->Trees.size(); ++i)
+                        {
+                            auto const& treeEntry = forestEntry.Forest->Trees[i];
+                            std::string name = treeEntry && treeEntry->Hash != 0
+                                                   ? std::string("Tree ") + std::to_string(treeEntry->Hash)
+                                                   : std::string("Tree ") + std::to_string(i);
+                            bool selected = static_cast<int>(i) == _animatorSelectedTree;
+                            if (ImGui::Selectable(name.c_str(), selected))
+                            {
+                                _animatorSelectedTree = static_cast<int>(i);
+                                _animatorSelectedAnimation = -1;
+                                _animatorSelectedBranch = 0;
+                                _animatorFrame = 0;
+                                _animatorTime = 0.0f;
+                                _animatorDirty = true;
+                            }
+                            if (selected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+                else
+                {
+                    ImGui::TextDisabled("Selected forest has no trees.");
+                }
+
+                SeEditor::Forest::SuAnimation* animation = nullptr;
+                if (tree)
+                {
+                    std::string animLabel = "None";
+                    if (_animatorSelectedAnimation >= 0 &&
+                        static_cast<std::size_t>(_animatorSelectedAnimation) < tree->AnimationEntries.size())
+                    {
+                        auto const& animEntry = tree->AnimationEntries[static_cast<std::size_t>(_animatorSelectedAnimation)];
+                        animLabel = animEntry.AnimName.empty()
+                                        ? std::string("Anim ") + std::to_string(_animatorSelectedAnimation)
+                                        : animEntry.AnimName;
+                        animation = animEntry.Animation.get();
+                    }
+
+                    if (ImGui::BeginCombo("Animation", animLabel.c_str()))
+                    {
+                        bool noneSelected = _animatorSelectedAnimation < 0;
+                        if (ImGui::Selectable("None", noneSelected))
+                        {
+                            _animatorSelectedAnimation = -1;
+                            _animatorPlaying = false;
+                            _animatorFrame = 0;
+                            _animatorTime = 0.0f;
+                            _animatorDirty = true;
+                        }
+                        if (noneSelected)
+                            ImGui::SetItemDefaultFocus();
+
+                        for (std::size_t i = 0; i < tree->AnimationEntries.size(); ++i)
+                        {
+                            auto const& animEntry = tree->AnimationEntries[i];
+                            std::string name = animEntry.AnimName.empty()
+                                                   ? std::string("Anim ") + std::to_string(i)
+                                                   : animEntry.AnimName;
+                            bool selected = static_cast<int>(i) == _animatorSelectedAnimation;
+                            if (ImGui::Selectable(name.c_str(), selected))
+                            {
+                                _animatorSelectedAnimation = static_cast<int>(i);
+                                _animatorPlaying = false;
+                                _animatorFrame = 0;
+                                _animatorTime = 0.0f;
+                                _animatorDirty = true;
+                            }
+                            if (selected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+
+                if (tree && !tree->Branches.empty())
+                {
+                    int branchCount = static_cast<int>(tree->Branches.size());
+                    if (_animatorSelectedBranch < 0)
+                        _animatorSelectedBranch = 0;
+                    if (_animatorSelectedBranch >= branchCount)
+                        _animatorSelectedBranch = branchCount - 1;
+                    auto const& branch = tree->Branches[static_cast<std::size_t>(_animatorSelectedBranch)];
+                    std::string branchLabel = branch && !branch->Name.empty()
+                                                  ? branch->Name
+                                                  : std::string("Branch ") + std::to_string(_animatorSelectedBranch);
+                    if (ImGui::BeginCombo("Branch", branchLabel.c_str()))
+                    {
+                        for (int i = 0; i < branchCount; ++i)
+                        {
+                            auto const& branchEntry = tree->Branches[static_cast<std::size_t>(i)];
+                            std::string name = branchEntry && !branchEntry->Name.empty()
+                                                   ? branchEntry->Name
+                                                   : std::string("Branch ") + std::to_string(i);
+                            bool selected = i == _animatorSelectedBranch;
+                            if (ImGui::Selectable(name.c_str(), selected))
+                                _animatorSelectedBranch = i;
+                            if (selected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+
+                if (animation)
+                {
+                    if (animation->Type < 0x06 || animation->Type > 0x0A)
+                    {
+                        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Unsupported animation type: %d", animation->Type);
+                    }
+                    else
+                    {
+                        if (ImGui::Button(_animatorPlaying ? "Pause" : "Play"))
+                        {
+                            _animatorPlaying = !_animatorPlaying;
+                            _animatorTime = static_cast<float>(_animatorFrame) / _animatorFps;
+                        }
+                        ImGui::SameLine();
+                        ImGui::Text("Frames: %d", animation->NumFrames);
+
+                        if (animation->NumFrames > 0)
+                        {
+                            int frameMin = 0;
+                            int frameMax = std::max(0, animation->NumFrames - 1);
+                            if (ImGui::SliderInt("Frame", &_animatorFrame, frameMin, frameMax))
+                            {
+                                _animatorTime = static_cast<float>(_animatorFrame) / _animatorFps;
+                                _animatorDirty = true;
+                            }
+                            float norm = frameMax > 0 ? static_cast<float>(_animatorFrame) / static_cast<float>(frameMax) : 0.0f;
+                            ImGui::Text("Time: %.3f (normalized %.3f)", _animatorTime, norm);
+                        }
+
+                        if (tree && !animation->SamplesDecoded)
+                        {
+                            if (!animation->DecodeType6Samples(*tree))
+                                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Failed to decode Type-6 data.");
+                            else
+                                _animatorDirty = true;
+                        }
+
+                        if (animation->SamplesDecoded &&
+                            _animatorSelectedBranch >= 0 &&
+                            static_cast<std::size_t>(_animatorSelectedBranch) < animation->Quantization.Translation.size())
+                        {
+                            auto showRange = [](char const* label, SeEditor::Forest::SuAnimationQuantRange const& range) {
+                                if (range.Valid)
+                                    ImGui::Text("%s min=%.6f delta=%.6f", label, range.Minimum, range.Delta);
+                                else
+                                    ImGui::TextDisabled("%s default", label);
+                            };
+
+                            auto const& qt = animation->Quantization.Translation[static_cast<std::size_t>(_animatorSelectedBranch)];
+                            auto const& qr = animation->Quantization.Rotation[static_cast<std::size_t>(_animatorSelectedBranch)];
+                            auto const& qs = animation->Quantization.Scale[static_cast<std::size_t>(_animatorSelectedBranch)];
+                            auto const& qv = animation->Quantization.Visibility[static_cast<std::size_t>(_animatorSelectedBranch)];
+
+                            ImGui::SeparatorText("Quantization");
+                            showRange("T.X", qt[0]);
+                            showRange("T.Y", qt[1]);
+                            showRange("T.Z", qt[2]);
+                            showRange("R.X", qr[0]);
+                            showRange("R.Y", qr[1]);
+                            showRange("R.Z", qr[2]);
+                            showRange("R.W", qr[3]);
+                            showRange("S.X", qs[0]);
+                            showRange("S.Y", qs[1]);
+                            showRange("S.Z", qs[2]);
+                            showRange("Vis", qv);
+                        }
+                    }
+                }
+            }
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
 
@@ -3093,6 +3336,7 @@ void CharmyBee::LoadForestResources()
     };
 
     std::vector<Renderer::SlRenderer::ForestCpuMesh> meshes;
+    std::vector<ForestMeshSource> meshSources;
     std::vector<ForestBoxLayer> layers;
     layers.reserve(library->Forests.size());
     std::size_t debugDroppedLogged = 0;
@@ -3107,6 +3351,7 @@ void CharmyBee::LoadForestResources()
         layer.Name = forestEntry.Name.empty()
                          ? std::string("Forest ") + std::to_string(forestIdx)
                          : forestEntry.Name;
+        layer.ForestIndex = static_cast<int>(forestIdx);
         BoxState forestState;
         auto const& trees = forestEntry.Forest->Trees;
         struct TreeInfo
@@ -3183,29 +3428,35 @@ void CharmyBee::LoadForestResources()
                     normalMatrix(1, 3) = 0.0f;
                     normalMatrix(2, 3) = 0.0f;
 
-                    for (auto& v : verts)
+                    Renderer::SlRenderer::ForestCpuMesh cpu;
+                    cpu.Vertices.reserve(verts.size() * 8);
+                    ForestMeshSource source;
+                    source.Vertices.reserve(verts.size() * 8);
+                    for (auto const& v : verts)
                     {
+                        source.Vertices.push_back(v.Pos.X);
+                        source.Vertices.push_back(v.Pos.Y);
+                        source.Vertices.push_back(v.Pos.Z);
+                        source.Vertices.push_back(v.Normal.X);
+                        source.Vertices.push_back(v.Normal.Y);
+                        source.Vertices.push_back(v.Normal.Z);
+                        source.Vertices.push_back(v.Uv.X);
+                        source.Vertices.push_back(v.Uv.Y);
+
                         SlLib::Math::Vector4 pos4{v.Pos.X, v.Pos.Y, v.Pos.Z, 1.0f};
                         auto transformed = SlLib::Math::Transform(worldMatrix, pos4);
-                        v.Pos = {transformed.X, transformed.Y, transformed.Z};
-                        treeInfo.Bounds.Include(v.Pos);
-                        forestState.Include(v.Pos);
+                        treeInfo.Bounds.Include({transformed.X, transformed.Y, transformed.Z});
+                        forestState.Include({transformed.X, transformed.Y, transformed.Z});
 
                         SlLib::Math::Vector4 n4{v.Normal.X, v.Normal.Y, v.Normal.Z, 0.0f};
                         auto nT = SlLib::Math::Transform(normalMatrix, n4);
-                        v.Normal = SlLib::Math::normalize({nT.X, nT.Y, nT.Z});
-                    }
-
-                    Renderer::SlRenderer::ForestCpuMesh cpu;
-                    cpu.Vertices.reserve(verts.size() * 8);
-                    for (auto const& v : verts)
-                    {
-                        cpu.Vertices.push_back(v.Pos.X);
-                        cpu.Vertices.push_back(v.Pos.Y);
-                        cpu.Vertices.push_back(v.Pos.Z);
-                        cpu.Vertices.push_back(v.Normal.X);
-                        cpu.Vertices.push_back(v.Normal.Y);
-                        cpu.Vertices.push_back(v.Normal.Z);
+                        auto n = SlLib::Math::normalize({nT.X, nT.Y, nT.Z});
+                        cpu.Vertices.push_back(transformed.X);
+                        cpu.Vertices.push_back(transformed.Y);
+                        cpu.Vertices.push_back(transformed.Z);
+                        cpu.Vertices.push_back(n.X);
+                        cpu.Vertices.push_back(n.Y);
+                        cpu.Vertices.push_back(n.Z);
                         cpu.Vertices.push_back(v.Uv.X);
                         cpu.Vertices.push_back(v.Uv.Y);
                     }
@@ -3500,7 +3751,18 @@ void CharmyBee::LoadForestResources()
 
                     if (primitive->Material && !primitive->Material->Textures.empty())
                         cpu.Texture = primitive->Material->Textures[0]->TextureResource;
+                    cpu.ForestIndex = static_cast<int>(forestIdx);
+                    cpu.TreeIndex = static_cast<int>(treeIdx);
+                    cpu.BranchIndex = branchIndex;
                     meshes.push_back(std::move(cpu));
+
+                    if (primitive->Material && !primitive->Material->Textures.empty())
+                        source.Texture = primitive->Material->Textures[0]->TextureResource;
+                    source.ForestIndex = static_cast<int>(forestIdx);
+                    source.TreeIndex = static_cast<int>(treeIdx);
+                    source.BranchIndex = branchIndex;
+                    source.Indices = meshes.back().Indices;
+                    meshSources.push_back(std::move(source));
                 }
             };
 
@@ -3542,6 +3804,8 @@ void CharmyBee::LoadForestResources()
             child.Max = treeInfo.Bounds.Max;
             child.MeshStartIndex = treeInfo.MeshStart;
             child.MeshCount = treeInfo.MeshCount;
+            child.ForestIndex = static_cast<int>(forestIdx);
+            child.TreeIndex = static_cast<int>(treeIdx);
             layer.Children.push_back(std::move(child));
         }
 
@@ -3559,6 +3823,7 @@ void CharmyBee::LoadForestResources()
     if (!meshes.empty())
     {
         _allForestMeshes = std::move(meshes);
+        _forestMeshSources = std::move(meshSources);
         _drawForestMeshes = true;
         _forestLibrary = std::move(library);
         std::cout << "[CharmyBee] Forest meshes loaded: " << _forestLibrary->Forests.size() << " forests." << std::endl;
@@ -3566,12 +3831,15 @@ void CharmyBee::LoadForestResources()
     else
     {
         _allForestMeshes.clear();
+        _forestMeshSources.clear();
     }
 
     _forestBoxLayers = std::move(layers);
     LoadForestVisibility();
+    UpdateForestHierarchy();
     UpdateForestBoxRenderer();
     UpdateForestMeshRendering();
+    _animatorDirty = true;
 }
 
 void CharmyBee::LoadNavigationResources()
@@ -4687,6 +4955,22 @@ void CharmyBee::UpdateForestMeshRendering()
         for (auto const& layer : _forestBoxLayers)
             gatherMeshes(gatherMeshes, layer);
 
+        filtered.erase(std::remove_if(filtered.begin(), filtered.end(),
+                                      [this](Renderer::SlRenderer::ForestCpuMesh const& mesh) {
+                                          if (!IsBranchVisible(mesh.ForestIndex, mesh.TreeIndex, mesh.BranchIndex))
+                                              return true;
+                                          if (_animatorVisibilityForest >= 0 &&
+                                              _animatorVisibilityTree >= 0 &&
+                                              mesh.ForestIndex == _animatorVisibilityForest &&
+                                              mesh.TreeIndex == _animatorVisibilityTree &&
+                                              mesh.BranchIndex >= 0 &&
+                                              static_cast<std::size_t>(mesh.BranchIndex) < _animatorBranchVisibility.size() &&
+                                              !_animatorBranchVisibility[static_cast<std::size_t>(mesh.BranchIndex)])
+                                              return true;
+                                          return false;
+                                      }),
+                       filtered.end());
+
         if (!filtered.empty())
         {
             combined.reserve(filtered.size() + _logicLocatorMeshes.size());
@@ -4704,6 +4988,645 @@ void CharmyBee::UpdateForestMeshRendering()
     bool hasVisible = !combined.empty();
     _renderer.SetForestMeshes(std::move(combined));
     _renderer.SetDrawForestMeshes(hasVisible);
+}
+
+void CharmyBee::UpdateForestHierarchy()
+{
+    _forestHierarchy.clear();
+    if (!_forestLibrary)
+        return;
+
+    for (std::size_t forestIdx = 0; forestIdx < _forestLibrary->Forests.size(); ++forestIdx)
+    {
+        auto const& forestEntry = _forestLibrary->Forests[forestIdx];
+        ForestHierarchy hierarchy;
+        hierarchy.Name = forestEntry.Name.empty()
+                         ? std::string("Forest ") + std::to_string(forestEntry.Hash)
+                         : forestEntry.Name;
+        hierarchy.Visible = true;
+        if (!forestEntry.Forest)
+        {
+            _forestHierarchy.push_back(std::move(hierarchy));
+            continue;
+        }
+
+        for (std::size_t treeIdx = 0; treeIdx < forestEntry.Forest->Trees.size(); ++treeIdx)
+        {
+            auto const& tree = forestEntry.Forest->Trees[treeIdx];
+            if (!tree)
+                continue;
+
+            TreeHierarchy treeHierarchy;
+            treeHierarchy.Name = tree->Hash != 0
+                                     ? std::string("Tree ") + std::to_string(tree->Hash)
+                                     : std::string("Tree ") + std::to_string(treeIdx);
+            treeHierarchy.Visible = true;
+            treeHierarchy.ForestIndex = static_cast<int>(forestIdx);
+            treeHierarchy.TreeIndex = static_cast<int>(treeIdx);
+            std::size_t branchCount = tree->Branches.size();
+            treeHierarchy.Nodes.resize(branchCount);
+            for (std::size_t i = 0; i < branchCount; ++i)
+                treeHierarchy.Nodes[i].Branch = tree->Branches[i];
+
+            for (auto& node : treeHierarchy.Nodes)
+                node.Visible = true;
+
+            for (int i = 0; i < static_cast<int>(branchCount); ++i)
+            {
+                auto const& branch = treeHierarchy.Nodes[static_cast<std::size_t>(i)].Branch;
+                if (!branch)
+                    continue;
+
+                int child = branch->Child;
+                while (child >= 0 && static_cast<std::size_t>(child) < branchCount)
+                {
+                    treeHierarchy.Nodes[static_cast<std::size_t>(i)].Children.push_back(child);
+                    auto const& childBranch = treeHierarchy.Nodes[static_cast<std::size_t>(child)].Branch;
+                    if (!childBranch)
+                        break;
+                    child = childBranch->Sibling;
+                }
+
+                if (branch->Parent < 0)
+                    treeHierarchy.Roots.push_back(i);
+            }
+
+            if (treeHierarchy.Roots.empty())
+            {
+                for (std::size_t i = 0; i < branchCount; ++i)
+                {
+                    if (treeHierarchy.Nodes[i].Branch)
+                    {
+                        treeHierarchy.Roots.push_back(static_cast<int>(i));
+                        break;
+                    }
+                }
+            }
+
+            hierarchy.Trees.push_back(std::move(treeHierarchy));
+        }
+
+        _forestHierarchy.push_back(std::move(hierarchy));
+    }
+}
+
+bool CharmyBee::IsTreeVisible(std::size_t forestIdx, std::size_t treeIdx) const
+{
+    if (forestIdx >= _forestHierarchy.size())
+        return true;
+    auto const& forest = _forestHierarchy[forestIdx];
+    if (treeIdx >= forest.Trees.size())
+        return true;
+    return forest.Visible && forest.Trees[treeIdx].Visible;
+}
+
+bool CharmyBee::IsBranchVisible(int forestIdx, int treeIdx, int branchIdx) const
+{
+    if (branchIdx < 0 || forestIdx < 0 || treeIdx < 0)
+        return true;
+    if (static_cast<std::size_t>(forestIdx) >= _forestHierarchy.size())
+        return true;
+    auto const& forest = _forestHierarchy[static_cast<std::size_t>(forestIdx)];
+    if (!forest.Visible)
+        return false;
+    if (static_cast<std::size_t>(treeIdx) >= forest.Trees.size())
+        return true;
+    auto const& tree = forest.Trees[static_cast<std::size_t>(treeIdx)];
+    if (!tree.Visible)
+        return false;
+
+    int current = branchIdx;
+    while (current >= 0 && static_cast<std::size_t>(current) < tree.Nodes.size())
+    {
+        auto const& node = tree.Nodes[static_cast<std::size_t>(current)];
+        if (!node.Visible)
+            return false;
+        if (!node.Branch)
+            break;
+        current = node.Branch->Parent;
+    }
+    return true;
+}
+
+void CharmyBee::ApplyTreeVisibilityToLayers()
+{
+    if (_forestBoxLayers.empty())
+        return;
+
+    for (auto& layer : _forestBoxLayers)
+    {
+        if (layer.ForestIndex >= 0 && static_cast<std::size_t>(layer.ForestIndex) < _forestHierarchy.size())
+            layer.Visible = _forestHierarchy[layer.ForestIndex].Visible;
+
+        for (auto& child : layer.Children)
+        {
+            if (child.ForestIndex >= 0 && child.TreeIndex >= 0)
+            {
+                child.Visible = IsTreeVisible(static_cast<std::size_t>(child.ForestIndex),
+                                               static_cast<std::size_t>(child.TreeIndex));
+            }
+        }
+    }
+}
+
+bool CharmyBee::RenderBranchNode(CharmyBee::TreeHierarchy& tree, int index)
+{
+    if (index < 0 || static_cast<std::size_t>(index) >= tree.Nodes.size())
+        return false;
+
+    auto& node = tree.Nodes[static_cast<std::size_t>(index)];
+    std::string label = node.Branch && !node.Branch->Name.empty()
+                            ? node.Branch->Name
+                            : std::string("Branch ") + std::to_string(index);
+    std::string unique = label + "##branch_" + std::to_string(index);
+    std::string checkboxId = unique + "_chk";
+
+    bool changed = ImGui::Checkbox(checkboxId.c_str(), &node.Visible);
+    ImGui::SameLine();
+    if (node.Children.empty())
+    {
+        ImGui::Text("%s", label.c_str());
+    }
+    else if (ImGui::TreeNode(unique.c_str(), "%s", label.c_str()))
+    {
+        for (int child : node.Children)
+            changed |= RenderBranchNode(tree, child);
+        ImGui::TreePop();
+    }
+    return changed;
+}
+
+void CharmyBee::RenderForestHierarchyWindow()
+{
+    if (!_showForestHierarchyWindow)
+        return;
+
+    if (!ImGui::Begin("Forest hierarchy", &_showForestHierarchyWindow))
+    {
+        ImGui::End();
+        return;
+    }
+
+    if (_forestHierarchy.empty())
+    {
+        ImGui::TextDisabled("No forest hierarchy available.");
+        ImGui::End();
+        return;
+    }
+
+    ImGui::BeginChild("ForestHierarchyContent", ImVec2(0.0f, 0.0f), true);
+    RenderForestHierarchyList();
+    ImGui::EndChild();
+
+    ImGui::End();
+}
+
+void CharmyBee::RenderForestHierarchyList()
+{
+    bool hierarchyChanged = false;
+
+    for (auto& forest : _forestHierarchy)
+    {
+        std::string label = forest.Name.empty() ? "Forest" : forest.Name;
+        std::string forestId = label + "##forest_" + std::to_string(reinterpret_cast<std::uintptr_t>(&forest));
+        bool forestChanged = ImGui::Checkbox(forestId.c_str(), &forest.Visible);
+        hierarchyChanged |= forestChanged;
+        if (forestChanged)
+        {
+            for (auto& tree : forest.Trees)
+                tree.Visible = forest.Visible;
+        }
+        ImGui::SameLine();
+        if (!forest.Visible)
+        {
+            ImGui::TextDisabled("%s", label.c_str());
+            continue;
+        }
+        if (ImGui::CollapsingHeader(label.c_str()))
+        {
+            for (std::size_t treeIdx = 0; treeIdx < forest.Trees.size(); ++treeIdx)
+            {
+                auto& tree = forest.Trees[treeIdx];
+                std::string treeLabel = tree.Name.empty()
+                                            ? std::string("Tree ") + std::to_string(treeIdx)
+                                            : tree.Name;
+                std::string treeId = treeLabel + "##tree_" + std::to_string(treeIdx);
+                std::string treeChk = treeId + "_chk";
+                bool treeChanged = ImGui::Checkbox(treeChk.c_str(), &tree.Visible);
+                hierarchyChanged |= treeChanged;
+                ImGui::SameLine();
+                if (!tree.Visible)
+                {
+                    ImGui::TextDisabled("%s", treeLabel.c_str());
+                    continue;
+                }
+                if (ImGui::TreeNodeEx(treeId.c_str(),
+                                      ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_DefaultOpen,
+                                      "%s",
+                                      treeLabel.c_str()))
+                {
+                    if (tree.Roots.empty())
+                    {
+                        ImGui::TextDisabled("No branch data available.");
+                    }
+                    else
+                    {
+                        for (int root : tree.Roots)
+                            hierarchyChanged |= RenderBranchNode(tree, root);
+                    }
+                    ImGui::TreePop();
+                }
+            }
+        }
+    }
+
+    if (hierarchyChanged)
+    {
+        ApplyTreeVisibilityToLayers();
+        UpdateForestBoxRenderer();
+        UpdateForestMeshRendering();
+    }
+}
+
+void CharmyBee::BuildForestMeshesFromPose(std::vector<SlLib::Math::Vector4> const& translations,
+                                          std::vector<SlLib::Math::Vector4> const& rotations,
+                                          std::vector<SlLib::Math::Vector4> const& scales,
+                                          int forestIndex,
+                                          int treeIndex)
+{
+    if (!_forestLibrary)
+        return;
+    if (forestIndex < 0 || treeIndex < 0)
+        return;
+    if (static_cast<std::size_t>(forestIndex) >= _forestLibrary->Forests.size())
+        return;
+
+    auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(forestIndex)];
+    if (!forestEntry.Forest)
+        return;
+    if (static_cast<std::size_t>(treeIndex) >= forestEntry.Forest->Trees.size())
+        return;
+
+    auto const& tree = forestEntry.Forest->Trees[static_cast<std::size_t>(treeIndex)];
+    if (!tree)
+        return;
+
+    std::size_t branchCount = tree->Branches.size();
+    std::vector<SlLib::Math::Matrix4x4> world(branchCount);
+    std::vector<bool> computed(branchCount, false);
+
+    auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
+        auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        s.X = clamp(s.X);
+        s.Y = clamp(s.Y);
+        s.Z = clamp(s.Z);
+        SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
+        SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
+        SlLib::Math::Matrix4x4 scale{};
+        scale(0, 0) = s.X;
+        scale(1, 1) = s.Y;
+        scale(2, 2) = s.Z;
+        scale(3, 3) = 1.0f;
+        SlLib::Math::Matrix4x4 local = SlLib::Math::Multiply(rot, scale);
+        local(0, 3) = t.X;
+        local(1, 3) = t.Y;
+        local(2, 3) = t.Z;
+        local(3, 3) = 1.0f;
+        return local;
+    };
+
+    std::function<SlLib::Math::Matrix4x4(int)> computeWorld = [&](int idx) -> SlLib::Math::Matrix4x4 {
+        if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount)
+            return SlLib::Math::Matrix4x4{};
+        if (computed[static_cast<std::size_t>(idx)])
+            return world[static_cast<std::size_t>(idx)];
+
+        SlLib::Math::Vector4 t{};
+        SlLib::Math::Vector4 r{};
+        SlLib::Math::Vector4 s{1.0f, 1.0f, 1.0f, 1.0f};
+        if (static_cast<std::size_t>(idx) < translations.size())
+            t = translations[static_cast<std::size_t>(idx)];
+        if (static_cast<std::size_t>(idx) < rotations.size())
+            r = rotations[static_cast<std::size_t>(idx)];
+        if (static_cast<std::size_t>(idx) < scales.size())
+            s = scales[static_cast<std::size_t>(idx)];
+
+        auto local = buildLocalMatrix(t, r, s);
+        int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+        if (parentIndex >= 0 && parentIndex < static_cast<int>(branchCount))
+            world[static_cast<std::size_t>(idx)] = SlLib::Math::Multiply(computeWorld(parentIndex), local);
+        else
+            world[static_cast<std::size_t>(idx)] = local;
+
+        computed[static_cast<std::size_t>(idx)] = true;
+        return world[static_cast<std::size_t>(idx)];
+    };
+
+    _allForestMeshes.clear();
+    _allForestMeshes.reserve(_forestMeshSources.size());
+    for (auto const& source : _forestMeshSources)
+    {
+        if (source.ForestIndex != forestIndex || source.TreeIndex != treeIndex)
+            continue;
+        if (source.BranchIndex < 0 || static_cast<std::size_t>(source.BranchIndex) >= branchCount)
+            continue;
+
+        auto worldMatrix = computeWorld(source.BranchIndex);
+        SlLib::Math::Matrix4x4 normalMatrix = worldMatrix;
+        normalMatrix(0, 3) = 0.0f;
+        normalMatrix(1, 3) = 0.0f;
+        normalMatrix(2, 3) = 0.0f;
+
+        Renderer::SlRenderer::ForestCpuMesh cpu;
+        cpu.Vertices.reserve(source.Vertices.size());
+        for (std::size_t i = 0; i + 7 < source.Vertices.size(); i += 8)
+        {
+            SlLib::Math::Vector4 pos4{source.Vertices[i + 0], source.Vertices[i + 1], source.Vertices[i + 2], 1.0f};
+            auto transformed = SlLib::Math::Transform(worldMatrix, pos4);
+            SlLib::Math::Vector4 n4{source.Vertices[i + 3], source.Vertices[i + 4], source.Vertices[i + 5], 0.0f};
+            auto nT = SlLib::Math::Transform(normalMatrix, n4);
+            auto n = SlLib::Math::normalize({nT.X, nT.Y, nT.Z});
+
+            cpu.Vertices.push_back(transformed.X);
+            cpu.Vertices.push_back(transformed.Y);
+            cpu.Vertices.push_back(transformed.Z);
+            cpu.Vertices.push_back(n.X);
+            cpu.Vertices.push_back(n.Y);
+            cpu.Vertices.push_back(n.Z);
+            cpu.Vertices.push_back(source.Vertices[i + 6]);
+            cpu.Vertices.push_back(source.Vertices[i + 7]);
+        }
+        cpu.Indices = source.Indices;
+        cpu.Texture = source.Texture;
+        cpu.ForestIndex = source.ForestIndex;
+        cpu.TreeIndex = source.TreeIndex;
+        cpu.BranchIndex = source.BranchIndex;
+        _allForestMeshes.push_back(std::move(cpu));
+    }
+
+    UpdateForestMeshRendering();
+}
+
+void CharmyBee::ApplyAnimatorFrame()
+{
+    if (!_forestLibrary || _forestMeshSources.empty())
+        return;
+
+    bool useAnimation = false;
+    SeEditor::Forest::SuRenderTree* animTree = nullptr;
+    SeEditor::Forest::SuAnimation* animation = nullptr;
+
+    if (_animatorSelectedAnimation >= 0 &&
+        _animatorSelectedForest >= 0 &&
+        _animatorSelectedTree >= 0 &&
+        static_cast<std::size_t>(_animatorSelectedForest) < _forestLibrary->Forests.size())
+    {
+        auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(_animatorSelectedForest)];
+        if (forestEntry.Forest &&
+            static_cast<std::size_t>(_animatorSelectedTree) < forestEntry.Forest->Trees.size())
+        {
+            animTree = forestEntry.Forest->Trees[static_cast<std::size_t>(_animatorSelectedTree)].get();
+            if (animTree && static_cast<std::size_t>(_animatorSelectedAnimation) < animTree->AnimationEntries.size())
+            {
+                auto const& animEntry = animTree->AnimationEntries[static_cast<std::size_t>(_animatorSelectedAnimation)];
+                animation = animEntry.Animation.get();
+            }
+        }
+    }
+
+    if (animation && animTree && animation->Type >= 0x06 && animation->Type <= 0x0A)
+    {
+        useAnimation = animation->DecodeType6Samples(*animTree);
+        if (useAnimation && animation->NumFrames > 0)
+        {
+            if (_animatorFrame < 0)
+                _animatorFrame = 0;
+            if (_animatorFrame >= animation->NumFrames)
+                _animatorFrame = animation->NumFrames - 1;
+        }
+    }
+
+    std::vector<std::vector<std::vector<SlLib::Math::Matrix4x4>>> worldByForest;
+    worldByForest.resize(_forestLibrary->Forests.size());
+    std::vector<bool> animVisibility;
+    int animForestIndex = _animatorSelectedForest;
+    int animTreeIndex = _animatorSelectedTree;
+    bool hasAnimVisibility = false;
+
+    auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
+        auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        s.X = clamp(s.X);
+        s.Y = clamp(s.Y);
+        s.Z = clamp(s.Z);
+        SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
+        SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
+        SlLib::Math::Matrix4x4 scale{};
+        scale(0, 0) = s.X;
+        scale(1, 1) = s.Y;
+        scale(2, 2) = s.Z;
+        scale(3, 3) = 1.0f;
+        SlLib::Math::Matrix4x4 local = SlLib::Math::Multiply(rot, scale);
+        local(0, 3) = t.X;
+        local(1, 3) = t.Y;
+        local(2, 3) = t.Z;
+        local(3, 3) = 1.0f;
+        return local;
+    };
+
+    for (std::size_t forestIdx = 0; forestIdx < _forestLibrary->Forests.size(); ++forestIdx)
+    {
+        auto const& forestEntry = _forestLibrary->Forests[forestIdx];
+        if (!forestEntry.Forest)
+            continue;
+        auto const& trees = forestEntry.Forest->Trees;
+        worldByForest[forestIdx].resize(trees.size());
+
+        for (std::size_t treeIdx = 0; treeIdx < trees.size(); ++treeIdx)
+        {
+            auto const& tree = trees[treeIdx];
+            if (!tree)
+                continue;
+
+            std::size_t branchCount = tree->Branches.size();
+            std::vector<SlLib::Math::Matrix4x4> world(branchCount);
+            std::vector<bool> computed(branchCount, false);
+
+            std::vector<SlLib::Math::Vector4> t = tree->Translations;
+            std::vector<SlLib::Math::Vector4> r = tree->Rotations;
+            std::vector<SlLib::Math::Vector4> s = tree->Scales;
+
+            if (useAnimation &&
+                animTree == tree.get() &&
+                forestIdx == static_cast<std::size_t>(_animatorSelectedForest) &&
+                treeIdx == static_cast<std::size_t>(_animatorSelectedTree))
+            {
+                t.resize(branchCount);
+                r.resize(branchCount);
+                s.resize(branchCount);
+                animVisibility.assign(branchCount, true);
+                hasAnimVisibility = true;
+                for (std::size_t bone = 0; bone < branchCount; ++bone)
+                {
+                    auto sample = animation->GetSample(_animatorFrame, static_cast<int>(bone));
+                    if (!sample)
+                        continue;
+                    t[bone] = sample->Translation;
+                    r[bone] = sample->Rotation;
+                    s[bone] = sample->Scale;
+                    animVisibility[bone] = sample->Visible;
+                }
+            }
+
+            std::function<SlLib::Math::Matrix4x4(int)> computeWorld = [&](int idx) -> SlLib::Math::Matrix4x4 {
+                if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount)
+                    return SlLib::Math::Matrix4x4{};
+                if (computed[static_cast<std::size_t>(idx)])
+                    return world[static_cast<std::size_t>(idx)];
+
+                SlLib::Math::Vector4 lt{};
+                SlLib::Math::Vector4 lr{};
+                SlLib::Math::Vector4 ls{1.0f, 1.0f, 1.0f, 1.0f};
+                if (static_cast<std::size_t>(idx) < t.size())
+                    lt = t[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < r.size())
+                    lr = r[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < s.size())
+                    ls = s[static_cast<std::size_t>(idx)];
+
+                auto local = buildLocalMatrix(lt, lr, ls);
+                int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+                if (parentIndex >= 0 && parentIndex < static_cast<int>(branchCount))
+                    world[static_cast<std::size_t>(idx)] = SlLib::Math::Multiply(computeWorld(parentIndex), local);
+                else
+                    world[static_cast<std::size_t>(idx)] = local;
+
+                computed[static_cast<std::size_t>(idx)] = true;
+                return world[static_cast<std::size_t>(idx)];
+            };
+
+            for (int i = 0; i < static_cast<int>(branchCount); ++i)
+                computeWorld(i);
+
+            worldByForest[forestIdx][treeIdx] = std::move(world);
+        }
+    }
+
+    std::vector<Renderer::SlRenderer::ForestCpuMesh> meshes;
+    meshes.reserve(_forestMeshSources.size());
+    if (hasAnimVisibility)
+    {
+        _animatorBranchVisibility = std::move(animVisibility);
+        _animatorVisibilityForest = animForestIndex;
+        _animatorVisibilityTree = animTreeIndex;
+    }
+    else
+    {
+        _animatorBranchVisibility.clear();
+        _animatorVisibilityForest = -1;
+        _animatorVisibilityTree = -1;
+    }
+
+    for (auto const& source : _forestMeshSources)
+    {
+        if (source.ForestIndex < 0 || source.TreeIndex < 0 || source.BranchIndex < 0)
+            continue;
+        if (static_cast<std::size_t>(source.ForestIndex) >= worldByForest.size())
+            continue;
+        auto const& treeWorlds = worldByForest[static_cast<std::size_t>(source.ForestIndex)];
+        if (static_cast<std::size_t>(source.TreeIndex) >= treeWorlds.size())
+            continue;
+        auto const& world = treeWorlds[static_cast<std::size_t>(source.TreeIndex)];
+        if (static_cast<std::size_t>(source.BranchIndex) >= world.size())
+            continue;
+
+        SlLib::Math::Matrix4x4 worldMatrix = world[static_cast<std::size_t>(source.BranchIndex)];
+        SlLib::Math::Matrix4x4 normalMatrix = worldMatrix;
+        normalMatrix(0, 3) = 0.0f;
+        normalMatrix(1, 3) = 0.0f;
+        normalMatrix(2, 3) = 0.0f;
+
+        Renderer::SlRenderer::ForestCpuMesh cpu;
+        cpu.Vertices.reserve(source.Vertices.size());
+        for (std::size_t i = 0; i + 7 < source.Vertices.size(); i += 8)
+        {
+            SlLib::Math::Vector4 pos4{source.Vertices[i + 0], source.Vertices[i + 1], source.Vertices[i + 2], 1.0f};
+            auto transformed = SlLib::Math::Transform(worldMatrix, pos4);
+            SlLib::Math::Vector4 n4{source.Vertices[i + 3], source.Vertices[i + 4], source.Vertices[i + 5], 0.0f};
+            auto nT = SlLib::Math::Transform(normalMatrix, n4);
+            auto n = SlLib::Math::normalize({nT.X, nT.Y, nT.Z});
+
+            cpu.Vertices.push_back(transformed.X);
+            cpu.Vertices.push_back(transformed.Y);
+            cpu.Vertices.push_back(transformed.Z);
+            cpu.Vertices.push_back(n.X);
+            cpu.Vertices.push_back(n.Y);
+            cpu.Vertices.push_back(n.Z);
+            cpu.Vertices.push_back(source.Vertices[i + 6]);
+            cpu.Vertices.push_back(source.Vertices[i + 7]);
+        }
+        cpu.Indices = source.Indices;
+        cpu.Texture = source.Texture;
+        cpu.ForestIndex = source.ForestIndex;
+        cpu.TreeIndex = source.TreeIndex;
+        cpu.BranchIndex = source.BranchIndex;
+        meshes.push_back(std::move(cpu));
+    }
+
+    _allForestMeshes = std::move(meshes);
+    UpdateForestMeshRendering();
+    _animatorLastAppliedFrame = _animatorFrame;
+}
+
+void CharmyBee::UpdateAnimator(float deltaSeconds)
+{
+    if (!_forestLibrary || _forestMeshSources.empty())
+        return;
+
+    SeEditor::Forest::SuAnimation* animation = nullptr;
+    SeEditor::Forest::SuRenderTree* tree = nullptr;
+
+    if (_animatorSelectedAnimation >= 0 &&
+        _animatorSelectedForest >= 0 &&
+        _animatorSelectedTree >= 0 &&
+        static_cast<std::size_t>(_animatorSelectedForest) < _forestLibrary->Forests.size())
+    {
+        auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(_animatorSelectedForest)];
+        if (forestEntry.Forest &&
+            static_cast<std::size_t>(_animatorSelectedTree) < forestEntry.Forest->Trees.size())
+        {
+            tree = forestEntry.Forest->Trees[static_cast<std::size_t>(_animatorSelectedTree)].get();
+            if (tree && static_cast<std::size_t>(_animatorSelectedAnimation) < tree->AnimationEntries.size())
+                animation = tree->AnimationEntries[static_cast<std::size_t>(_animatorSelectedAnimation)].Animation.get();
+        }
+    }
+
+    if (_animatorPlaying && animation && animation->NumFrames > 0)
+    {
+        _animatorTime += deltaSeconds;
+        int maxFrames = animation->NumFrames;
+        if (maxFrames > 0)
+        {
+            int newFrame = static_cast<int>(_animatorTime * _animatorFps);
+            if (newFrame >= maxFrames)
+                newFrame %= maxFrames;
+            if (newFrame < 0)
+                newFrame = 0;
+            if (newFrame != _animatorFrame)
+            {
+                _animatorFrame = newFrame;
+                _animatorDirty = true;
+            }
+        }
+    }
+
+    if (!animation && _animatorLastAppliedFrame >= 0)
+        _animatorDirty = true;
+
+    if (_animatorDirty)
+    {
+        ApplyAnimatorFrame();
+        _animatorDirty = false;
+    }
 }
 
 bool CharmyBee::RenderForestBoxLayer(ForestBoxLayer& layer)
@@ -5409,9 +6332,11 @@ void CharmyBee::Run()
         RenderMainDockWindow();
         RenderRacingLineEditor();
         RenderStuffWindow();
+        RenderForestHierarchyWindow();
 
         RenderSifViewer();
 
+        UpdateAnimator(delta.count());
         _renderer.Render();
         _controller->Render();
         _controller->SwapBuffers();

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <span>
 
 namespace SeEditor::Forest {
 
@@ -106,6 +107,94 @@ std::uint16_t FloatToHalf(float value)
     std::uint16_t outExp = static_cast<std::uint16_t>(newExp << 10);
     std::uint16_t outMant = static_cast<std::uint16_t>(mant >> 13);
     return static_cast<std::uint16_t>(outSign | outExp | outMant);
+}
+
+struct Type6Reader
+{
+    std::span<const std::uint8_t> Data;
+    bool BigEndian = false;
+    std::size_t Offset = 0;
+
+    bool Has(std::size_t count) const { return Offset + count <= Data.size(); }
+
+    std::uint8_t ReadU8()
+    {
+        if (!Has(1))
+            return 0;
+        return Data[Offset++];
+    }
+
+    std::uint16_t ReadU16()
+    {
+        if (!Has(2))
+            return 0;
+        std::uint16_t a = Data[Offset];
+        std::uint16_t b = Data[Offset + 1];
+        Offset += 2;
+        if (BigEndian)
+            return static_cast<std::uint16_t>((a << 8) | b);
+        return static_cast<std::uint16_t>(a | (b << 8));
+    }
+
+    std::uint32_t ReadU32()
+    {
+        if (!Has(4))
+            return 0;
+        std::uint32_t b0 = Data[Offset + 0];
+        std::uint32_t b1 = Data[Offset + 1];
+        std::uint32_t b2 = Data[Offset + 2];
+        std::uint32_t b3 = Data[Offset + 3];
+        Offset += 4;
+        if (BigEndian)
+            return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    float ReadFloat()
+    {
+        std::uint32_t bits = ReadU32();
+        float v = 0.0f;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+};
+
+struct Type6StreamHeader
+{
+    std::uint32_t NumFrames = 0;
+    std::uint32_t NumKeys = 0;
+};
+
+Type6StreamHeader ReadType6Header(Type6Reader& reader, bool smallHeader)
+{
+    Type6StreamHeader header{};
+    if (smallHeader)
+    {
+        header.NumFrames = reader.ReadU8();
+        header.NumKeys = reader.ReadU8();
+    }
+    else
+    {
+        header.NumFrames = reader.ReadU16();
+        header.NumKeys = reader.ReadU16();
+    }
+    return header;
+}
+
+std::uint32_t ReadBitsLSB(std::span<const std::uint8_t> data, std::size_t bitOffset, std::size_t bitCount)
+{
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < bitCount; ++i)
+    {
+        std::size_t bitIndex = bitOffset + i;
+        std::size_t byteIndex = bitIndex / 8;
+        std::size_t bitInByte = bitIndex % 8;
+        if (byteIndex >= data.size())
+            break;
+        if (data[byteIndex] & (1u << bitInByte))
+            value |= (1u << i);
+    }
+    return value;
 }
 } // namespace
 
@@ -1106,6 +1195,14 @@ int StreamOverride::GetSizeForSerialization() const
     return 0x8;
 }
 
+void SuAnimationQuantization::Resize(std::size_t bones)
+{
+    Translation.assign(bones, {});
+    Rotation.assign(bones, {});
+    Scale.assign(bones, {});
+    Visibility.assign(bones, {});
+}
+
 void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
 {
     int start = static_cast<int>(context.Position);
@@ -1131,19 +1228,22 @@ void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
     if (Type == 0)
         return;
 
-    if (Type == 6)
+    if (Type >= 6 && Type <= 10)
     {
         int bits = NumFloatStreams + 0x1F + (NumUvBones + NumBones) * 4;
         int numDoubleWords = ClampCount((bits + ((bits >> 0x1F) & 0x1F)) >> 5, "Animation6.Masks");
         if (numDoubleWords == 0)
             return;
         int wordDataOffset = 0x18 + (numDoubleWords * 4);
-        int paramData = context.ReadInt32();
+        int paramData = context.ReadPointer();
         if (!sane(paramData, static_cast<int>(context.Data().size())))
         {
             std::cerr << "[Forest] Animation type 6 invalid data pointer: " << paramData << std::endl;
             return;
         }
+        Type6BigEndian = context.Platform ? context.Platform->IsBigEndian() : false;
+        Type6Block.clear();
+        SamplesDecoded = false;
 
         ChannelMasks.clear();
         ChannelMasks.reserve(static_cast<std::size_t>(numDoubleWords));
@@ -1263,6 +1363,61 @@ void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
         FrameData.reserve(static_cast<std::size_t>(numPackedShorts));
         for (int i = 0; i < numPackedShorts; ++i)
             FrameData.push_back(context.ReadInt16(static_cast<std::size_t>(paramData + (i * 2))));
+
+        auto dataSpan = context.Data();
+        std::size_t blockStart = static_cast<std::size_t>(paramData);
+        if (blockStart < dataSpan.size())
+        {
+            bool smallHeader = Type == 0x0A;
+            int frameIndexSize = (Type == 0x07 || Type == 0x0A) ? 1 : 2;
+            int factorSize = 0;
+            if (Type == 0x08)
+                factorSize = 4;
+            else if (Type == 0x09 || Type == 0x0A)
+                factorSize = 1;
+            else
+                factorSize = 2;
+
+            Type6Reader reader{dataSpan, Type6BigEndian, blockStart};
+            std::vector<std::uint32_t> masks;
+            masks.reserve(static_cast<std::size_t>(NumBones));
+            for (int i = 0; i < NumBones; ++i)
+                masks.push_back(reader.ReadU32());
+
+            for (int bone = 0; bone < NumBones; ++bone)
+            {
+                std::uint32_t mask = masks[static_cast<std::size_t>(bone)];
+                auto advanceStream = [&](int streamCount) {
+                    for (int s = 0; s < streamCount; ++s)
+                    {
+                        Type6StreamHeader header = ReadType6Header(reader, smallHeader);
+                        std::size_t frames = header.NumFrames;
+                        std::size_t keys = header.NumKeys;
+                        reader.Offset += frames * static_cast<std::size_t>(frameIndexSize);
+                        reader.Offset += frames * static_cast<std::size_t>(factorSize);
+                        reader.Offset += 8;
+                        std::size_t packedBytes = (keys * 16 + 7) / 8;
+                        reader.Offset += packedBytes;
+                    }
+                };
+
+                if (mask & 0x1u)
+                    advanceStream(3);
+                if (mask & 0x2u)
+                    advanceStream(4);
+                if (mask & 0x4u)
+                    advanceStream(3);
+                if (mask & 0x8u)
+                    advanceStream(1);
+            }
+
+            if (reader.Offset > blockStart && reader.Offset <= dataSpan.size())
+            {
+                std::size_t blockSize = reader.Offset - blockStart;
+                Type6Block.assign(dataSpan.begin() + static_cast<std::ptrdiff_t>(blockStart),
+                                  dataSpan.begin() + static_cast<std::ptrdiff_t>(blockStart + blockSize));
+            }
+        }
     }
     else if (Type == 1)
     {
@@ -1547,10 +1702,287 @@ int SuAnimation::GetSizeForSerialization() const
     if (Type == 1)
         size += 0x4 + static_cast<int>(AnimStreams.size()) * 2 +
             static_cast<int>(ChannelMasks.size()) * 4 + (NumBones * 8);
-    else if (Type == 4 || Type == 6)
+    else if (Type == 4 || (Type >= 6 && Type <= 10))
         size += 0x4 + static_cast<int>(AnimStreams.size()) * 2 +
             static_cast<int>(ChannelMasks.size()) * 4;
     return size;
+}
+
+SuAnimationSample const* SuAnimation::GetSample(int frame, int bone) const
+{
+    if (frame < 0 || bone < 0)
+        return nullptr;
+    if (NumFrames <= 0 || NumBones <= 0)
+        return nullptr;
+    if (static_cast<std::size_t>(frame) >= static_cast<std::size_t>(NumFrames))
+        return nullptr;
+    if (static_cast<std::size_t>(bone) >= static_cast<std::size_t>(NumBones))
+        return nullptr;
+    if (Samples.size() != static_cast<std::size_t>(NumFrames) * static_cast<std::size_t>(NumBones))
+        return nullptr;
+    return &Samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                    static_cast<std::size_t>(bone)];
+}
+
+bool SuAnimation::DecodeType6Samples(SuRenderTree const& tree)
+{
+    if (Type < 0x06 || Type > 0x0A)
+        return false;
+    if (NumFrames <= 0 || NumBones <= 0)
+        return false;
+    if (Type6Block.empty())
+        return false;
+    if (SamplesDecoded)
+        return true;
+
+    Samples.clear();
+    Samples.resize(static_cast<std::size_t>(NumFrames) * static_cast<std::size_t>(NumBones));
+    Quantization.Resize(static_cast<std::size_t>(NumBones));
+
+    for (int bone = 0; bone < NumBones; ++bone)
+    {
+        SlLib::Math::Vector4 t{};
+        SlLib::Math::Vector4 r{};
+        SlLib::Math::Vector4 s{1.0f, 1.0f, 1.0f, 1.0f};
+        if (static_cast<std::size_t>(bone) < tree.Translations.size())
+            t = tree.Translations[static_cast<std::size_t>(bone)];
+        if (static_cast<std::size_t>(bone) < tree.Rotations.size())
+            r = tree.Rotations[static_cast<std::size_t>(bone)];
+        if (static_cast<std::size_t>(bone) < tree.Scales.size())
+            s = tree.Scales[static_cast<std::size_t>(bone)];
+
+        for (int frame = 0; frame < NumFrames; ++frame)
+        {
+            auto& sample = Samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                   static_cast<std::size_t>(bone)];
+            sample.Translation = t;
+            sample.Rotation = r;
+            sample.Scale = s;
+            sample.Visible = true;
+        }
+    }
+
+    bool smallHeader = Type == 0x0A;
+    int frameIndexSize = (Type == 0x07 || Type == 0x0A) ? 1 : 2;
+    int factorSize = 0;
+    if (Type == 0x08)
+        factorSize = 4;
+    else if (Type == 0x09 || Type == 0x0A)
+        factorSize = 1;
+    else
+        factorSize = 2;
+
+    Type6Reader reader{std::span<const std::uint8_t>(Type6Block.data(), Type6Block.size()), Type6BigEndian, 0};
+    std::vector<std::uint32_t> masks;
+    masks.reserve(static_cast<std::size_t>(NumBones));
+    for (int i = 0; i < NumBones; ++i)
+        masks.push_back(reader.ReadU32());
+
+    std::vector<bool> hasRotation(static_cast<std::size_t>(NumBones), false);
+
+    auto readFrameIndices = [&](std::size_t count) {
+        std::vector<int> values;
+        values.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            int v = 0;
+            if (frameIndexSize == 1)
+                v = reader.ReadU8();
+            else
+                v = static_cast<int>(reader.ReadU16());
+            values.push_back(v);
+        }
+        return values;
+    };
+
+    auto readFrameFactors = [&](std::size_t count) {
+        std::vector<float> values;
+        values.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (factorSize == 4)
+            {
+                values.push_back(reader.ReadFloat());
+            }
+            else if (factorSize == 2)
+            {
+                float v = static_cast<float>(reader.ReadU16()) / 65535.0f;
+                values.push_back(v);
+            }
+            else
+            {
+                float v = static_cast<float>(reader.ReadU8()) / 255.0f;
+                values.push_back(v);
+            }
+        }
+        return values;
+    };
+
+    auto decodeStream = [&](int boneIndex,
+                            int channel,
+                            int component) {
+        Type6StreamHeader header = ReadType6Header(reader, smallHeader);
+        std::size_t frameCount = header.NumFrames;
+        std::size_t keyCount = header.NumKeys;
+
+        auto frameKeys = readFrameIndices(frameCount);
+        auto frameFactors = readFrameFactors(frameCount);
+
+        float minimum = reader.ReadFloat();
+        float delta = reader.ReadFloat();
+
+        std::size_t packedBytes = (keyCount * 16 + 7) / 8;
+        std::span<const std::uint8_t> packed{};
+        if (reader.Offset + packedBytes <= reader.Data.size())
+            packed = reader.Data.subspan(reader.Offset, packedBytes);
+        reader.Offset += packedBytes;
+
+        std::vector<float> keys;
+        keys.resize(keyCount);
+        for (std::size_t i = 0; i < keyCount; ++i)
+        {
+            std::uint32_t q = ReadBitsLSB(packed, i * 16, 16);
+            keys[i] = minimum + delta * static_cast<float>(q);
+        }
+
+        auto sampleKey = [&](int index) -> float {
+            if (keys.empty())
+                return 0.0f;
+            if (index < 0)
+                index = 0;
+            if (index >= static_cast<int>(keys.size()))
+                index = static_cast<int>(keys.size()) - 1;
+            return keys[static_cast<std::size_t>(index)];
+        };
+
+        for (int frame = 0; frame < NumFrames; ++frame)
+        {
+            int localFrame = frame;
+            if (localFrame < 0)
+                localFrame = 0;
+            if (frameCount == 0)
+                localFrame = 0;
+            else if (static_cast<std::size_t>(localFrame) >= frameCount)
+                localFrame = static_cast<int>(frameCount - 1);
+
+            int k = 0;
+            float t = 0.0f;
+            if (!frameKeys.empty())
+                k = frameKeys[static_cast<std::size_t>(localFrame)];
+            if (!frameFactors.empty())
+                t = frameFactors[static_cast<std::size_t>(localFrame)];
+
+            float value = 0.0f;
+            if (keyCount == 0)
+            {
+                value = 0.0f;
+            }
+            else if (keyCount < 2)
+            {
+                value = keys[0];
+            }
+            else
+            {
+                float p0 = sampleKey(k - 1);
+                float p1 = sampleKey(k);
+                float p2 = sampleKey(k + 1);
+                float p3 = sampleKey(k + 2);
+                float ts = t * t;
+                float tc = ts * t;
+                float a0 = p1;
+                float a1 = 0.5f * (p2 - p0);
+                float a2 = p0 - 2.5f * p1 + 2.0f * p2 - 0.5f * p3;
+                float a3 = -0.5f * p0 + 1.5f * p1 - 1.5f * p2 + 0.5f * p3;
+                value = a0 + a1 * t + a2 * ts + a3 * tc;
+            }
+
+            auto& sample = Samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                   static_cast<std::size_t>(boneIndex)];
+
+            if (channel == 0)
+            {
+                if (component == 0) sample.Translation.X = value;
+                if (component == 1) sample.Translation.Y = value;
+                if (component == 2) sample.Translation.Z = value;
+            }
+            else if (channel == 1)
+            {
+                if (component == 0) sample.Rotation.X = value;
+                if (component == 1) sample.Rotation.Y = value;
+                if (component == 2) sample.Rotation.Z = value;
+                if (component == 3) sample.Rotation.W = value;
+            }
+            else if (channel == 2)
+            {
+                if (component == 0) sample.Scale.X = value;
+                if (component == 1) sample.Scale.Y = value;
+                if (component == 2) sample.Scale.Z = value;
+            }
+            else if (channel == 3)
+            {
+                sample.Visible = value >= 0.5f;
+            }
+        }
+
+        auto& range = (channel == 0) ? Quantization.Translation[static_cast<std::size_t>(boneIndex)][component]
+                     : (channel == 1) ? Quantization.Rotation[static_cast<std::size_t>(boneIndex)][component]
+                     : (channel == 2) ? Quantization.Scale[static_cast<std::size_t>(boneIndex)][component]
+                     : Quantization.Visibility[static_cast<std::size_t>(boneIndex)];
+        range.Minimum = minimum;
+        range.Delta = delta;
+        range.Valid = true;
+    };
+
+    for (int bone = 0; bone < NumBones; ++bone)
+    {
+        std::uint32_t mask = masks[static_cast<std::size_t>(bone)];
+        if (mask & 0x1u)
+        {
+            for (int c = 0; c < 3; ++c)
+                decodeStream(bone, 0, c);
+        }
+        if (mask & 0x2u)
+        {
+            hasRotation[static_cast<std::size_t>(bone)] = true;
+            for (int c = 0; c < 4; ++c)
+                decodeStream(bone, 1, c);
+        }
+        if (mask & 0x4u)
+        {
+            for (int c = 0; c < 3; ++c)
+                decodeStream(bone, 2, c);
+        }
+        if (mask & 0x8u)
+        {
+            decodeStream(bone, 3, 0);
+        }
+    }
+
+    for (int bone = 0; bone < NumBones; ++bone)
+    {
+        if (!hasRotation[static_cast<std::size_t>(bone)])
+            continue;
+        for (int frame = 0; frame < NumFrames; ++frame)
+        {
+            auto& sample = Samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                   static_cast<std::size_t>(bone)];
+            float len = std::sqrt(sample.Rotation.X * sample.Rotation.X +
+                                  sample.Rotation.Y * sample.Rotation.Y +
+                                  sample.Rotation.Z * sample.Rotation.Z +
+                                  sample.Rotation.W * sample.Rotation.W);
+            if (len > 1e-6f)
+            {
+                float inv = 1.0f / len;
+                sample.Rotation.X *= inv;
+                sample.Rotation.Y *= inv;
+                sample.Rotation.Z *= inv;
+                sample.Rotation.W *= inv;
+            }
+        }
+    }
+
+    SamplesDecoded = true;
+    return true;
 }
 
 void SuAnimationEntry::Load(SlLib::Serialization::ResourceLoadContext& context)
@@ -1628,7 +2060,7 @@ void SuRenderTree::Load(SlLib::Serialization::ResourceLoadContext& context)
                 if (animPtr + 0x14 > dataSize)
                     return false;
                 int type = context.ReadInt32(animPtr);
-                if (type != 0 && type != 1 && type != 4 && type != 6)
+                if (type != 0 && type != 1 && type != 4 && (type < 6 || type > 10))
                     return false;
                 int frames = context.ReadInt32(animPtr + 4);
                 int bones = context.ReadInt32(animPtr + 8);

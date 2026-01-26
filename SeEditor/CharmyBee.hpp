@@ -69,6 +69,30 @@ private:
         std::vector<std::unique_ptr<TreeNode>> Children;
     };
 
+    struct BranchHierarchyNode
+    {
+        std::shared_ptr<Forest::SuBranch> Branch;
+        std::vector<int> Children;
+        bool Visible = true;
+    };
+
+    struct TreeHierarchy
+    {
+        std::string Name;
+        std::vector<BranchHierarchyNode> Nodes;
+        std::vector<int> Roots;
+        bool Visible = true;
+        int ForestIndex = -1;
+        int TreeIndex = -1;
+    };
+
+    struct ForestHierarchy
+    {
+        std::string Name;
+        std::vector<TreeHierarchy> Trees;
+        bool Visible = true;
+    };
+
     std::unique_ptr<TreeNode> _assetRoot;
     TreeNode* _selectedFolder = nullptr;
 
@@ -151,11 +175,38 @@ private:
         std::vector<ForestBoxLayer> Children;
         std::size_t MeshStartIndex = 0;
         std::size_t MeshCount = 0;
+        int ForestIndex = -1;
+        int TreeIndex = -1;
     };
     bool _showForestHierarchyWindow = false;
     bool _showNavigationHierarchyWindow = false;
     std::vector<ForestBoxLayer> _forestBoxLayers;
+    std::vector<ForestHierarchy> _forestHierarchy;
     std::vector<Renderer::SlRenderer::ForestCpuMesh> _allForestMeshes;
+    struct ForestMeshSource
+    {
+        std::vector<float> Vertices;
+        std::vector<std::uint32_t> Indices;
+        std::shared_ptr<SeEditor::Forest::SuRenderTextureResource> Texture;
+        int ForestIndex = -1;
+        int TreeIndex = -1;
+        int BranchIndex = -1;
+    };
+    std::vector<ForestMeshSource> _forestMeshSources;
+    std::vector<SlLib::Math::Matrix4x4> _animatorWorldScratch;
+    int _animatorSelectedForest = 0;
+    int _animatorSelectedTree = 0;
+    int _animatorSelectedAnimation = -1;
+    int _animatorSelectedBranch = 0;
+    bool _animatorPlaying = false;
+    float _animatorTime = 0.0f;
+    int _animatorFrame = 0;
+    int _animatorLastAppliedFrame = -1;
+    float _animatorFps = 30.0f;
+    bool _animatorDirty = false;
+    std::vector<bool> _animatorBranchVisibility;
+    int _animatorVisibilityForest = -1;
+    int _animatorVisibilityTree = -1;
     struct NavigationLineEntry
     {
         int LineIndex = 0;
@@ -233,6 +284,20 @@ private:
     void LoadForestVisibility();
     void SaveForestVisibility() const;
     std::filesystem::path GetForestVisibilityPath() const;
+    void UpdateForestHierarchy();
+    void RenderForestHierarchyWindow();
+    void RenderForestHierarchyList();
+    bool RenderBranchNode(TreeHierarchy& tree, int index);
+    bool IsTreeVisible(std::size_t forestIdx, std::size_t treeIdx) const;
+    bool IsBranchVisible(int forestIdx, int treeIdx, int branchIdx) const;
+    void ApplyTreeVisibilityToLayers();
+    void UpdateAnimator(float deltaSeconds);
+    void ApplyAnimatorFrame();
+    void BuildForestMeshesFromPose(std::vector<SlLib::Math::Vector4> const& translations,
+                                   std::vector<SlLib::Math::Vector4> const& rotations,
+                                   std::vector<SlLib::Math::Vector4> const& scales,
+                                   int forestIndex,
+                                   int treeIndex);
     void UpdateNavigationLineVisibility();
     void UpdateNavigationDebugLines();
     void UpdateLogicDebugLines();
