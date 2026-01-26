@@ -1,7 +1,6 @@
 #include "SeEditor/UnityExport.hpp"
 
 #include "SeEditor/LogicLoader.hpp"
-#include "SeEditor/NavigationLoader.hpp"
 #include "SeEditor/SifParser.hpp"
 #include "SeEditor/Forest/ForestTypes.hpp"
 
@@ -1467,57 +1466,6 @@ std::filesystem::path FindUnityProjectRoot(std::filesystem::path const& startDir
     return {};
 }
 
-static bool WriteMinimalUnityPackages(const std::filesystem::path& unityRoot, std::string& error)
-{
-    std::error_code ec;
-    const auto packagesDir = unityRoot / "Packages";
-    std::filesystem::create_directories(packagesDir, ec);
-    if (ec)
-    {
-        error = "Failed to create Packages/: " + ec.message();
-        return false;
-    }
-    const auto manifest = packagesDir / "manifest.json";
-    if (!std::filesystem::exists(manifest, ec))
-    {
-        std::ofstream out(manifest, std::ios::binary | std::ios::trunc);
-        if (!out)
-        {
-            error = "Failed to write Packages/manifest.json";
-            return false;
-        }
-        out << "{\n";
-        out << "  \"dependencies\": {\n";
-        out << "    \"com.unity.modules.assetbundle\": \"1.0.0\",\n";
-        out << "    \"com.unity.modules.physics\": \"1.0.0\",\n";
-        out << "    \"com.unity.modules.physics2d\": \"1.0.0\",\n";
-        out << "    \"com.unity.modules.ui\": \"1.0.0\"\n";
-        out << "  }\n";
-        out << "}\n";
-    }
-    return true;
-}
-
-static std::filesystem::path FindTemplateRoot(std::filesystem::path const& preferredBase)
-{
-    std::error_code ec;
-    // Prefer template next to the repo / working directory (NOT inside the user's export root).
-    std::filesystem::path cur = std::filesystem::weakly_canonical(preferredBase, ec);
-    if (ec)
-        cur = preferredBase;
-
-    for (int i = 0; i < 12; ++i)
-    {
-        const std::filesystem::path candidate = cur / "SSAR_MapTemplate";
-        if (std::filesystem::exists(candidate, ec) && std::filesystem::is_directory(candidate, ec))
-            return candidate;
-        if (!cur.has_parent_path())
-            break;
-        cur = cur.parent_path();
-    }
-    return {};
-}
-
 static std::optional<std::filesystem::path> TryPrepareUnityProjectAtRoot(std::filesystem::path const& userRoot,
                                                                          std::string& error)
 {
@@ -1540,38 +1488,34 @@ static std::optional<std::filesystem::path> TryPrepareUnityProjectAtRoot(std::fi
         return std::nullopt;
     }
 
-    // Try to locate SSAR_MapTemplate near the running app (cwd), not under the user's export root.
-    const std::filesystem::path templateDir = FindTemplateRoot(std::filesystem::current_path());
-    if (!templateDir.empty())
+    const std::filesystem::path templateDir = base / "SSAR_MapTemplate";
+    if (!std::filesystem::exists(templateDir, ec))
     {
-        for (auto const& entry : std::filesystem::directory_iterator(templateDir, ec))
-        {
-            if (ec)
-            {
-                error = "Failed to iterate template: " + ec.message();
-                return std::nullopt;
-            }
-            const auto name = entry.path().filename().string();
-            if (_stricmp(name.c_str(), "Assets") == 0)
-                continue;
-
-            const std::filesystem::path dst = unity / entry.path().filename();
-            std::filesystem::copy(entry.path(),
-                                  dst,
-                                  std::filesystem::copy_options::recursive | std::filesystem::copy_options::update_existing,
-                                  ec);
-            if (ec)
-            {
-                error = "Failed to copy template item: " + entry.path().string() + " -> " + dst.string() + " (" + ec.message() + ")";
-                return std::nullopt;
-            }
-        }
+        error = "SSAR_MapTemplate not found at: " + templateDir.string();
+        return std::nullopt;
     }
-    else
+
+    for (auto const& entry : std::filesystem::directory_iterator(templateDir, ec))
     {
-        // Do not hard-fail; create a minimal Unity project layout so export works even without the template.
-        if (!WriteMinimalUnityPackages(unity, error))
+        if (ec)
+        {
+            error = "Failed to iterate template: " + ec.message();
             return std::nullopt;
+        }
+        const auto name = entry.path().filename().string();
+        if (_stricmp(name.c_str(), "Assets") == 0)
+            continue;
+
+        const std::filesystem::path dst = unity / entry.path().filename();
+        std::filesystem::copy(entry.path(),
+                              dst,
+                              std::filesystem::copy_options::recursive | std::filesystem::copy_options::update_existing,
+                              ec);
+        if (ec)
+        {
+            error = "Failed to copy template item: " + entry.path().string() + " -> " + dst.string() + " (" + ec.message() + ")";
+            return std::nullopt;
+        }
     }
 
     if (!std::filesystem::exists(assets, ec) || !std::filesystem::exists(projectSettings, ec))
@@ -1669,11 +1613,6 @@ ExportResult ExportSifToUnity(std::filesystem::path const& sifPath,
     SeEditor::LogicProbeInfo logicProbe{};
     std::string logicError;
     bool hasLogic = SeEditor::LoadLogicFromSifChunks(parsed->Chunks, logic, logicProbe, logicError);
-
-    SlLib::SumoTool::Siff::Navigation navigation;
-    SeEditor::NavigationProbeInfo navProbe{};
-    std::string navError;
-    bool hasNav = SeEditor::LoadNavigationFromSifChunks(parsed->Chunks, navigation, navProbe, navError);
 
     // Export a single collision mesh for the whole SIF from COLI chunk (Unity-readable OBJ).
     {
@@ -1931,60 +1870,6 @@ ExportResult ExportSifToUnity(std::filesystem::path const& sifPath,
     json << "\n    ]\n";
     json << "  }\n";
 
-    json << ",\n  \"navigation\": {\n";
-    json << "    \"present\": " << (hasNav ? "true" : "false") << ",\n";
-    json << "    \"error\": \"" << JsonEscape(hasNav ? "" : navError) << "\",\n";
-    json << "    \"version\": " << (hasNav ? navProbe.Version : 0) << ",\n";
-    json << "    \"baseOffset\": " << (hasNav ? static_cast<unsigned long long>(navProbe.BaseOffset) : 0ULL) << ",\n";
-    json << "    \"waypoints\": [\n";
-    if (hasNav)
-    {
-        std::unordered_map<const SlLib::SumoTool::Siff::NavData::NavWaypoint*, int> wpIndex;
-        wpIndex.reserve(navigation.Waypoints.size());
-        for (std::size_t i = 0; i < navigation.Waypoints.size(); ++i)
-        {
-            auto const& wp = navigation.Waypoints[i];
-            if (wp)
-                wpIndex[wp.get()] = static_cast<int>(i);
-        }
-
-        bool firstWp = true;
-        for (std::size_t i = 0; i < navigation.Waypoints.size(); ++i)
-        {
-            auto const& wp = navigation.Waypoints[i];
-            if (!wp)
-                continue;
-            if (!firstWp)
-                json << ",\n";
-            firstWp = false;
-
-            json << "      {\"index\": " << i
-                 << ", \"name\": \"" << JsonEscape(wp->Name)
-                 << "\", \"flags\": " << wp->Flags
-                 << ", \"pos\": [" << wp->Pos.X << ", " << wp->Pos.Y << ", " << wp->Pos.Z << "]"
-                 << ", \"dir\": [" << wp->Dir.X << ", " << wp->Dir.Y << ", " << wp->Dir.Z << "]"
-                 << ", \"up\": [" << wp->Up.X << ", " << wp->Up.Y << ", " << wp->Up.Z << "]"
-                 << ", \"to\": [";
-
-            bool firstTo = true;
-            for (auto const& link : wp->ToLinks)
-            {
-                if (!link || !link->To)
-                    continue;
-                auto it = wpIndex.find(link->To);
-                if (it == wpIndex.end())
-                    continue;
-                if (!firstTo)
-                    json << ", ";
-                firstTo = false;
-                json << it->second;
-            }
-            json << "]}";
-        }
-    }
-    json << "\n    ]\n";
-    json << "  }\n";
-
     json << "}\n";
 
     std::ofstream out(jsonPath, std::ios::binary | std::ios::trunc);
@@ -1998,21 +1883,6 @@ ExportResult ExportSifToUnity(std::filesystem::path const& sifPath,
     // Build a Unity scene that instantiates one prefab per tree (prefab contains SuBranch hierarchy + meshes).
     UnitySceneWriter scene;
     int sceneRoot = scene.AddNode(SanitizeName(sifPath.stem().string()), 0, {0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1});
-    int navRoot = 0;
-    int navWpRoot = 0;
-    if (hasNav)
-    {
-        navRoot = scene.AddNode("Navigation", sceneRoot, {0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1});
-        navWpRoot = scene.AddNode("Waypoints", navRoot, {0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1});
-        for (std::size_t i = 0; i < navigation.Waypoints.size(); ++i)
-        {
-            auto const& wp = navigation.Waypoints[i];
-            if (!wp)
-                continue;
-            Vector4 t{wp->Pos.X, wp->Pos.Y, wp->Pos.Z, 0.0f};
-            scene.AddNode("WP_" + std::to_string(i), navWpRoot, t, {0, 0, 0, 1}, {1, 1, 1, 1});
-        }
-    }
     for (auto const& forestLib : forests)
     {
         if (!forestLib.library)

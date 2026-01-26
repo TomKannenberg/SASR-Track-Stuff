@@ -187,30 +187,6 @@ private:
     std::vector<ForestBoxLayer> _forestBoxLayers;
     std::vector<ForestHierarchy> _forestHierarchy;
     std::vector<Renderer::SlRenderer::ForestCpuMesh> _allForestMeshes;
-    struct ForestMeshSource
-    {
-        std::vector<float> Vertices;
-        std::vector<std::uint32_t> Indices;
-        std::shared_ptr<SeEditor::Forest::SuRenderTextureResource> Texture;
-        int ForestIndex = -1;
-        int TreeIndex = -1;
-        int BranchIndex = -1;
-    };
-    std::vector<ForestMeshSource> _forestMeshSources;
-    std::vector<SlLib::Math::Matrix4x4> _animatorWorldScratch;
-    int _animatorSelectedForest = 0;
-    int _animatorSelectedTree = 0;
-    int _animatorSelectedAnimation = -1;
-    int _animatorSelectedBranch = 0;
-    bool _animatorPlaying = false;
-    float _animatorTime = 0.0f;
-    int _animatorFrame = 0;
-    int _animatorLastAppliedFrame = -1;
-    float _animatorFps = 30.0f;
-    bool _animatorDirty = false;
-    std::vector<bool> _animatorBranchVisibility;
-    int _animatorVisibilityForest = -1;
-    int _animatorVisibilityTree = -1;
     struct NavigationLineEntry
     {
         int LineIndex = 0;
@@ -218,11 +194,13 @@ private:
         bool Visible = true;
     };
     std::vector<NavigationLineEntry> _navigationLineEntries;
-    float _cameraYaw = 0.6f;
-    float _cameraPitch = 0.35f;
-    SlLib::Math::Vector3 _cameraPosition{3.5f, 3.0f, 3.5f};
+    float _orbitYaw = 0.6f;
+    float _orbitPitch = 0.35f;
+    float _orbitDistance = 10.0f;
     int _selectedChunk = -1;
     SlLib::Math::Vector3 _collisionCenter{0.0f, 0.0f, 0.0f};
+    SlLib::Math::Vector3 _orbitTarget{0.0f, 0.5f, 0.0f};
+    SlLib::Math::Vector3 _orbitOffset{0.0f, 0.0f, 0.0f};
     bool _debugKeyInput = false;
     std::array<bool, GLFW_KEY_LAST + 1> _glfwKeyStates{};
     std::array<bool, GLFW_MOUSE_BUTTON_LAST + 1> _glfwMouseButtonStates{};
@@ -271,6 +249,13 @@ private:
     void LoadCollisionDebugGeometry();
     void LoadForestDebugGeometry();
     void LoadForestResources();
+    void UpdateForestHierarchy();
+    bool IsTreeVisible(std::size_t forestIdx, std::size_t treeIdx) const;
+    bool IsBranchVisible(int forestIdx, int treeIdx, int branchIdx) const;
+    void ApplyTreeVisibilityToLayers();
+    void RenderForestHierarchyWindow();
+    void RenderForestHierarchyList();
+    bool RenderBranchNode(TreeHierarchy& tree, int index);
     void LoadNavigationResources();
     void LoadLogicResources();
     void LoadItemsForestResources();
@@ -286,20 +271,6 @@ private:
     void LoadForestVisibility();
     void SaveForestVisibility() const;
     std::filesystem::path GetForestVisibilityPath() const;
-    void UpdateForestHierarchy();
-    void RenderForestHierarchyWindow();
-    void RenderForestHierarchyList();
-    bool RenderBranchNode(TreeHierarchy& tree, int index);
-    bool IsTreeVisible(std::size_t forestIdx, std::size_t treeIdx) const;
-    bool IsBranchVisible(int forestIdx, int treeIdx, int branchIdx) const;
-    void ApplyTreeVisibilityToLayers();
-    void UpdateAnimator(float deltaSeconds);
-    void ApplyAnimatorFrame();
-    void BuildForestMeshesFromPose(std::vector<SlLib::Math::Vector4> const& translations,
-                                   std::vector<SlLib::Math::Vector4> const& rotations,
-                                   std::vector<SlLib::Math::Vector4> const& scales,
-                                   int forestIndex,
-                                   int treeIndex);
     void UpdateNavigationLineVisibility();
     void UpdateNavigationDebugLines();
     void UpdateLogicDebugLines();
@@ -307,7 +278,7 @@ private:
     void UpdateTriggerPhantomBoxes();
     bool RenderForestBoxLayer(ForestBoxLayer& layer);
     void SetForestLayerVisibilityRecursive(ForestBoxLayer& layer, bool visible);
-    void UpdateCameraFromInput(float delta);
+    void UpdateOrbitFromInput(float delta);
     void DrawNodeCreationMenu();
     void AddItemNode(std::string const& name, SlLib::Resources::Scene::SeDefinitionNode* definition = nullptr);
     void RenderSifViewer();

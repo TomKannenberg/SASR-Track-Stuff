@@ -53,15 +53,9 @@ public:
     void SetDebugLines(std::vector<DebugLine> lines);
     void SetDrawDebugLines(bool enable) { _drawDebugLines = enable; }
     void SetOrbitCamera(float yaw, float pitch, float distance, SlLib::Math::Vector3 target);
-    void SetFreeFlyCamera(SlLib::Math::Vector3 position, float yaw, float pitch);
     void SetDrawCollisionMesh(bool enable) { _drawCollisionMesh = enable; }
 
 private:
-    enum class CameraMode
-    {
-        Orbit,
-        FreeFly
-    };
     struct ForestGpuMesh
     {
         GLuint Vao = 0;
@@ -87,14 +81,10 @@ private:
     std::unordered_map<const void*, GLuint> _forestTextureCache;
     bool _forestDirty = false;
     bool _drawForestMeshes = false;
-    CameraMode _cameraMode = CameraMode::Orbit;
     float _orbitYaw = 0.6f;
     float _orbitPitch = 0.35f;
     float _orbitDistance = 10.0f;
     SlLib::Math::Vector3 _orbitTarget{0.0f, 0.5f, 0.0f};
-    SlLib::Math::Vector3 _flyPosition{3.5f, 3.0f, 3.5f};
-    float _flyYaw = 0.6f;
-    float _flyPitch = 0.35f;
     bool _drawCollisionMesh = true;
     bool _drawDebugLines = false;
 };

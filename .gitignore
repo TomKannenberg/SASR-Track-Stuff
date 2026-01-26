@@ -16,9 +16,8 @@ track.Forest
 *_forestXYZ.txt
 CppSLib_Stuff/
 gitignore.bak/
-Unity/
-SSAR_MapTemplate/
-**/*_SIF/
-*.mtl
-*.dds
-*.tga
+UnityTooling/
+_bak/
+_bak_previous/
+tests/
+*.zip
