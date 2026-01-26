@@ -14,6 +14,7 @@
 #include "NavigationLoader.hpp"
 #include "LogicLoader.hpp"
 #include "XpacUnpacker.hpp"
+#include "UnityExport.hpp"
 #include "SlLib/Resources/Database/SlPlatform.hpp"
 #include "SlLib/Utilities/SlUtil.hpp"
 #include "Forest/ForestArchive.hpp"
@@ -1256,6 +1257,8 @@ CharmyBee::~CharmyBee()
 {
     if (_xpacWorker && _xpacWorker->joinable())
         _xpacWorker->join();
+    if (_unityExportWorker && _unityExportWorker->joinable())
+        _unityExportWorker->join();
 }
 
 CharmyBee::TreeNode::TreeNode(std::string name, bool isFolder)
@@ -1770,6 +1773,14 @@ void CharmyBee::RenderSifViewer()
                 ImGui::Text("Original size: %llu bytes", static_cast<unsigned long long>(_sifOriginalSize));
                 if (_sifFileCompressed)
                     ImGui::Text("Decompressed payload: %llu bytes", static_cast<unsigned long long>(_sifDecompressedSize));
+
+                {
+                    std::scoped_lock lock(_unityExportMutex);
+                    if (!_unityExportStatus.empty())
+                        ImGui::TextWrapped("Unity export: %s", _unityExportStatus.c_str());
+                }
+                if (ImGui::Button("Export SIF to Unity"))
+                    ExportSifToUnity();
 
                 ImGui::Separator();
                 if (!_sifChunks.empty())
@@ -2921,6 +2932,43 @@ void CharmyBee::OpenSifFile()
     {
         LoadSifFile(*result);
     }
+}
+
+void CharmyBee::ExportSifToUnity()
+{
+    if (_unityExportBusy.exchange(true))
+        return;
+
+    if (_unityExportWorker && _unityExportWorker->joinable())
+        _unityExportWorker->join();
+
+    const std::filesystem::path sifPath = std::filesystem::path(_sifFilePath);
+    const std::filesystem::path exportRoot = GetStuffRoot();
+
+    {
+        std::scoped_lock lock(_unityExportMutex);
+        _unityExportStatus = "Running... (root: " + exportRoot.string() + ")";
+    }
+
+    _unityExportWorker = std::make_unique<std::thread>([this, sifPath, exportRoot]() {
+        auto res = SeEditor::UnityExport::ExportSifToUnity(sifPath, exportRoot);
+        {
+            std::scoped_lock lock(_unityExportMutex);
+            if (res.Success)
+            {
+                std::ostringstream msg;
+                msg << "Done: " << res.ExportJsonPath.string();
+                if (!res.ScenePath.empty())
+                    msg << " | Scene: " << res.ScenePath.string();
+                _unityExportStatus = msg.str();
+            }
+            else
+            {
+                _unityExportStatus = "Failed: " + res.Error;
+            }
+        }
+        _unityExportBusy.store(false);
+    });
 }
 
 void CharmyBee::LoadSifFile(std::filesystem::path const& path)

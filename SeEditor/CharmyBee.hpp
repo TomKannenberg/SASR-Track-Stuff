@@ -147,6 +147,10 @@ private:
     std::atomic<std::size_t> _xpacRepackProgress{0};
     std::atomic<std::size_t> _xpacRepackTotal{0};
     bool _confirmNukeStuff = false;
+    std::atomic<bool> _unityExportBusy{false};
+    std::string _unityExportStatus;
+    std::mutex _unityExportMutex;
+    std::unique_ptr<std::thread> _unityExportWorker;
     std::mutex _xpacMutex;
     std::unique_ptr<std::thread> _xpacWorker;
     struct XpacRepackEntry
@@ -309,6 +313,7 @@ private:
     void DrawNodeCreationMenu();
     void AddItemNode(std::string const& name, SlLib::Resources::Scene::SeDefinitionNode* definition = nullptr);
     void RenderSifViewer();
+    void ExportSifToUnity();
     void UnpackXpac();
     void RepackXpac();
     void OpenSifFile();

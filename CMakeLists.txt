@@ -90,11 +90,15 @@ target_link_libraries(forest_unpacker PRIVATE SeEditorCore)
 target_include_directories(forest_unpacker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(forest_unpacker PRIVATE ZLIB::ZLIB)
 
+add_executable(sif_to_unity SeEditor/SifToUnity.cpp)
+target_link_libraries(sif_to_unity PRIVATE SeEditorLib SlLib SeEditorCore)
+target_include_directories(sif_to_unity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 target_link_libraries(SlLib PRIVATE ZLIB::ZLIB)
 
 # Statically link libgcc/libstdc++ for MinGW builds.
 if (MINGW)
-    foreach(_tgt CppSLib forest_extractor forest_to_obj forest_unpacker)
+    foreach(_tgt CppSLib forest_extractor forest_to_obj forest_unpacker sif_to_unity)
         target_link_options(${_tgt} PRIVATE -static -static-libgcc -static-libstdc++)
     endforeach()
 endif()
