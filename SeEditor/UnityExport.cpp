@@ -1,6 +1,7 @@
 #include "SeEditor/UnityExport.hpp"
 
 #include "SeEditor/LogicLoader.hpp"
+#include "SeEditor/NavigationLoader.hpp"
 #include "SeEditor/SifParser.hpp"
 #include "SeEditor/Forest/ForestTypes.hpp"
 
@@ -1669,6 +1670,11 @@ ExportResult ExportSifToUnity(std::filesystem::path const& sifPath,
     std::string logicError;
     bool hasLogic = SeEditor::LoadLogicFromSifChunks(parsed->Chunks, logic, logicProbe, logicError);
 
+    SlLib::SumoTool::Siff::Navigation navigation;
+    SeEditor::NavigationProbeInfo navProbe{};
+    std::string navError;
+    bool hasNav = SeEditor::LoadNavigationFromSifChunks(parsed->Chunks, navigation, navProbe, navError);
+
     // Export a single collision mesh for the whole SIF from COLI chunk (Unity-readable OBJ).
     {
         auto it = std::find_if(parsed->Chunks.begin(), parsed->Chunks.end(),
@@ -1925,6 +1931,60 @@ ExportResult ExportSifToUnity(std::filesystem::path const& sifPath,
     json << "\n    ]\n";
     json << "  }\n";
 
+    json << ",\n  \"navigation\": {\n";
+    json << "    \"present\": " << (hasNav ? "true" : "false") << ",\n";
+    json << "    \"error\": \"" << JsonEscape(hasNav ? "" : navError) << "\",\n";
+    json << "    \"version\": " << (hasNav ? navProbe.Version : 0) << ",\n";
+    json << "    \"baseOffset\": " << (hasNav ? static_cast<unsigned long long>(navProbe.BaseOffset) : 0ULL) << ",\n";
+    json << "    \"waypoints\": [\n";
+    if (hasNav)
+    {
+        std::unordered_map<const SlLib::SumoTool::Siff::NavData::NavWaypoint*, int> wpIndex;
+        wpIndex.reserve(navigation.Waypoints.size());
+        for (std::size_t i = 0; i < navigation.Waypoints.size(); ++i)
+        {
+            auto const& wp = navigation.Waypoints[i];
+            if (wp)
+                wpIndex[wp.get()] = static_cast<int>(i);
+        }
+
+        bool firstWp = true;
+        for (std::size_t i = 0; i < navigation.Waypoints.size(); ++i)
+        {
+            auto const& wp = navigation.Waypoints[i];
+            if (!wp)
+                continue;
+            if (!firstWp)
+                json << ",\n";
+            firstWp = false;
+
+            json << "      {\"index\": " << i
+                 << ", \"name\": \"" << JsonEscape(wp->Name)
+                 << "\", \"flags\": " << wp->Flags
+                 << ", \"pos\": [" << wp->Pos.X << ", " << wp->Pos.Y << ", " << wp->Pos.Z << "]"
+                 << ", \"dir\": [" << wp->Dir.X << ", " << wp->Dir.Y << ", " << wp->Dir.Z << "]"
+                 << ", \"up\": [" << wp->Up.X << ", " << wp->Up.Y << ", " << wp->Up.Z << "]"
+                 << ", \"to\": [";
+
+            bool firstTo = true;
+            for (auto const& link : wp->ToLinks)
+            {
+                if (!link || !link->To)
+                    continue;
+                auto it = wpIndex.find(link->To);
+                if (it == wpIndex.end())
+                    continue;
+                if (!firstTo)
+                    json << ", ";
+                firstTo = false;
+                json << it->second;
+            }
+            json << "]}";
+        }
+    }
+    json << "\n    ]\n";
+    json << "  }\n";
+
     json << "}\n";
 
     std::ofstream out(jsonPath, std::ios::binary | std::ios::trunc);
@@ -1938,6 +1998,21 @@ ExportResult ExportSifToUnity(std::filesystem::path const& sifPath,
     // Build a Unity scene that instantiates one prefab per tree (prefab contains SuBranch hierarchy + meshes).
     UnitySceneWriter scene;
     int sceneRoot = scene.AddNode(SanitizeName(sifPath.stem().string()), 0, {0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1});
+    int navRoot = 0;
+    int navWpRoot = 0;
+    if (hasNav)
+    {
+        navRoot = scene.AddNode("Navigation", sceneRoot, {0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1});
+        navWpRoot = scene.AddNode("Waypoints", navRoot, {0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1});
+        for (std::size_t i = 0; i < navigation.Waypoints.size(); ++i)
+        {
+            auto const& wp = navigation.Waypoints[i];
+            if (!wp)
+                continue;
+            Vector4 t{wp->Pos.X, wp->Pos.Y, wp->Pos.Z, 0.0f};
+            scene.AddNode("WP_" + std::to_string(i), navWpRoot, t, {0, 0, 0, 1}, {1, 1, 1, 1});
+        }
+    }
     for (auto const& forestLib : forests)
     {
         if (!forestLib.library)
