@@ -1466,6 +1466,57 @@ std::filesystem::path FindUnityProjectRoot(std::filesystem::path const& startDir
     return {};
 }
 
+static bool WriteMinimalUnityPackages(const std::filesystem::path& unityRoot, std::string& error)
+{
+    std::error_code ec;
+    const auto packagesDir = unityRoot / "Packages";
+    std::filesystem::create_directories(packagesDir, ec);
+    if (ec)
+    {
+        error = "Failed to create Packages/: " + ec.message();
+        return false;
+    }
+    const auto manifest = packagesDir / "manifest.json";
+    if (!std::filesystem::exists(manifest, ec))
+    {
+        std::ofstream out(manifest, std::ios::binary | std::ios::trunc);
+        if (!out)
+        {
+            error = "Failed to write Packages/manifest.json";
+            return false;
+        }
+        out << "{\n";
+        out << "  \"dependencies\": {\n";
+        out << "    \"com.unity.modules.assetbundle\": \"1.0.0\",\n";
+        out << "    \"com.unity.modules.physics\": \"1.0.0\",\n";
+        out << "    \"com.unity.modules.physics2d\": \"1.0.0\",\n";
+        out << "    \"com.unity.modules.ui\": \"1.0.0\"\n";
+        out << "  }\n";
+        out << "}\n";
+    }
+    return true;
+}
+
+static std::filesystem::path FindTemplateRoot(std::filesystem::path const& preferredBase)
+{
+    std::error_code ec;
+    // Prefer template next to the repo / working directory (NOT inside the user's export root).
+    std::filesystem::path cur = std::filesystem::weakly_canonical(preferredBase, ec);
+    if (ec)
+        cur = preferredBase;
+
+    for (int i = 0; i < 12; ++i)
+    {
+        const std::filesystem::path candidate = cur / "SSAR_MapTemplate";
+        if (std::filesystem::exists(candidate, ec) && std::filesystem::is_directory(candidate, ec))
+            return candidate;
+        if (!cur.has_parent_path())
+            break;
+        cur = cur.parent_path();
+    }
+    return {};
+}
+
 static std::optional<std::filesystem::path> TryPrepareUnityProjectAtRoot(std::filesystem::path const& userRoot,
                                                                          std::string& error)
 {
@@ -1488,34 +1539,38 @@ static std::optional<std::filesystem::path> TryPrepareUnityProjectAtRoot(std::fi
         return std::nullopt;
     }
 
-    const std::filesystem::path templateDir = base / "SSAR_MapTemplate";
-    if (!std::filesystem::exists(templateDir, ec))
+    // Try to locate SSAR_MapTemplate near the running app (cwd), not under the user's export root.
+    const std::filesystem::path templateDir = FindTemplateRoot(std::filesystem::current_path());
+    if (!templateDir.empty())
     {
-        error = "SSAR_MapTemplate not found at: " + templateDir.string();
-        return std::nullopt;
+        for (auto const& entry : std::filesystem::directory_iterator(templateDir, ec))
+        {
+            if (ec)
+            {
+                error = "Failed to iterate template: " + ec.message();
+                return std::nullopt;
+            }
+            const auto name = entry.path().filename().string();
+            if (_stricmp(name.c_str(), "Assets") == 0)
+                continue;
+
+            const std::filesystem::path dst = unity / entry.path().filename();
+            std::filesystem::copy(entry.path(),
+                                  dst,
+                                  std::filesystem::copy_options::recursive | std::filesystem::copy_options::update_existing,
+                                  ec);
+            if (ec)
+            {
+                error = "Failed to copy template item: " + entry.path().string() + " -> " + dst.string() + " (" + ec.message() + ")";
+                return std::nullopt;
+            }
+        }
     }
-
-    for (auto const& entry : std::filesystem::directory_iterator(templateDir, ec))
+    else
     {
-        if (ec)
-        {
-            error = "Failed to iterate template: " + ec.message();
+        // Do not hard-fail; create a minimal Unity project layout so export works even without the template.
+        if (!WriteMinimalUnityPackages(unity, error))
             return std::nullopt;
-        }
-        const auto name = entry.path().filename().string();
-        if (_stricmp(name.c_str(), "Assets") == 0)
-            continue;
-
-        const std::filesystem::path dst = unity / entry.path().filename();
-        std::filesystem::copy(entry.path(),
-                              dst,
-                              std::filesystem::copy_options::recursive | std::filesystem::copy_options::update_existing,
-                              ec);
-        if (ec)
-        {
-            error = "Failed to copy template item: " + entry.path().string() + " -> " + dst.string() + " (" + ec.message() + ")";
-            return std::nullopt;
-        }
     }
 
     if (!std::filesystem::exists(assets, ec) || !std::filesystem::exists(projectSettings, ec))
