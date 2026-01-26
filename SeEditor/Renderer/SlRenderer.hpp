@@ -23,9 +23,17 @@ public:
 
     struct ForestCpuMesh
     {
-        std::vector<float> Vertices; // pos(3) + normal(3) + uv(2)
+        // Interleaved per-vertex floats:
+        //   pos(3), normal(3), uv(2), weights(4), indices(4 as floats)
+        // Unskinned meshes should use weights=(1,0,0,0), indices=(0,0,0,0).
+        std::vector<float> Vertices;
         std::vector<std::uint32_t> Indices;
         std::shared_ptr<SeEditor::Forest::SuRenderTextureResource> Texture;
+        SlLib::Math::Matrix4x4 Model{};
+        bool Skinned = false;
+        std::vector<int> BoneMatrixIndices;
+        std::vector<SlLib::Math::Matrix4x4> BoneInverseMatrices;
+        std::vector<SlLib::Math::Matrix4x4> BonePalette;
         int ForestIndex = -1;
         int TreeIndex = -1;
         int BranchIndex = -1;
@@ -40,6 +48,7 @@ public:
 
     void SetForestMeshes(std::vector<ForestCpuMesh> meshes);
     void SetDrawForestMeshes(bool enable) { _drawForestMeshes = enable; }
+    void UpdateForestBonePalettes(std::vector<std::vector<SlLib::Math::Matrix4x4>> palettes);
 
     void Initialize();
     void Render();
@@ -52,8 +61,15 @@ public:
     void SetDrawTriggerBoxes(bool enable) { _drawTriggerBoxes = enable; }
     void SetDebugLines(std::vector<DebugLine> lines);
     void SetDrawDebugLines(bool enable) { _drawDebugLines = enable; }
+    void SetBoneLines(std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> bones);
+    void SetDrawBoneLines(bool enable) { _drawBoneLines = enable; }
     void SetOrbitCamera(float yaw, float pitch, float distance, SlLib::Math::Vector3 target);
     void SetDrawCollisionMesh(bool enable) { _drawCollisionMesh = enable; }
+    void SetDrawOriginAxes(bool enable) { _drawOriginAxes = enable; }
+
+    std::size_t DebugForestMeshCount() const { return _forestCpuMeshes.size(); }
+    std::size_t DebugForestSkinnedCount() const;
+    bool DebugForestDirty() const { return _forestDirty; }
 
 private:
     struct ForestGpuMesh
@@ -63,6 +79,7 @@ private:
         GLuint Ebo = 0;
         GLuint Texture = 0;
         std::size_t IndexCount = 0;
+        std::size_t CpuIndex = 0;
     };
 
     EditorFramebuffer _framebuffer;
@@ -75,6 +92,8 @@ private:
     bool _drawForestBoxes = false;
     std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> _triggerBoxes;
     bool _drawTriggerBoxes = false;
+    std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> _boneLines;
+    bool _drawBoneLines = false;
     std::vector<DebugLine> _debugLines;
     std::vector<ForestCpuMesh> _forestCpuMeshes;
     std::vector<ForestGpuMesh> _forestGpuMeshes;
@@ -87,6 +106,7 @@ private:
     SlLib::Math::Vector3 _orbitTarget{0.0f, 0.5f, 0.0f};
     bool _drawCollisionMesh = true;
     bool _drawDebugLines = false;
+    bool _drawOriginAxes = true;
 };
 
 } // namespace SeEditor::Renderer

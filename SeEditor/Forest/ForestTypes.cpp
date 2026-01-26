@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <optional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <span>
 
 namespace SeEditor::Forest {
 
@@ -106,6 +109,825 @@ std::uint16_t FloatToHalf(float value)
     std::uint16_t outExp = static_cast<std::uint16_t>(newExp << 10);
     std::uint16_t outMant = static_cast<std::uint16_t>(mant >> 13);
     return static_cast<std::uint16_t>(outSign | outExp | outMant);
+}
+
+struct Type6Reader
+{
+    std::span<const std::uint8_t> Data;
+    bool BigEndian = false;
+    std::size_t Offset = 0;
+
+    bool Has(std::size_t count) const { return Offset + count <= Data.size(); }
+
+    std::uint8_t ReadU8()
+    {
+        if (!Has(1))
+            return 0;
+        return Data[Offset++];
+    }
+
+    std::uint16_t ReadU16()
+    {
+        if (!Has(2))
+            return 0;
+        std::uint16_t a = Data[Offset];
+        std::uint16_t b = Data[Offset + 1];
+        Offset += 2;
+        if (BigEndian)
+            return static_cast<std::uint16_t>((a << 8) | b);
+        return static_cast<std::uint16_t>(a | (b << 8));
+    }
+
+    std::uint32_t ReadU32()
+    {
+        if (!Has(4))
+            return 0;
+        std::uint32_t b0 = Data[Offset + 0];
+        std::uint32_t b1 = Data[Offset + 1];
+        std::uint32_t b2 = Data[Offset + 2];
+        std::uint32_t b3 = Data[Offset + 3];
+        Offset += 4;
+        if (BigEndian)
+            return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    float ReadFloat()
+    {
+        std::uint32_t bits = ReadU32();
+        float v = 0.0f;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+};
+
+struct Type6StreamHeader
+{
+    std::uint32_t NumFrames = 0;
+    std::uint32_t NumKeys = 0;
+};
+
+Type6StreamHeader ReadType6Header(Type6Reader& reader, bool smallHeader)
+{
+    Type6StreamHeader header{};
+    if (smallHeader)
+    {
+        header.NumFrames = reader.ReadU8();
+        header.NumKeys = reader.ReadU8();
+    }
+    else
+    {
+        header.NumFrames = reader.ReadU16();
+        header.NumKeys = reader.ReadU16();
+    }
+    return header;
+}
+
+Type6StreamHeader ReadType6HeaderSafe(Type6Reader& reader,
+                                      bool smallHeader,
+                                      std::size_t maxFrames,
+                                      std::size_t frameIndexSize,
+                                      std::size_t factorSize)
+{
+    if (!smallHeader)
+        return ReadType6Header(reader, false);
+
+    std::size_t saved = reader.Offset;
+    Type6StreamHeader h8 = ReadType6Header(reader, true);
+    std::size_t minBytes = h8.NumFrames * (frameIndexSize + factorSize) + 8;
+    std::size_t packedBytes = (static_cast<std::size_t>(h8.NumKeys) * 16 + 7) / 8;
+    bool sane = h8.NumFrames <= maxFrames && reader.Has(minBytes + packedBytes);
+    if (sane)
+        return h8;
+
+    reader.Offset = saved;
+    return ReadType6Header(reader, false);
+}
+
+Type6StreamHeader ReadType6HeaderInlineSafe(Type6Reader& reader,
+                                            bool smallHeader,
+                                            std::size_t maxFrames,
+                                            std::size_t frameIndexSize,
+                                            std::size_t factorSize)
+{
+    if (!smallHeader)
+        return ReadType6Header(reader, false);
+
+    std::size_t saved = reader.Offset;
+    Type6StreamHeader h8 = ReadType6Header(reader, true);
+    std::size_t minBytes = (static_cast<std::size_t>(h8.NumKeys) + 1u) * frameIndexSize;
+    bool sane = h8.NumFrames <= maxFrames && reader.Has(minBytes);
+    if (sane)
+        return h8;
+
+    reader.Offset = saved;
+    return ReadType6Header(reader, false);
+}
+
+std::uint32_t ReadBitsLSB(std::span<const std::uint8_t> data, std::size_t bitOffset, std::size_t bitCount)
+{
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < bitCount; ++i)
+    {
+        std::size_t bitIndex = bitOffset + i;
+        std::size_t byteIndex = bitIndex / 8;
+        std::size_t bitInByte = bitIndex % 8;
+        if (byteIndex >= data.size())
+            break;
+        if (data[byteIndex] & (1u << bitInByte))
+            value |= (1u << i);
+    }
+    return value;
+}
+
+std::uint32_t ReadBitsMSB(std::span<const std::uint8_t> data, std::size_t bitOffset, std::size_t bitCount)
+{
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < bitCount; ++i)
+    {
+        std::size_t bitIndex = bitOffset + i;
+        std::size_t byteIndex = bitIndex / 8;
+        std::size_t bitInByte = 7 - (bitIndex % 8);
+        if (byteIndex >= data.size())
+            break;
+        if (data[byteIndex] & (1u << bitInByte))
+            value |= (1u << (bitCount - 1 - i));
+    }
+    return value;
+}
+
+std::size_t Align4(std::size_t offset)
+{
+    return (offset + 3u) & ~static_cast<std::size_t>(3u);
+}
+
+std::size_t Align2(std::size_t offset)
+{
+    return (offset + 1u) & ~static_cast<std::size_t>(1u);
+}
+
+std::size_t ComputeType6MaskWordCount(int numBones, int numUvBones, int numFloatStreams)
+{
+    std::size_t bits = static_cast<std::size_t>(numBones + numUvBones) * 4u +
+                       static_cast<std::size_t>(numFloatStreams);
+    return (bits + 31u) >> 5;
+}
+
+std::uint32_t ReadMaskValue(std::span<const std::uint8_t> data,
+                            std::size_t offset,
+                            int entrySize,
+                            bool bigEndian)
+{
+    if (entrySize == 1)
+        return static_cast<std::uint8_t>(data[offset]);
+    if (entrySize == 2)
+    {
+        std::uint16_t a = data[offset + 0];
+        std::uint16_t b = data[offset + 1];
+        return bigEndian ? static_cast<std::uint16_t>((a << 8) | b)
+                         : static_cast<std::uint16_t>(a | (b << 8));
+    }
+    std::uint32_t b0 = data[offset + 0];
+    std::uint32_t b1 = data[offset + 1];
+    std::uint32_t b2 = data[offset + 2];
+    std::uint32_t b3 = data[offset + 3];
+    return bigEndian ? ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+                     : (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+}
+
+bool ReadPackedNibbleMasks(std::span<const std::uint8_t> data,
+                           std::size_t startOffset,
+                           int numBones,
+                           std::size_t maskWordCount,
+                           bool bigEndian,
+                           std::vector<std::uint32_t>& outMasks,
+                           std::size_t& outMaskBytes)
+{
+    outMasks.clear();
+    outMasks.reserve(static_cast<std::size_t>(numBones));
+    std::size_t maskBytes = maskWordCount * 4u;
+    if (startOffset + maskBytes > data.size())
+        return false;
+    for (int i = 0; i < numBones; ++i)
+    {
+        std::size_t dwordIndex = static_cast<std::size_t>(i) / 8u;
+        std::size_t nibbleIndex = static_cast<std::size_t>(i) % 8u;
+        std::size_t off = startOffset + dwordIndex * 4u;
+        std::uint32_t dword = ReadMaskValue(data, off, 4, bigEndian);
+        outMasks.push_back((dword >> (nibbleIndex * 4u)) & 0xFu);
+    }
+    outMaskBytes = maskBytes;
+    return true;
+}
+
+bool TryParseType6Block(std::span<const std::uint8_t> data,
+                        std::size_t startOffset,
+                        std::size_t endOffset,
+                        int type,
+                        int numBones,
+                        int numFrames,
+                        int numUvBones,
+                        int numFloatStreams,
+                        bool bigEndian)
+{
+    if (startOffset >= endOffset || endOffset > data.size())
+        return false;
+
+    bool smallHeader = (type == 0x07 || type == 0x0A);
+    std::size_t frameIndexSize = (type == 0x07 || type == 0x0A) ? 1u : 2u;
+    std::size_t factorSize = 0;
+    if (type == 0x08)
+        factorSize = 4;
+    else if (type == 0x09 || type == 0x0A)
+        factorSize = 1;
+    else
+        factorSize = 2;
+
+    Type6Reader reader{data, bigEndian, startOffset};
+    std::vector<std::uint32_t> masks;
+    std::size_t maskBytes = 0;
+    std::size_t maskWords = ComputeType6MaskWordCount(numBones, numUvBones, numFloatStreams);
+    if (!ReadPackedNibbleMasks(data, startOffset, numBones, maskWords, bigEndian, masks, maskBytes))
+        return false;
+    reader.Offset = startOffset + maskBytes;
+    bool anySet = false;
+    for (std::uint32_t mask : masks)
+    {
+        if (mask != 0)
+        {
+            anySet = true;
+            break;
+        }
+    }
+    if (!anySet)
+        return false;
+    int nonZeroCount = 0;
+    for (std::uint32_t mask : masks)
+    {
+        if (mask != 0)
+            ++nonZeroCount;
+    }
+    if (nonZeroCount < (numBones / 2))
+        return false;
+
+    auto advanceStream = [&](int streamCount) -> bool {
+        for (int s = 0; s < streamCount; ++s)
+        {
+            Type6StreamHeader header = ReadType6Header(reader, smallHeader);
+            std::size_t frames = header.NumFrames;
+            std::size_t keys = header.NumKeys;
+            if (frames == 0)
+                frames = static_cast<std::size_t>(numFrames);
+            if (frames == 0 || frames > static_cast<std::size_t>(numFrames))
+                return false;
+            if (keys == 0 || keys > 4096u)
+                return false;
+            std::size_t bytes = (keys + 1u) * frameIndexSize;
+            std::size_t endOffset = Align2(reader.Offset + bytes);
+            if (!reader.Has(endOffset - reader.Offset))
+                return false;
+            reader.Offset = endOffset;
+        }
+        return true;
+    };
+
+    for (int bone = 0; bone < numBones; ++bone)
+    {
+        std::uint32_t maskBits = masks[static_cast<std::size_t>(bone)];
+        if (maskBits & 0x1u)
+            if (!advanceStream(3)) return false;
+        if (maskBits & 0x2u)
+            if (!advanceStream(4)) return false;
+        if (maskBits & 0x4u)
+            if (!advanceStream(3)) return false;
+        if (maskBits & 0x8u)
+            if (!advanceStream(1)) return false;
+    }
+
+    return reader.Offset == endOffset;
+}
+
+bool FindType6BlockStart(std::span<const std::uint8_t> data,
+                         std::size_t endOffset,
+                         int type,
+                         int numBones,
+                         int numFrames,
+                         int numUvBones,
+                         int numFloatStreams,
+                         bool bigEndian,
+                         std::size_t& outStart)
+{
+    if (endOffset > data.size())
+        return false;
+
+    std::size_t maskWords = ComputeType6MaskWordCount(numBones, numUvBones, numFloatStreams);
+    std::size_t maskBytes = maskWords * 4u;
+    if (endOffset < maskBytes)
+        return false;
+
+    std::size_t maxScan = 8 * 1024 * 1024;
+    std::size_t scanStart = (endOffset > maxScan) ? endOffset - maxScan : 0u;
+    std::size_t firstCandidate = (endOffset >= maskBytes) ? (endOffset - maskBytes) : 0u;
+    if (firstCandidate < scanStart)
+        firstCandidate = scanStart;
+
+    for (std::size_t candidate = firstCandidate; candidate + maskBytes <= endOffset; candidate += 4)
+    {
+        std::vector<std::uint32_t> masks;
+        std::size_t dummyBytes = 0;
+        if (!ReadPackedNibbleMasks(data, candidate, numBones, maskWords, bigEndian, masks, dummyBytes))
+            continue;
+        int nonZeroCount = 0;
+        for (std::uint32_t mask : masks)
+        {
+            if (mask != 0)
+                ++nonZeroCount;
+        }
+        if (nonZeroCount < (numBones / 2))
+            continue;
+
+        if (TryParseType6Block(data, candidate, endOffset, type, numBones, numFrames,
+                               numUvBones, numFloatStreams, bigEndian))
+        {
+            outStart = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool TryComputeType6End(std::span<const std::uint8_t> data,
+                        std::size_t startOffset,
+                        int type,
+                        int numBones,
+                        int numFrames,
+                        int numUvBones,
+                        int numFloatStreams,
+                        bool bigEndian,
+                        std::size_t& outEnd)
+{
+    if (startOffset >= data.size())
+        return false;
+
+    bool smallHeader = (type == 0x07 || type == 0x0A);
+    std::size_t frameIndexSize = (type == 0x07 || type == 0x0A) ? 1u : 2u;
+    std::size_t factorSize = 0;
+    if (type == 0x08)
+        factorSize = 4;
+    else if (type == 0x09 || type == 0x0A)
+        factorSize = 1;
+    else
+        factorSize = 2;
+
+    Type6Reader reader{data, bigEndian, startOffset};
+    std::vector<std::uint32_t> masks;
+    std::size_t maskBytes = 0;
+    std::size_t maskWords = ComputeType6MaskWordCount(numBones, numUvBones, numFloatStreams);
+    if (!ReadPackedNibbleMasks(data, startOffset, numBones, maskWords, bigEndian, masks, maskBytes))
+        return false;
+    reader.Offset = startOffset + maskBytes;
+    bool anySet = false;
+    for (std::uint32_t mask : masks)
+    {
+        if (mask != 0)
+        {
+            anySet = true;
+            break;
+        }
+    }
+    if (!anySet)
+        return false;
+    int nonZeroCount = 0;
+    for (std::uint32_t mask : masks)
+    {
+        if (mask != 0)
+            ++nonZeroCount;
+    }
+    if (nonZeroCount < (numBones / 2))
+        return false;
+
+    auto advanceStream = [&](int streamCount) -> bool {
+        for (int s = 0; s < streamCount; ++s)
+        {
+            Type6StreamHeader header = ReadType6Header(reader, smallHeader);
+            std::size_t frames = header.NumFrames;
+            std::size_t keys = header.NumKeys;
+            if (frames == 0)
+                frames = static_cast<std::size_t>(numFrames);
+            if (frames == 0 || frames > static_cast<std::size_t>(numFrames))
+                return false;
+            if (keys == 0 || keys > 4096u)
+                return false;
+            std::size_t bytes = (keys + 1u) * frameIndexSize;
+            std::size_t endOffset = Align2(reader.Offset + bytes);
+            if (!reader.Has(endOffset - reader.Offset))
+                return false;
+            reader.Offset = endOffset;
+        }
+        return true;
+    };
+
+    for (int bone = 0; bone < numBones; ++bone)
+    {
+        std::uint32_t maskBits = masks[static_cast<std::size_t>(bone)];
+        if (maskBits & 0x1u)
+            if (!advanceStream(3)) return false;
+        if (maskBits & 0x2u)
+            if (!advanceStream(4)) return false;
+        if (maskBits & 0x4u)
+            if (!advanceStream(3)) return false;
+        if (maskBits & 0x8u)
+            if (!advanceStream(1)) return false;
+    }
+
+    if (reader.Offset <= startOffset || reader.Offset > data.size())
+        return false;
+
+    outEnd = reader.Offset;
+    return true;
+}
+
+bool FindType6BlockAroundAnchor(std::span<const std::uint8_t> data,
+                                std::size_t anchor,
+                                int type,
+                                int numBones,
+                                int numFrames,
+                                int numUvBones,
+                                int numFloatStreams,
+                                bool bigEndian,
+                                std::size_t& outStart,
+                                std::size_t& outEnd)
+{
+    if (data.empty() || anchor > data.size())
+        return false;
+    std::size_t maskWords = ComputeType6MaskWordCount(numBones, numUvBones, numFloatStreams);
+    std::size_t maskBytes = maskWords * 4u;
+    if (maskBytes == 0 || maskBytes > data.size())
+        return false;
+
+    std::size_t window = 256u * 1024u;
+    std::size_t start = (anchor > window) ? (anchor - window) : 0u;
+    std::size_t end = std::min(anchor + window, data.size());
+    if (end < start + maskBytes)
+        return false;
+
+    bool smallHeader = (type == 0x07 || type == 0x0A);
+    auto tryCandidate = [&](std::size_t candidate) -> bool {
+        std::vector<std::uint32_t> masks;
+        std::size_t dummyBytes = 0;
+        if (!ReadPackedNibbleMasks(data, candidate, numBones, maskWords, bigEndian, masks, dummyBytes))
+            return false;
+        int nonZero = 0;
+        for (std::uint32_t mask : masks)
+        {
+            if (mask != 0)
+                ++nonZero;
+        }
+        if (nonZero < (numBones / 2))
+            return false;
+
+        std::size_t headerOff = candidate + maskBytes;
+        if (headerOff + (smallHeader ? 2u : 4u) > data.size())
+            return false;
+        std::uint32_t hFrames = 0;
+        std::uint32_t hKeys = 0;
+        if (smallHeader)
+        {
+            hFrames = data[headerOff + 0];
+            hKeys = data[headerOff + 1];
+        }
+        else
+        {
+            hFrames = data[headerOff + 0] | (static_cast<std::uint32_t>(data[headerOff + 1]) << 8);
+            hKeys = data[headerOff + 2] | (static_cast<std::uint32_t>(data[headerOff + 3]) << 8);
+        }
+        if (hFrames == 0 || hFrames > static_cast<std::uint32_t>(numFrames))
+            return false;
+        if (hKeys == 0 || hKeys > 4096u)
+            return false;
+
+        std::size_t computedEnd = 0;
+        if (TryComputeType6End(data, candidate, type, numBones, numFrames,
+                               numUvBones, numFloatStreams, bigEndian, computedEnd))
+        {
+            outStart = candidate;
+            outEnd = computedEnd;
+            return true;
+        }
+        if (hKeys <= 1024u)
+        {
+            outStart = candidate;
+            outEnd = data.size();
+            return true;
+        }
+        return false;
+    };
+
+    std::size_t step = 4u;
+    for (std::size_t candidate = anchor; candidate >= start; candidate -= step)
+    {
+        if (candidate + maskBytes <= end && tryCandidate(candidate))
+            return true;
+        if (candidate == 0)
+            break;
+    }
+    for (std::size_t candidate = anchor + step;
+         candidate + maskBytes <= end;
+         candidate += step)
+    {
+        if (tryCandidate(candidate))
+            return true;
+    }
+    return false;
+}
+
+bool FindType6StreamStartAroundAnchor(std::span<const std::uint8_t> data,
+                                      std::size_t anchor,
+                                      int type,
+                                      int numFrames,
+                                      bool bigEndian,
+                                      std::size_t& outStart)
+{
+    if (data.empty() || anchor > data.size())
+        return false;
+    bool smallHeader = (type == 0x07 || type == 0x0A);
+    std::size_t step = smallHeader ? 2u : 4u;
+    std::size_t window = 4u * 1024u;
+    std::size_t start = (anchor > window) ? (anchor - window) : 0u;
+    std::size_t end = std::min(anchor + window, data.size());
+
+    auto readHeader = [&](std::size_t offset, std::uint32_t& frames, std::uint32_t& keys) -> bool {
+        if (offset + step > data.size())
+            return false;
+        if (smallHeader)
+        {
+            frames = data[offset + 0];
+            keys = data[offset + 1];
+        }
+        else
+        {
+            if (bigEndian)
+            {
+                frames = (static_cast<std::uint32_t>(data[offset + 0]) << 8) | data[offset + 1];
+                keys = (static_cast<std::uint32_t>(data[offset + 2]) << 8) | data[offset + 3];
+            }
+            else
+            {
+                frames = data[offset + 0] | (static_cast<std::uint32_t>(data[offset + 1]) << 8);
+                keys = data[offset + 2] | (static_cast<std::uint32_t>(data[offset + 3]) << 8);
+            }
+        }
+        return true;
+    };
+
+    for (std::size_t offset = anchor; offset >= start; offset -= step)
+    {
+        std::uint32_t frames = 0;
+        std::uint32_t keys = 0;
+        if (readHeader(offset, frames, keys) && frames > 0 && frames <= static_cast<std::uint32_t>(numFrames) &&
+            keys > 0 && keys <= 4096u)
+        {
+            outStart = offset;
+            return true;
+        }
+        if (offset == 0)
+            break;
+    }
+    for (std::size_t offset = anchor + step; offset + step <= end; offset += step)
+    {
+        std::uint32_t frames = 0;
+        std::uint32_t keys = 0;
+        if (readHeader(offset, frames, keys) && frames > 0 && frames <= static_cast<std::uint32_t>(numFrames) &&
+            keys > 0 && keys <= 4096u)
+        {
+            outStart = offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FindType6StreamStartWithMasks(std::span<const std::uint8_t> data,
+                                   std::size_t anchor,
+                                   int type,
+                                   int numBones,
+                                   int numFrames,
+                                   std::vector<int> const& channelMasks,
+                                   bool bigEndian,
+                                   std::size_t& outStart)
+{
+    if (data.empty() || anchor > data.size())
+        return false;
+    bool smallHeader = (type == 0x07 || type == 0x0A);
+    std::size_t frameIndexSize = (type == 0x07 || type == 0x0A) ? 1u : 2u;
+    std::size_t factorSize = 0;
+    if (type == 0x08)
+        factorSize = 4;
+    else if (type == 0x09 || type == 0x0A)
+        factorSize = 1;
+    else
+        factorSize = 2;
+
+    std::vector<std::uint32_t> masks;
+    masks.reserve(static_cast<std::size_t>(numBones));
+    for (int bone = 0; bone < numBones; ++bone)
+    {
+        std::size_t wordIndex = static_cast<std::size_t>(bone) / 8u;
+        std::size_t nibbleIndex = static_cast<std::size_t>(bone) % 8u;
+        std::uint32_t word = wordIndex < channelMasks.size()
+            ? static_cast<std::uint32_t>(channelMasks[wordIndex])
+            : 0u;
+        masks.push_back((word >> (nibbleIndex * 4u)) & 0xFu);
+    }
+
+    std::size_t step = smallHeader ? 2u : 4u;
+    std::size_t window = 64u * 1024u;
+    std::size_t start = (anchor > window) ? (anchor - window) : 0u;
+    std::size_t end = std::min(anchor + window, data.size());
+
+    for (std::size_t candidate = anchor; candidate >= start; candidate -= step)
+    {
+        Type6Reader reader{data, bigEndian, candidate};
+        bool ok = true;
+        for (int bone = 0; bone < numBones && ok; ++bone)
+        {
+            std::uint32_t maskBits = masks[static_cast<std::size_t>(bone)];
+            int streamCounts[4] = {3, 4, 3, 1};
+            for (int channel = 0; channel < 4 && ok; ++channel)
+            {
+                if ((maskBits & (1u << channel)) == 0)
+                    continue;
+                for (int s = 0; s < streamCounts[channel] && ok; ++s)
+                {
+                    if (!reader.Has(smallHeader ? 2u : 4u))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    Type6StreamHeader header = ReadType6Header(reader, smallHeader);
+                    if (header.NumFrames == 0 || header.NumFrames > static_cast<std::uint32_t>(numFrames))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    if (header.NumKeys == 0 || header.NumKeys > 4096u)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    std::size_t bytes = static_cast<std::size_t>(header.NumFrames) * (frameIndexSize + factorSize);
+                    reader.Offset += bytes;
+                    reader.Offset = Align4(reader.Offset);
+                    reader.Offset += 8;
+                    std::size_t packedBytes = (static_cast<std::size_t>(header.NumKeys) * 16 + 7) / 8;
+                    reader.Offset += packedBytes;
+                    reader.Offset = Align4(reader.Offset);
+                    if (reader.Offset > data.size())
+                        ok = false;
+                }
+            }
+        }
+        if (ok)
+        {
+            outStart = candidate;
+            return true;
+        }
+        if (candidate == 0)
+            break;
+    }
+    for (std::size_t candidate = anchor + step; candidate + step <= end; candidate += step)
+    {
+        Type6Reader reader{data, bigEndian, candidate};
+        bool ok = true;
+        for (int bone = 0; bone < numBones && ok; ++bone)
+        {
+            std::uint32_t maskBits = masks[static_cast<std::size_t>(bone)];
+            int streamCounts[4] = {3, 4, 3, 1};
+            for (int channel = 0; channel < 4 && ok; ++channel)
+            {
+                if ((maskBits & (1u << channel)) == 0)
+                    continue;
+                for (int s = 0; s < streamCounts[channel] && ok; ++s)
+                {
+                    if (!reader.Has(smallHeader ? 2u : 4u))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    Type6StreamHeader header = ReadType6Header(reader, smallHeader);
+                    if (header.NumFrames == 0 || header.NumFrames > static_cast<std::uint32_t>(numFrames))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    if (header.NumKeys == 0 || header.NumKeys > 4096u)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    std::size_t bytes = static_cast<std::size_t>(header.NumFrames) * (frameIndexSize + factorSize);
+                    reader.Offset += bytes;
+                    reader.Offset = Align4(reader.Offset);
+                    reader.Offset += 8;
+                    std::size_t packedBytes = (static_cast<std::size_t>(header.NumKeys) * 16 + 7) / 8;
+                    reader.Offset += packedBytes;
+                    reader.Offset = Align4(reader.Offset);
+                    if (reader.Offset > data.size())
+                        ok = false;
+                }
+            }
+        }
+        if (ok)
+        {
+            outStart = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FindType6StreamStartByMaskBytes(std::span<const std::uint8_t> data,
+                                     std::size_t anchor,
+                                     int type,
+                                     int numBones,
+                                     int numFrames,
+                                     bool bigEndian,
+                                     std::size_t& outStart)
+{
+    if (data.empty() || anchor > data.size())
+        return false;
+    bool smallHeader = (type == 0x07 || type == 0x0A);
+    std::size_t step = smallHeader ? 2u : 4u;
+    std::size_t window = 4u * 1024u;
+    std::size_t start = (anchor > window) ? (anchor - window) : 0u;
+    std::size_t end = std::min(anchor + window, data.size());
+    std::size_t maskBytes = static_cast<std::size_t>(numBones);
+    if (maskBytes == 0 || maskBytes > data.size())
+        return false;
+
+    auto readHeader = [&](std::size_t offset, std::uint32_t& frames, std::uint32_t& keys) -> bool {
+        if (offset + step > data.size())
+            return false;
+        if (smallHeader)
+        {
+            frames = data[offset + 0];
+            keys = data[offset + 1];
+        }
+        else
+        {
+            if (bigEndian)
+            {
+                frames = (static_cast<std::uint32_t>(data[offset + 0]) << 8) | data[offset + 1];
+                keys = (static_cast<std::uint32_t>(data[offset + 2]) << 8) | data[offset + 3];
+            }
+            else
+            {
+                frames = data[offset + 0] | (static_cast<std::uint32_t>(data[offset + 1]) << 8);
+                keys = data[offset + 2] | (static_cast<std::uint32_t>(data[offset + 3]) << 8);
+            }
+        }
+        return true;
+    };
+
+    auto validMaskRun = [&](std::size_t candidate) -> bool {
+        if (candidate + maskBytes > data.size())
+            return false;
+        int nonZero = 0;
+        for (int i = 0; i < numBones; ++i)
+        {
+            std::uint8_t v = data[candidate + static_cast<std::size_t>(i)];
+            if ((v & 0xFu) != 0)
+                ++nonZero;
+        }
+        return nonZero >= (numBones / 2);
+    };
+
+    std::size_t best = 0;
+    std::uint32_t bestFrames = 0;
+    for (std::size_t candidate = start; candidate + maskBytes <= end; candidate += step)
+    {
+        if (!validMaskRun(candidate))
+            continue;
+        std::uint32_t frames = 0;
+        std::uint32_t keys = 0;
+        std::size_t headerOff = candidate + maskBytes;
+        if (readHeader(headerOff, frames, keys) && frames > 0 && frames <= static_cast<std::uint32_t>(numFrames) &&
+            keys > 0 && keys <= 4096u)
+        {
+            if (frames > bestFrames)
+            {
+                bestFrames = frames;
+                best = headerOff;
+            }
+        }
+    }
+    if (bestFrames > 0)
+    {
+        outStart = best;
+        return true;
+    }
+    return false;
 }
 } // namespace
 
@@ -1106,6 +1928,14 @@ int StreamOverride::GetSizeForSerialization() const
     return 0x8;
 }
 
+void SuAnimationQuantization::Resize(std::size_t bones)
+{
+    Translation.assign(bones, {});
+    Rotation.assign(bones, {});
+    Scale.assign(bones, {});
+    Visibility.assign(bones, {});
+}
+
 void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
 {
     int start = static_cast<int>(context.Position);
@@ -1131,138 +1961,114 @@ void SuAnimation::Load(SlLib::Serialization::ResourceLoadContext& context)
     if (Type == 0)
         return;
 
-    if (Type == 6)
+    if (Type >= 6 && Type <= 10)
     {
-        int bits = NumFloatStreams + 0x1F + (NumUvBones + NumBones) * 4;
-        int numDoubleWords = ClampCount((bits + ((bits >> 0x1F) & 0x1F)) >> 5, "Animation6.Masks");
-        if (numDoubleWords == 0)
-            return;
-        int wordDataOffset = 0x18 + (numDoubleWords * 4);
-        int paramData = context.ReadInt32();
-        if (!sane(paramData, static_cast<int>(context.Data().size())))
+        bool paramGpu = false;
+        int paramData = context.ReadPointer(paramGpu);
+        if (!paramGpu && !sane(paramData, static_cast<int>(context.Data().size())))
         {
             std::cerr << "[Forest] Animation type 6 invalid data pointer: " << paramData << std::endl;
             return;
         }
+        Type6BigEndian = context.Platform ? context.Platform->IsBigEndian() : false;
+        Type6Block.clear();
+        SamplesDecoded = false;
+        Type6DataPtr = nullptr;
+        Type6DataSize = 0;
+        Type6GpuDataPtr = nullptr;
+        Type6GpuDataSize = 0;
+        Type6ParamDataIsGpu = paramGpu;
+        Type6ParamDataOffset = paramData;
+        Type6Anchor = 0;
+        Type6BlockStart = 0;
+        Type6BlockEnd = 0;
+        Type6DebugWindow.clear();
+        Type6DebugWindowOffset = 0;
 
         ChannelMasks.clear();
-        ChannelMasks.reserve(static_cast<std::size_t>(numDoubleWords));
-        for (int i = 0; i < numDoubleWords; ++i)
-            ChannelMasks.push_back(context.ReadInt32());
-
-        int dataSize = 0;
-        int maskIndex = 0;
-        int headerStart = start + wordDataOffset;
-        int headerOffset = headerStart;
-        std::uint32_t mask = maskIndex < static_cast<int>(ChannelMasks.size())
-            ? static_cast<std::uint32_t>(ChannelMasks[maskIndex++])
-            : 0u;
-        int remaining = 8;
-
-        for (int i = 0; i < NumBones; ++i)
-        {
-            if ((mask & 1) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                dataSize = (dataSize + count * 0x12 + 0x11) & ~3;
-                headerOffset += 4 + (count * 2);
-            }
-            if ((mask & 2) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                dataSize = (dataSize + count * 0x18 + 0x13) & ~3;
-                headerOffset += 4 + (count * 2);
-            }
-            if ((mask & 4) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                dataSize = (dataSize + count * 0x12 + 0x11) & ~3;
-                headerOffset += 4 + (count * 2);
-            }
-            if ((mask & 8) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                headerOffset += 4 + (count * 2);
-            }
-
-            mask >>= 4;
-            remaining -= 1;
-            if (remaining == 0)
-            {
-                mask = maskIndex < static_cast<int>(ChannelMasks.size())
-                    ? static_cast<std::uint32_t>(ChannelMasks[maskIndex++])
-                    : 0u;
-                remaining = 8;
-            }
-        }
-
-        for (int i = 0; i < NumUvBones; ++i)
-        {
-            if ((mask & 1) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                dataSize = (dataSize + count * 0xC + 0xF) & ~3;
-                headerOffset += 4 + (count * 2);
-            }
-            if ((mask & 2) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                dataSize = (dataSize + count * 0x18 + 0x13) & ~3;
-                headerOffset += 4 + (count * 2);
-            }
-            if ((mask & 4) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                dataSize = (dataSize + count * 0xC + 0xF) & ~3;
-                headerOffset += 4 + (count * 2);
-            }
-
-            mask >>= 4;
-            remaining -= 1;
-            if (remaining == 0)
-            {
-                mask = maskIndex < static_cast<int>(ChannelMasks.size())
-                    ? static_cast<std::uint32_t>(ChannelMasks[maskIndex++])
-                    : 0u;
-                remaining = 8;
-            }
-        }
-
-        remaining <<= 4;
-        for (int i = 0; i < NumFloatStreams; ++i)
-        {
-            if ((mask & 1) != 0)
-            {
-                int count = context.ReadInt16(static_cast<std::size_t>(headerOffset + 2));
-                dataSize = (dataSize + count * 0x6 + 0xD) & ~3;
-                headerOffset += 4 + (count * 2);
-            }
-
-            mask >>= 1;
-            remaining -= 1;
-            if (remaining == 0)
-            {
-                mask = maskIndex < static_cast<int>(ChannelMasks.size())
-                    ? static_cast<std::uint32_t>(ChannelMasks[maskIndex++])
-                    : 0u;
-                remaining = 32;
-            }
-        }
-
-        int numFrameHeaders = ClampCount((headerOffset - headerStart) / 2, "Animation6.Headers");
-        int numPackedShorts = ClampCount(dataSize / 2, "Animation6.PackedShorts");
-        if (numFrameHeaders == 0 || numPackedShorts == 0)
-            return;
-
         AnimStreams.clear();
-        AnimStreams.reserve(static_cast<std::size_t>(numFrameHeaders));
-        for (int i = 0; i < numFrameHeaders; ++i)
-            AnimStreams.push_back(context.ReadInt16());
-
         FrameData.clear();
-        FrameData.reserve(static_cast<std::size_t>(numPackedShorts));
-        for (int i = 0; i < numPackedShorts; ++i)
-            FrameData.push_back(context.ReadInt16(static_cast<std::size_t>(paramData + (i * 2))));
+
+        auto dataSpan = context.Data();
+        std::size_t anchor = static_cast<std::size_t>(paramData);
+        Type6DataPtr = dataSpan.data();
+        Type6DataSize = dataSpan.size();
+        auto gpuSpan = context.GpuData();
+        Type6GpuDataPtr = gpuSpan.data();
+        Type6GpuDataSize = gpuSpan.size();
+        std::size_t maskStart = static_cast<std::size_t>(start) + 0x18;
+        Type6Anchor = maskStart;
+        if (!dataSpan.empty())
+        {
+            std::size_t window = 256u * 1024u;
+            std::size_t windowStart = (maskStart > window) ? (maskStart - window) : 0u;
+            std::size_t windowEnd = std::min(maskStart + window, dataSpan.size());
+            if (windowEnd > windowStart)
+            {
+                Type6DebugWindow.assign(dataSpan.begin() + static_cast<std::ptrdiff_t>(windowStart),
+                                        dataSpan.begin() + static_cast<std::ptrdiff_t>(windowEnd));
+                Type6DebugWindowOffset = windowStart;
+            }
+        }
+
+        if (maskStart <= dataSpan.size())
+        {
+            std::size_t blockEnd = 0;
+            auto tryComputeBlock = [&](bool bigEndian, std::size_t candidate, std::size_t& outEnd) -> bool {
+                return TryComputeType6End(dataSpan, candidate, Type, NumBones, NumFrames,
+                                          NumUvBones, NumFloatStreams, bigEndian, outEnd);
+            };
+
+            bool found = tryComputeBlock(Type6BigEndian, maskStart, blockEnd);
+            if (!found)
+            {
+                bool otherEndian = !Type6BigEndian;
+                found = tryComputeBlock(otherEndian, maskStart, blockEnd);
+                if (found)
+                    Type6BigEndian = otherEndian;
+            }
+            if (!found)
+            {
+                std::size_t blockStart = 0;
+                if (FindType6BlockStart(dataSpan, maskStart, Type, NumBones, NumFrames,
+                                        NumUvBones, NumFloatStreams, Type6BigEndian, blockStart))
+                {
+                    found = tryComputeBlock(Type6BigEndian, blockStart, blockEnd);
+                    if (!found)
+                    {
+                        bool otherEndian = !Type6BigEndian;
+                        found = tryComputeBlock(otherEndian, blockStart, blockEnd);
+                        if (found)
+                            Type6BigEndian = otherEndian;
+                    }
+                    if (found)
+                        maskStart = blockStart;
+                }
+            }
+
+            if (found)
+            {
+                Type6MaskEntrySize = 0;
+                Type6BlockStart = maskStart;
+                Type6BlockEnd = blockEnd;
+                if (!paramGpu &&
+                    paramData > static_cast<int>(Type6BlockStart) &&
+                    paramData < static_cast<int>(Type6BlockEnd))
+                {
+                    Type6BlockEnd = static_cast<std::size_t>(paramData);
+                }
+                Type6Block.assign(dataSpan.begin() + static_cast<std::ptrdiff_t>(Type6BlockStart),
+                                  dataSpan.begin() + static_cast<std::ptrdiff_t>(Type6BlockEnd));
+            }
+        }
+
+        if (Type6Block.empty() && maskStart < dataSpan.size())
+        {
+            Type6MaskEntrySize = 0;
+            Type6BlockStart = maskStart;
+            Type6BlockEnd = dataSpan.size();
+            Type6Block.assign(dataSpan.begin() + static_cast<std::ptrdiff_t>(maskStart), dataSpan.end());
+        }
     }
     else if (Type == 1)
     {
@@ -1547,10 +2353,1259 @@ int SuAnimation::GetSizeForSerialization() const
     if (Type == 1)
         size += 0x4 + static_cast<int>(AnimStreams.size()) * 2 +
             static_cast<int>(ChannelMasks.size()) * 4 + (NumBones * 8);
-    else if (Type == 4 || Type == 6)
+    else if (Type == 4 || (Type >= 6 && Type <= 10))
         size += 0x4 + static_cast<int>(AnimStreams.size()) * 2 +
             static_cast<int>(ChannelMasks.size()) * 4;
     return size;
+}
+
+SuAnimationSample const* SuAnimation::GetSample(int frame, int bone) const
+{
+    if (frame < 0 || bone < 0)
+        return nullptr;
+    if (NumFrames <= 0 || NumBones <= 0)
+        return nullptr;
+    if (static_cast<std::size_t>(frame) >= static_cast<std::size_t>(NumFrames))
+        return nullptr;
+    if (static_cast<std::size_t>(bone) >= static_cast<std::size_t>(NumBones))
+        return nullptr;
+    if (Samples.size() != static_cast<std::size_t>(NumFrames) * static_cast<std::size_t>(NumBones))
+        return nullptr;
+    return &Samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                    static_cast<std::size_t>(bone)];
+}
+
+bool SuAnimation::DecodeType6Samples(SuRenderTree const& tree)
+{
+    if (Type < 0x06 || Type > 0x0A)
+        return false;
+    if (NumFrames <= 0 || NumBones <= 0)
+        return false;
+    if (Type6Block.empty())
+        return false;
+    std::span<const std::uint8_t> blockSpan{Type6Block.data(), Type6Block.size()};
+    std::span<const std::uint8_t> fullSpan{};
+    if (Type6ParamDataIsGpu)
+    {
+        if (Type6GpuDataPtr != nullptr && Type6GpuDataSize > 0)
+            fullSpan = std::span<const std::uint8_t>(Type6GpuDataPtr, Type6GpuDataSize);
+    }
+    else
+    {
+        if (Type6DataPtr != nullptr && Type6DataSize > 0)
+            fullSpan = std::span<const std::uint8_t>(Type6DataPtr, Type6DataSize);
+    }
+    bool debugDump = std::getenv("TYPE6_DUMP") != nullptr || std::getenv("DECODE_DEBUG") != nullptr;
+    if (SamplesDecoded && !debugDump)
+        return true;
+
+    auto initSamples = [&](std::vector<SuAnimationSample>& samples) {
+        samples.clear();
+        samples.resize(static_cast<std::size_t>(NumFrames) * static_cast<std::size_t>(NumBones));
+        for (int bone = 0; bone < NumBones; ++bone)
+        {
+            SlLib::Math::Vector4 t{};
+            SlLib::Math::Vector4 r{};
+            SlLib::Math::Vector4 s{1.0f, 1.0f, 1.0f, 1.0f};
+            if (static_cast<std::size_t>(bone) < tree.Translations.size())
+                t = tree.Translations[static_cast<std::size_t>(bone)];
+            if (static_cast<std::size_t>(bone) < tree.Rotations.size())
+                r = tree.Rotations[static_cast<std::size_t>(bone)];
+            if (static_cast<std::size_t>(bone) < tree.Scales.size())
+                s = tree.Scales[static_cast<std::size_t>(bone)];
+
+            for (int frame = 0; frame < NumFrames; ++frame)
+            {
+                auto& sample = samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                       static_cast<std::size_t>(bone)];
+                sample.Translation = t;
+                sample.Rotation = r;
+                sample.Scale = s;
+                sample.Visible = true;
+            }
+        }
+    };
+
+    auto decodeType6UsUs = [&](bool bigEndian,
+                               std::span<const std::uint8_t> streamData,
+                               std::size_t maskWords,
+                               std::span<const std::uint8_t> paramData,
+                               std::size_t paramOffset,
+                               std::vector<SuAnimationSample>& outSamples,
+                               SuAnimationQuantization& outQuant,
+                               std::vector<bool>& outHasRotation,
+                               int& outMaskNonZero,
+                               std::array<std::uint32_t, 4>& outMaskSample,
+                               int& outMaskScore) -> bool {
+        std::vector<std::uint32_t> masks;
+        std::size_t maskBytes = 0;
+        if (streamData.empty())
+            return false;
+        if (!ReadPackedNibbleMasks(streamData, 0, NumBones, maskWords, bigEndian, masks, maskBytes))
+            return false;
+
+        initSamples(outSamples);
+        outQuant.Resize(static_cast<std::size_t>(NumBones));
+        outHasRotation.assign(static_cast<std::size_t>(NumBones), false);
+        outMaskNonZero = 0;
+        int transCount = 0;
+        int rotCount = 0;
+        int scaleCount = 0;
+        int visCount = 0;
+        for (std::uint32_t m : masks)
+        {
+            if (m != 0)
+                ++outMaskNonZero;
+            if (m & 0x1u) ++transCount;
+            if (m & 0x2u) ++rotCount;
+            if (m & 0x4u) ++scaleCount;
+            if (m & 0x8u) ++visCount;
+        }
+        for (std::size_t i = 0; i < outMaskSample.size(); ++i)
+            outMaskSample[i] = (i < masks.size()) ? masks[i] : 0u;
+        outMaskScore = outMaskNonZero * 2 + transCount * 10 + scaleCount * 6 + visCount * 2 + rotCount;
+
+        auto readU16 = [&](std::span<const std::uint8_t> data, std::size_t& offset) -> std::uint16_t {
+            if (offset + 2 > data.size())
+                return 0;
+            std::uint16_t value = 0;
+            if (bigEndian)
+                value = static_cast<std::uint16_t>(data[offset] << 8 | data[offset + 1]);
+            else
+                value = static_cast<std::uint16_t>(data[offset] | (data[offset + 1] << 8));
+            offset += 2;
+            return value;
+        };
+        auto readS16At = [&](std::span<const std::uint8_t> data, std::size_t offset, bool useBigEndian) -> std::int16_t {
+            if (offset + 2 > data.size())
+                return 0;
+            std::uint16_t value = 0;
+            if (useBigEndian)
+                value = static_cast<std::uint16_t>(data[offset] << 8 | data[offset + 1]);
+            else
+                value = static_cast<std::uint16_t>(data[offset] | (data[offset + 1] << 8));
+            return static_cast<std::int16_t>(value);
+        };
+        auto readF32At = [&](std::span<const std::uint8_t> data, std::size_t offset, bool useBigEndian) -> float {
+            if (offset + 4 > data.size())
+                return 0.0f;
+            std::uint32_t raw = 0;
+            if (useBigEndian)
+                raw = (static_cast<std::uint32_t>(data[offset]) << 24) |
+                      (static_cast<std::uint32_t>(data[offset + 1]) << 16) |
+                      (static_cast<std::uint32_t>(data[offset + 2]) << 8) |
+                      static_cast<std::uint32_t>(data[offset + 3]);
+            else
+                raw = static_cast<std::uint32_t>(data[offset]) |
+                      (static_cast<std::uint32_t>(data[offset + 1]) << 8) |
+                      (static_cast<std::uint32_t>(data[offset + 2]) << 16) |
+                      (static_cast<std::uint32_t>(data[offset + 3]) << 24);
+            float value = 0.0f;
+            std::memcpy(&value, &raw, sizeof(value));
+            return value;
+        };
+
+        std::size_t streamOffset = maskBytes;
+        if (paramData.empty())
+            paramData = fullSpan.empty() ? blockSpan : fullSpan;
+        paramOffset = Align4(paramOffset);
+        const float invQuant = 1.0f / 32768.0f;
+
+        // Heuristic: param block endianness can differ from stream endianness.
+        // Pick the endian that yields reasonable min/delta.
+        bool paramBigEndian = bigEndian;
+        if (paramOffset + 8 <= paramData.size())
+        {
+            float minBe = readF32At(paramData, paramOffset, true);
+            float deltaBe = readF32At(paramData, paramOffset + 4, true);
+            float minLe = readF32At(paramData, paramOffset, false);
+            float deltaLe = readF32At(paramData, paramOffset + 4, false);
+            auto ok = [](float v) { return std::isfinite(v) && std::fabs(v) < 1.0e4f; };
+            bool beOk = ok(minBe) && ok(deltaBe) && deltaBe >= 0.0f;
+            bool leOk = ok(minLe) && ok(deltaLe) && deltaLe >= 0.0f;
+            if (!beOk && leOk)
+                paramBigEndian = false;
+            else if (!leOk && beOk)
+                paramBigEndian = true;
+            else if (leOk && beOk)
+            {
+                // Prefer the smaller magnitude pair.
+                float magBe = std::fabs(minBe) + std::fabs(deltaBe);
+                float magLe = std::fabs(minLe) + std::fabs(deltaLe);
+                if (magLe < magBe)
+                    paramBigEndian = false;
+            }
+        }
+
+        auto findKeyIndex = [&](std::vector<std::uint16_t> const& keyTimes, int frame) -> int {
+            int numKeys = static_cast<int>(keyTimes.size());
+            if (numKeys <= 0)
+                return 0;
+            if (numKeys < 5)
+            {
+                int idx = 0;
+                for (; idx < numKeys; ++idx)
+                {
+                    if (frame < static_cast<int>(keyTimes[static_cast<std::size_t>(idx)]))
+                        break;
+                }
+                if (idx >= numKeys)
+                    idx = numKeys - 1;
+                return idx;
+            }
+
+            int lastTime = static_cast<int>(keyTimes[static_cast<std::size_t>(numKeys - 1)]);
+            int idx = (lastTime > 0) ? (frame * numKeys) / lastTime : 0;
+            if (idx < 0)
+                idx = 0;
+            if (idx >= numKeys)
+                idx = numKeys - 1;
+            if (static_cast<int>(keyTimes[static_cast<std::size_t>(idx)]) <= frame)
+            {
+                while (idx + 1 < numKeys &&
+                       static_cast<int>(keyTimes[static_cast<std::size_t>(idx + 1)]) <= frame)
+                {
+                    ++idx;
+                }
+            }
+            else
+            {
+                while (idx > 0 &&
+                       static_cast<int>(keyTimes[static_cast<std::size_t>(idx - 1)]) > frame)
+                {
+                    --idx;
+                }
+            }
+            return idx;
+        };
+
+        auto decodeVecStream = [&](int boneIndex, int componentCount, int channel) {
+            std::size_t localStream = streamOffset;
+            std::uint16_t numFrames = readU16(streamData, localStream);
+            std::uint16_t numKeys = readU16(streamData, localStream);
+            if (numFrames == 0 || numKeys == 0)
+            {
+                streamOffset = localStream;
+                return;
+            }
+            std::vector<std::uint16_t> keyTimes;
+            keyTimes.reserve(numKeys);
+            for (std::size_t i = 0; i < numKeys; ++i)
+                keyTimes.push_back(readU16(streamData, localStream));
+            streamOffset = localStream;
+
+            paramOffset = Align4(paramOffset);
+            float minimum = readF32At(paramData, paramOffset, paramBigEndian);
+            float delta = readF32At(paramData, paramOffset + 4, paramBigEndian);
+            std::size_t baseSamples = paramOffset + 8;
+            std::size_t keyStrideBytes = static_cast<std::size_t>(componentCount) * 3u * 2u;
+            std::size_t tailOffset = baseSamples + static_cast<std::size_t>(numKeys) * keyStrideBytes;
+
+            for (int frame = 0; frame < NumFrames; ++frame)
+            {
+                int localFrame = frame % static_cast<int>(numFrames);
+                if (localFrame < 0)
+                    localFrame = 0;
+                int k = findKeyIndex(keyTimes, localFrame);
+                if (k < 0)
+                    k = 0;
+                if (k >= static_cast<int>(numKeys))
+                    k = static_cast<int>(numKeys) - 1;
+
+                int prevTime = (k == 0) ? 0 : static_cast<int>(keyTimes[static_cast<std::size_t>(k - 1)]);
+                int nextTime = static_cast<int>(keyTimes[static_cast<std::size_t>(k)]);
+                int denom = nextTime - prevTime;
+                float t = 0.0f;
+                if (denom > 0)
+                    t = static_cast<float>(localFrame - prevTime) / static_cast<float>(denom);
+                float ts = t * t;
+                float tc = ts * t;
+
+                SlLib::Math::Vector4 value{};
+                for (int c = 0; c < componentCount; ++c)
+                {
+                    auto readSampleAt = [&](int keyIndex, int sampleSet) -> float {
+                        std::size_t off = baseSamples +
+                                          static_cast<std::size_t>(keyIndex) * keyStrideBytes +
+                                          static_cast<std::size_t>(sampleSet) *
+                                              static_cast<std::size_t>(componentCount) * 2u +
+                                          static_cast<std::size_t>(c) * 2u;
+                        std::int16_t raw = readS16At(paramData, off, paramBigEndian);
+                        float normalized = static_cast<float>(raw) * invQuant;
+                        return minimum + delta * normalized;
+                    };
+                    auto readTail = [&]() -> float {
+                        std::size_t off = tailOffset + static_cast<std::size_t>(c) * 2u;
+                        std::int16_t raw = readS16At(paramData, off, paramBigEndian);
+                        float normalized = static_cast<float>(raw) * invQuant;
+                        return minimum + delta * normalized;
+                    };
+
+                    float p0 = readSampleAt(k, 0);
+                    float p1 = readSampleAt(k, 1);
+                    float p2 = readSampleAt(k, 2);
+                    float p3 = (k + 1 < static_cast<int>(numKeys)) ? readSampleAt(k + 1, 0) : readTail();
+                    float v = (((p3 - p2) - p1) - p0) * tc + p2 * ts + p1 * t + p0;
+                    if (c == 0)
+                        value.X = v;
+                    else if (c == 1)
+                        value.Y = v;
+                    else if (c == 2)
+                        value.Z = v;
+                    else if (c == 3)
+                        value.W = v;
+                }
+
+                auto& sample = outSamples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                       static_cast<std::size_t>(boneIndex)];
+                auto finiteVec = [&](SlLib::Math::Vector4 const& v) -> bool {
+                    return std::isfinite(v.X) && std::isfinite(v.Y) && std::isfinite(v.Z) && std::isfinite(v.W);
+                };
+                if (!finiteVec(value))
+                    return;
+                if (channel == 0)
+                    sample.Translation = value;
+                else if (channel == 1)
+                {
+                    // Avoid zero-length quaternions that can poison skinning.
+                    float len2 = value.X * value.X + value.Y * value.Y + value.Z * value.Z + value.W * value.W;
+                    if (len2 > 1.0e-8f)
+                        sample.Rotation = value;
+                }
+                else if (channel == 2)
+                    sample.Scale = value;
+            }
+
+            std::size_t advance = Align4(((static_cast<std::size_t>(numKeys) *
+                                           static_cast<std::size_t>(componentCount) * 3u +
+                                           static_cast<std::size_t>(componentCount)) *
+                                          2u + 8u));
+            paramOffset += advance;
+        };
+
+        auto decodeVisibility = [&](int boneIndex) {
+            std::size_t localStream = streamOffset;
+            std::uint16_t numFrames = readU16(streamData, localStream);
+            std::uint16_t numKeys = readU16(streamData, localStream);
+            if (numFrames == 0 || numKeys == 0)
+            {
+                streamOffset = localStream;
+                return;
+            }
+            std::vector<std::uint16_t> keyTimes;
+            keyTimes.reserve(numKeys);
+            for (std::size_t i = 0; i < numKeys; ++i)
+                keyTimes.push_back(readU16(streamData, localStream));
+            streamOffset = localStream;
+
+            for (int frame = 0; frame < NumFrames; ++frame)
+            {
+                int localFrame = frame % static_cast<int>(numFrames);
+                if (localFrame < 0)
+                    localFrame = 0;
+                int k = findKeyIndex(keyTimes, localFrame);
+                bool visible = (k & 1) == 0;
+                auto& sample = outSamples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                       static_cast<std::size_t>(boneIndex)];
+                sample.Visible = visible;
+            }
+        };
+
+        for (int bone = 0; bone < NumBones; ++bone)
+        {
+            std::uint32_t mask = (static_cast<std::size_t>(bone) < masks.size())
+                                     ? masks[static_cast<std::size_t>(bone)]
+                                     : 0u;
+            if ((mask & 1u) != 0)
+                decodeVecStream(bone, 3, 0);
+            if ((mask & 2u) != 0)
+            {
+                outHasRotation[static_cast<std::size_t>(bone)] = true;
+                decodeVecStream(bone, 4, 1);
+                for (int frame = 0; frame < NumFrames; ++frame)
+                {
+                    auto& sample = outSamples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                           static_cast<std::size_t>(bone)];
+                    float len = std::sqrt(sample.Rotation.X * sample.Rotation.X +
+                                          sample.Rotation.Y * sample.Rotation.Y +
+                                          sample.Rotation.Z * sample.Rotation.Z +
+                                          sample.Rotation.W * sample.Rotation.W);
+                    if (len > 0.0f)
+                    {
+                        sample.Rotation.X /= len;
+                        sample.Rotation.Y /= len;
+                        sample.Rotation.Z /= len;
+                        sample.Rotation.W /= len;
+                    }
+                }
+            }
+            if ((mask & 4u) != 0)
+                decodeVecStream(bone, 3, 2);
+            if ((mask & 8u) != 0)
+                decodeVisibility(bone);
+        }
+
+        return true;
+    };
+
+    auto scoreSamples = [&](std::vector<SuAnimationSample> const& samples,
+                            std::vector<bool> const& hasRotation) {
+        auto isFinite = [](float v) { return std::isfinite(v); };
+        std::array<int, 4> frameSamples{0, NumFrames / 3, (NumFrames * 2) / 3, std::max(0, NumFrames - 1)};
+        std::array<int, 4> boneSamples{0, NumBones / 3, (NumBones * 2) / 3, std::max(0, NumBones - 1)};
+        double score = 0.0;
+        for (int bone : boneSamples)
+        {
+            if (bone < 0 || bone >= NumBones)
+                continue;
+            for (int frame : frameSamples)
+            {
+                if (frame < 0 || frame >= NumFrames)
+                    continue;
+                auto const& sample = samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                             static_cast<std::size_t>(bone)];
+                bool ok = true;
+                float values[] = {sample.Translation.X, sample.Translation.Y, sample.Translation.Z,
+                                  sample.Rotation.X, sample.Rotation.Y, sample.Rotation.Z, sample.Rotation.W,
+                                  sample.Scale.X, sample.Scale.Y, sample.Scale.Z};
+                for (float v : values)
+                {
+                    if (!isFinite(v))
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok)
+                {
+                    score -= 1000.0;
+                    continue;
+                }
+
+                float tAbs = std::max({std::fabs(sample.Translation.X),
+                                       std::fabs(sample.Translation.Y),
+                                       std::fabs(sample.Translation.Z)});
+                if (tAbs < 1e5f)
+                    score += 2.0;
+                else
+                    score -= (tAbs > 1e6f) ? 100.0 : 2.0;
+
+                float sMin = std::min({sample.Scale.X, sample.Scale.Y, sample.Scale.Z});
+                float sMax = std::max({sample.Scale.X, sample.Scale.Y, sample.Scale.Z});
+                if (sMin > 0.001f && sMax < 100.0f)
+                    score += 2.0;
+                else
+                    score -= 2.0;
+
+                if (hasRotation[static_cast<std::size_t>(bone)])
+                {
+                    float len = std::sqrt(sample.Rotation.X * sample.Rotation.X +
+                                          sample.Rotation.Y * sample.Rotation.Y +
+                                          sample.Rotation.Z * sample.Rotation.Z +
+                                          sample.Rotation.W * sample.Rotation.W);
+                    if (len > 0.1f && len < 10.0f)
+                        score += 2.0;
+                    else
+                        score -= 2.0;
+                }
+            }
+        }
+        // Dense sanity check to avoid selecting variants with huge translations or zero scales.
+        double maxAbsT = 0.0;
+        double minScale = std::numeric_limits<double>::infinity();
+        double maxScale = 0.0;
+        int nonFinite = 0;
+        for (int frame = 0; frame < NumFrames; ++frame)
+        {
+            for (int bone = 0; bone < NumBones; ++bone)
+            {
+                auto const& s = samples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                        static_cast<std::size_t>(bone)];
+                float values[] = {s.Translation.X, s.Translation.Y, s.Translation.Z,
+                                  s.Rotation.X, s.Rotation.Y, s.Rotation.Z, s.Rotation.W,
+                                  s.Scale.X, s.Scale.Y, s.Scale.Z};
+                for (float v : values)
+                    if (!std::isfinite(v))
+                        ++nonFinite;
+                double tAbs = std::max({std::fabs(static_cast<double>(s.Translation.X)),
+                                        std::fabs(static_cast<double>(s.Translation.Y)),
+                                        std::fabs(static_cast<double>(s.Translation.Z))});
+                if (tAbs > maxAbsT)
+                    maxAbsT = tAbs;
+                double sMin = std::min({static_cast<double>(s.Scale.X),
+                                        static_cast<double>(s.Scale.Y),
+                                        static_cast<double>(s.Scale.Z)});
+                double sMax = std::max({static_cast<double>(s.Scale.X),
+                                        static_cast<double>(s.Scale.Y),
+                                        static_cast<double>(s.Scale.Z)});
+                if (sMin < minScale)
+                    minScale = sMin;
+                if (sMax > maxScale)
+                    maxScale = sMax;
+            }
+        }
+        if (nonFinite > 0)
+            score -= 10000.0;
+        if (maxAbsT > 1.0e5)
+            score -= 1000.0 + std::log10(maxAbsT) * 50.0;
+        if (minScale <= 0.0)
+            score -= 500.0;
+        else if (minScale < 0.001)
+            score -= 50.0;
+        if (maxScale > 100.0)
+            score -= 50.0;
+        return score;
+    };
+
+    if (Type == 0x06)
+    {
+        auto dumpHex = [&](char const* label, std::span<const std::uint8_t> data, std::size_t offset) {
+            if (data.empty() || offset >= data.size())
+                return;
+            std::size_t count = std::min<std::size_t>(0x40u, data.size() - offset);
+            std::cout << "[Type6Dump] " << label << " off=0x" << std::hex << offset << std::dec << " bytes=" << count;
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                if ((i % 16u) == 0)
+                    std::cout << "\n[Type6Dump]  ";
+                std::cout << std::hex << std::setw(2) << std::setfill('0')
+                          << static_cast<unsigned>(data[offset + i]) << " ";
+            }
+            std::cout << std::dec << std::setfill(' ') << std::endl;
+        };
+        auto selectMaskOffset = [&](std::span<const std::uint8_t> data,
+                                    std::size_t maskWords,
+                                    bool bigEndian) -> std::size_t {
+            std::array<std::size_t, 15> offsets{
+                0u,  0x8u, 0x10u, 0x14u, 0x18u, 0x1cu, 0x20u, 0x24u,
+                0x28u, 0x2cu, 0x30u, 0x34u, 0x38u, 0x3cu, 0x40u};
+            std::size_t bestOffset = 0;
+            int bestScore = std::numeric_limits<int>::min();
+            int bestNonZero = 0;
+            int bestTrans = 0;
+            int bestRot = 0;
+            int bestScale = 0;
+            int bestVis = 0;
+            for (std::size_t off : offsets)
+            {
+                if (off >= data.size())
+                    continue;
+                std::vector<std::uint32_t> masks;
+                std::size_t maskBytes = 0;
+                if (!ReadPackedNibbleMasks(data, off, NumBones, maskWords, bigEndian, masks, maskBytes))
+                    continue;
+                int nonZero = 0;
+                int transCount = 0;
+                int rotCount = 0;
+                int scaleCount = 0;
+                int visCount = 0;
+                for (std::uint32_t m : masks)
+                {
+                    if (m != 0)
+                        ++nonZero;
+                    if (m & 0x1u) ++transCount;
+                    if (m & 0x2u) ++rotCount;
+                    if (m & 0x4u) ++scaleCount;
+                    if (m & 0x8u) ++visCount;
+                }
+                int score = nonZero * 2 + transCount * 5 + rotCount * 2 + scaleCount * 3 + visCount;
+                if (transCount == 0)
+                    score -= 50;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestOffset = off;
+                    bestNonZero = nonZero;
+                    bestTrans = transCount;
+                    bestRot = rotCount;
+                    bestScale = scaleCount;
+                    bestVis = visCount;
+                }
+            }
+            if (std::getenv("TYPE6_TRACE") != nullptr)
+            {
+                std::cout << "[Type6] maskOffset=0x" << std::hex << bestOffset << std::dec
+                          << " nz=" << bestNonZero
+                          << " t=" << bestTrans
+                          << " r=" << bestRot
+                          << " s=" << bestScale
+                          << " v=" << bestVis
+                          << " endian=" << (bigEndian ? "BE" : "LE")
+                          << std::endl;
+            }
+            return bestOffset;
+        };
+
+        auto countMaskNonZero = [&](std::span<const std::uint8_t> data,
+                                    std::size_t startOffset,
+                                    std::size_t maskWords,
+                                    bool bigEndian) -> int {
+            std::vector<std::uint32_t> masks;
+            std::size_t maskBytes = 0;
+            if (!ReadPackedNibbleMasks(data, startOffset, NumBones, maskWords, bigEndian, masks, maskBytes))
+                return 0;
+            int nonZero = 0;
+            for (std::uint32_t m : masks)
+                if (m != 0)
+                    ++nonZero;
+            return nonZero;
+        };
+
+        auto findBestMaskStart = [&](std::span<const std::uint8_t> data,
+                                     std::size_t anchor,
+                                     std::size_t windowBefore,
+                                     std::size_t windowAfter,
+                                     std::size_t maskWords) -> std::optional<std::size_t> {
+            if (data.empty())
+                return std::nullopt;
+            std::size_t start = (anchor > windowBefore) ? (anchor - windowBefore) : 0u;
+            std::size_t end = std::min(anchor + windowAfter, data.size());
+            if (start >= end)
+                return std::nullopt;
+            int bestNonZero = 0;
+            std::size_t bestOffset = start;
+            for (std::size_t off = start; off + maskWords * 4u <= end; ++off)
+            {
+                int nonZeroLE = countMaskNonZero(data, off, maskWords, false);
+                int nonZeroBE = countMaskNonZero(data, off, maskWords, true);
+                int nonZero = std::max(nonZeroLE, nonZeroBE);
+                if (nonZero > bestNonZero)
+                {
+                    bestNonZero = nonZero;
+                    bestOffset = off;
+                    if (bestNonZero >= NumBones)
+                        break;
+                }
+            }
+            if (bestNonZero <= 0)
+                return std::nullopt;
+            return bestOffset;
+        };
+
+        struct Variant
+        {
+            bool BigEndian = false;
+            std::span<const std::uint8_t> StreamData{};
+            std::size_t MaskWords = 0;
+            std::span<const std::uint8_t> ParamData{};
+            std::size_t ParamOffset = 0;
+            const char* Label = "";
+        };
+
+        double bestScore = -1e30;
+        int bestMaskScore = std::numeric_limits<int>::min();
+        std::vector<SuAnimationSample> bestSamples;
+        SuAnimationQuantization bestQuant;
+        std::vector<bool> bestHasRotation;
+        bool bestEndian = Type6BigEndian;
+        const char* bestLabel = "";
+        int bestMaskNonZero = 0;
+        std::array<std::uint32_t, 4> bestMaskSample{};
+
+        std::size_t maskWordsDefault = ComputeType6MaskWordCount(NumBones, NumUvBones, NumFloatStreams);
+        std::size_t maskWordsNoFloat = ComputeType6MaskWordCount(NumBones, NumUvBones, 0);
+        std::span<const std::uint8_t> fullData = fullSpan.empty() ? blockSpan : fullSpan;
+        std::size_t paramAbs = static_cast<std::size_t>(std::max(0, Type6ParamDataOffset));
+        std::size_t paramRel = 0;
+        bool hasRel = Type6BlockEnd > Type6BlockStart &&
+                      Type6ParamDataOffset >= 0 &&
+                      static_cast<std::size_t>(Type6ParamDataOffset) >= Type6BlockStart &&
+                      static_cast<std::size_t>(Type6ParamDataOffset) < Type6BlockEnd;
+        if (hasRel)
+            paramRel = static_cast<std::size_t>(Type6ParamDataOffset) - Type6BlockStart;
+
+        std::optional<std::size_t> bestMaskStart = findBestMaskStart(fullData, Type6Anchor, 0x400, 0x4000, maskWordsDefault);
+        std::optional<std::size_t> bestMaskStartNoFloat = findBestMaskStart(fullData, Type6Anchor, 0x400, 0x4000, maskWordsNoFloat);
+        std::span<const std::uint8_t> scanSpan = bestMaskStart ? fullData.subspan(*bestMaskStart) : std::span<const std::uint8_t>{};
+        std::span<const std::uint8_t> scanSpanNoFloat = bestMaskStartNoFloat ? fullData.subspan(*bestMaskStartNoFloat) : std::span<const std::uint8_t>{};
+
+        auto withBestMaskOffset = [&](std::span<const std::uint8_t> base,
+                                      std::size_t maskWords,
+                                      bool bigEndian) -> std::span<const std::uint8_t> {
+            if (base.empty())
+                return base;
+            std::size_t off = selectMaskOffset(base, maskWords, bigEndian);
+            if (off >= base.size())
+                return base;
+            return base.subspan(off);
+        };
+
+        std::array<Variant, 12> variants = {{
+            {Type6BigEndian, withBestMaskOffset(blockSpan, maskWordsDefault, Type6BigEndian), maskWordsDefault, fullData, paramAbs, "abs+mask"},
+            {!Type6BigEndian, withBestMaskOffset(blockSpan, maskWordsDefault, !Type6BigEndian), maskWordsDefault, fullData, paramAbs, "abs+mask"},
+            {Type6BigEndian, withBestMaskOffset(blockSpan, maskWordsNoFloat, Type6BigEndian), maskWordsNoFloat, fullData, paramAbs, "abs+nofloat"},
+            {!Type6BigEndian, withBestMaskOffset(blockSpan, maskWordsNoFloat, !Type6BigEndian), maskWordsNoFloat, fullData, paramAbs, "abs+nofloat"},
+            {Type6BigEndian, hasRel ? withBestMaskOffset(blockSpan, maskWordsDefault, Type6BigEndian) : std::span<const std::uint8_t>{}, maskWordsDefault, blockSpan, paramRel, "rel+mask"},
+            {!Type6BigEndian, hasRel ? withBestMaskOffset(blockSpan, maskWordsDefault, !Type6BigEndian) : std::span<const std::uint8_t>{}, maskWordsDefault, blockSpan, paramRel, "rel+mask"},
+            {Type6BigEndian, withBestMaskOffset(scanSpan, maskWordsDefault, Type6BigEndian), maskWordsDefault, fullData, paramAbs, "scan+mask"},
+            {!Type6BigEndian, withBestMaskOffset(scanSpan, maskWordsDefault, !Type6BigEndian), maskWordsDefault, fullData, paramAbs, "scan+mask"},
+            {Type6BigEndian, hasRel ? withBestMaskOffset(scanSpan, maskWordsDefault, Type6BigEndian) : std::span<const std::uint8_t>{}, maskWordsDefault, blockSpan, paramRel, "scan+relmask"},
+            {!Type6BigEndian, hasRel ? withBestMaskOffset(scanSpan, maskWordsDefault, !Type6BigEndian) : std::span<const std::uint8_t>{}, maskWordsDefault, blockSpan, paramRel, "scan+relmask"},
+            {Type6BigEndian, withBestMaskOffset(scanSpanNoFloat, maskWordsNoFloat, Type6BigEndian), maskWordsNoFloat, fullData, paramAbs, "scan+nofloat"},
+            {!Type6BigEndian, withBestMaskOffset(scanSpanNoFloat, maskWordsNoFloat, !Type6BigEndian), maskWordsNoFloat, fullData, paramAbs, "scan+nofloat"},
+        }};
+
+        for (auto const& variant : variants)
+        {
+            if (variant.ParamData.empty())
+                continue;
+            if (variant.ParamOffset >= variant.ParamData.size())
+                continue;
+            std::vector<SuAnimationSample> tempSamples;
+            SuAnimationQuantization tempQuant;
+            std::vector<bool> tempHasRotation;
+            int tempMaskNonZero = 0;
+            std::array<std::uint32_t, 4> tempMaskSample{};
+            int tempMaskScore = 0;
+            if (!decodeType6UsUs(variant.BigEndian, variant.StreamData, variant.MaskWords, variant.ParamData,
+                                 variant.ParamOffset, tempSamples, tempQuant, tempHasRotation,
+                                 tempMaskNonZero, tempMaskSample, tempMaskScore))
+            {
+                continue;
+            }
+            if (tempMaskNonZero == 0)
+                continue;
+            double score = scoreSamples(tempSamples, tempHasRotation);
+            if (score > bestScore || (score == bestScore && tempMaskScore > bestMaskScore))
+            {
+                bestScore = score;
+                bestMaskScore = tempMaskScore;
+                bestSamples = std::move(tempSamples);
+                bestQuant = std::move(tempQuant);
+                bestHasRotation = std::move(tempHasRotation);
+                bestEndian = variant.BigEndian;
+                bestLabel = variant.Label;
+                bestMaskNonZero = tempMaskNonZero;
+                bestMaskSample = tempMaskSample;
+            }
+        }
+
+        if (std::getenv("TYPE6_TRACE") != nullptr && bestLabel && *bestLabel)
+        {
+            std::cout << "[Type6] bestVariant=" << bestLabel
+                      << " endian=" << (bestEndian ? "BE" : "LE")
+                      << " score=" << bestScore
+                      << " maskNonZero=" << bestMaskNonZero
+                      << std::endl;
+        }
+
+        if (std::getenv("TYPE6_DUMP") != nullptr)
+        {
+            std::size_t dumpMaskOff = 0;
+            if (bestLabel && std::strncmp(bestLabel, "scan", 4) == 0 && bestMaskStart)
+                dumpMaskOff = *bestMaskStart;
+            dumpHex("block", fullData, dumpMaskOff);
+            dumpHex("param", fullData, paramAbs);
+        }
+
+        if (bestSamples.empty())
+            return false;
+        Samples = std::move(bestSamples);
+        Quantization = std::move(bestQuant);
+        SamplesDecoded = true;
+        Type6BigEndian = bestEndian;
+        Type6DebugMasksLogged = true;
+        Type6MaskNonZero = bestMaskNonZero;
+        Type6MaskSample = bestMaskSample;
+        return true;
+    }
+
+    bool smallHeader = (Type == 0x07 || Type == 0x0A);
+    int frameIndexSize = (Type == 0x07 || Type == 0x0A) ? 1 : 2;
+    int factorSize = 0;
+    if (Type == 0x08)
+        factorSize = 4;
+    else if (Type == 0x09 || Type == 0x0A)
+        factorSize = 1;
+    else
+        factorSize = 2;
+
+    auto buildOrders = []() {
+        std::array<int, 4> base{0, 1, 2, 3};
+        std::vector<std::array<int, 4>> orders;
+        orders.reserve(24);
+        std::sort(base.begin(), base.end());
+        do
+        {
+            orders.push_back(base);
+        } while (std::next_permutation(base.begin(), base.end()));
+        return orders;
+    };
+
+
+    std::vector<std::array<int, 4>> orders{{{0, 1, 2, 3}}};
+    std::array<int, 1> bitWidths{16};
+    std::array<int, 1> factorModes{0};
+    double bestScore = -1e30;
+    std::vector<SuAnimationSample> bestSamples;
+    SuAnimationQuantization bestQuant;
+    std::vector<bool> bestHasRotation;
+    bool bestEndian = Type6BigEndian;
+    std::size_t maskWords = ComputeType6MaskWordCount(NumBones, NumUvBones, NumFloatStreams);
+
+    bool trace = std::getenv("TYPE6_TRACE") != nullptr;
+    auto tryDecode = [&](bool currentBigEndian) {
+        std::vector<std::uint32_t> masks;
+        std::size_t maskBytes = 0;
+        if (!ReadPackedNibbleMasks(blockSpan, 0, NumBones, maskWords, currentBigEndian, masks, maskBytes))
+            return;
+        if (trace || debugDump)
+            std::cout << "[Type6] endian=" << (currentBigEndian ? "BE" : "LE")
+                      << " maskBytes=" << maskBytes
+                      << " blockBytes=" << blockSpan.size()
+                      << " paramData=" << Type6ParamDataOffset
+                      << " paramGpu=" << (Type6ParamDataIsGpu ? 1 : 0)
+                      << " dataSize=" << Type6DataSize << std::endl;
+        if (trace || debugDump)
+            std::cout.flush();
+        if (!Type6DebugMasksLogged)
+        {
+            Type6DebugMasksLogged = true;
+            int nonZero = 0;
+            for (std::uint32_t m : masks)
+                if (m != 0)
+                    ++nonZero;
+            Type6MaskNonZero = nonZero;
+            for (std::size_t i = 0; i < Type6MaskSample.size(); ++i)
+                Type6MaskSample[i] = (i < masks.size()) ? masks[i] : 0u;
+        }
+        if (debugDump && !masks.empty())
+        {
+            std::cout << "[Type6Dump] mask0=0x" << std::hex << masks[0] << std::dec
+                      << " anchor=" << Type6Anchor
+                      << " blockStart=" << Type6BlockStart
+                      << " blockEnd=" << Type6BlockEnd
+                      << " paramOffset=" << Type6ParamDataOffset
+                      << " paramGpu=" << (Type6ParamDataIsGpu ? 1 : 0)
+                      << std::endl;
+        }
+
+        auto decodeWithOrder = [&](std::array<int, 4> const& order,
+                                   int bitWidth,
+                                   bool msbPacking,
+                                   int factorMode,
+                                   std::vector<SuAnimationSample>& outSamples,
+                                   SuAnimationQuantization& outQuant,
+                                   std::vector<bool>& outHasRotation) {
+            initSamples(outSamples);
+            outQuant.Resize(static_cast<std::size_t>(NumBones));
+            outHasRotation.assign(static_cast<std::size_t>(NumBones), false);
+
+            Type6Reader reader{blockSpan, currentBigEndian, maskBytes};
+            Type6Reader paramReader{};
+            std::size_t paramOffset = static_cast<std::size_t>(std::max(0, Type6ParamDataOffset));
+            if (!fullSpan.empty())
+            {
+                Type6Reader paramFull{fullSpan, currentBigEndian, paramOffset};
+                paramReader = paramFull;
+            }
+            else
+            {
+                Type6Reader paramLocal{blockSpan, currentBigEndian, 0};
+                paramReader = paramLocal;
+            }
+            paramReader.Offset = Align4(paramReader.Offset);
+            int debugBone = -1;
+            bool debugLogged = false;
+            if (std::getenv("DECODE_DEBUG") != nullptr)
+            {
+                for (int i = 0; i < NumBones; ++i)
+                {
+                    if (static_cast<std::size_t>(i) < masks.size() && masks[static_cast<std::size_t>(i)] != 0)
+                    {
+                        debugBone = i;
+                        break;
+                    }
+                }
+            }
+            auto readFrameIndices = [&](std::size_t count) {
+                std::vector<int> values;
+                values.reserve(count);
+                for (std::size_t i = 0; i < count; ++i)
+                {
+                    int v = 0;
+                    if (frameIndexSize == 1)
+                        v = reader.ReadU8();
+                    else
+                        v = static_cast<int>(reader.ReadU16());
+                    values.push_back(v);
+                }
+                return values;
+            };
+
+            std::size_t debugStreamCount = 0;
+            bool debugDump = std::getenv("TYPE6_DUMP") != nullptr;
+            auto decodeStream = [&](int boneIndex, int channel, int componentCount) {
+                Type6StreamHeader header = ReadType6HeaderInlineSafe(reader, smallHeader,
+                                                               static_cast<std::size_t>(NumFrames),
+                                                               static_cast<std::size_t>(frameIndexSize),
+                                                               static_cast<std::size_t>(factorSize));
+                std::size_t frameCount = header.NumFrames == 0 ? static_cast<std::size_t>(NumFrames)
+                                                          : header.NumFrames;
+                std::size_t keyCount = header.NumKeys;
+                if (frameCount == 0 || frameCount > static_cast<std::size_t>(NumFrames))
+                    return;
+                if (keyCount == 0 || keyCount > 4096u)
+                    return;
+                if (trace && debugStreamCount < 8)
+                {
+                    ++debugStreamCount;
+                    std::cout << "[Type6] stream#" << debugStreamCount
+                              << " bone=" << boneIndex
+                              << " ch=" << channel
+                              << " comps=" << componentCount
+                              << " frames=" << frameCount
+                              << " keys=" << keyCount
+                              << " inlineOff=" << reader.Offset
+                              << " paramOff=" << paramReader.Offset
+                              << std::endl;
+                }
+
+                std::size_t keyTimesCount = keyCount;
+                if (!reader.Has(keyTimesCount * static_cast<std::size_t>(frameIndexSize)))
+                    return;
+
+                auto keyTimes = readFrameIndices(keyTimesCount);
+                if ((trace || debugDump) && debugStreamCount <= 1)
+                    std::cout << "[Type6]  keyTimesRead off=" << reader.Offset << std::endl;
+                reader.Offset = Align2(reader.Offset);
+
+                paramReader.Offset = Align4(paramReader.Offset);
+                float minimum = 0.0f;
+                float delta = 0.0f;
+                if (paramReader.Has(8))
+                {
+                    minimum = paramReader.ReadFloat();
+                    delta = paramReader.ReadFloat();
+                }
+                if ((trace || debugDump) && debugStreamCount <= 1)
+                    std::cout << "[Type6]  minDeltaRead off=" << paramReader.Offset << std::endl;
+
+                std::size_t samplesPerKey = static_cast<std::size_t>(componentCount) * 3u;
+                std::size_t sampleCount = keyCount * samplesPerKey + static_cast<std::size_t>(componentCount);
+                std::vector<short> samples;
+                samples.resize(sampleCount);
+                std::size_t byteCount = sampleCount * sizeof(short);
+                if (paramReader.Offset + byteCount <= paramReader.Data.size())
+                {
+                    for (std::size_t i = 0; i < sampleCount; ++i)
+                    {
+                        std::uint16_t raw = paramReader.ReadU16();
+                        samples[i] = static_cast<std::int16_t>(raw);
+                    }
+                    paramReader.Offset = Align4(paramReader.Offset);
+                }
+                else
+                {
+                    paramReader.Offset = paramReader.Data.size();
+                }
+                if (debugDump && debugStreamCount == 1)
+                {
+                    std::cout << "[Type6Dump] bone=" << boneIndex
+                              << " ch=" << channel
+                              << " keys=" << keyCount
+                              << " min=" << minimum
+                              << " delta=" << delta
+                              << " keyTimes0=" << (keyTimes.empty() ? -1 : keyTimes[0])
+                              << " keyTimesLast=" << (keyTimes.empty() ? -1 : keyTimes.back())
+                              << " sample0=" << (samples.empty() ? 0 : samples[0])
+                              << " sample1=" << (samples.size() > 1 ? samples[1] : 0)
+                              << " sample2=" << (samples.size() > 2 ? samples[2] : 0)
+                              << std::endl;
+                }
+                if (trace && debugStreamCount <= 1)
+                    std::cout << "[Type6]  samplesRead off=" << paramReader.Offset << std::endl;
+
+                auto sampleValue = [&](int keyIndex, int sampleSet, int component) -> float {
+                    if (keyCount == 0)
+                        return 0.0f;
+                    if (keyIndex < 0)
+                        keyIndex = 0;
+                    if (keyIndex >= static_cast<int>(keyCount))
+                        keyIndex = static_cast<int>(keyCount) - 1;
+                    int idx = keyIndex * static_cast<int>(samplesPerKey) +
+                              sampleSet * componentCount + component;
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= samples.size())
+                        return 0.0f;
+                    float normalized = static_cast<float>(samples[static_cast<std::size_t>(idx)]) / 32767.0f;
+                    return minimum + delta * normalized;
+                };
+                auto sampleValueNext = [&](int keyIndex, int component) -> float {
+                    int idx = keyIndex * static_cast<int>(samplesPerKey) + componentCount * 3 + component;
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= samples.size())
+                        return 0.0f;
+                    float normalized = static_cast<float>(samples[static_cast<std::size_t>(idx)]) / 32767.0f;
+                    return minimum + delta * normalized;
+                };
+
+                if (std::getenv("DECODE_DEBUG") != nullptr &&
+                    boneIndex == debugBone &&
+                    !debugLogged)
+                {
+                    debugLogged = true;
+                    int midFrame = NumFrames > 1 ? (NumFrames / 2) : 0;
+                    auto evalFrame = [&](int frameIndex) {
+                        int localFrame = frameIndex;
+                        if (frameCount > 0)
+                            localFrame = localFrame % static_cast<int>(frameCount);
+                        if (localFrame < 0)
+                            localFrame = 0;
+                        int k = 0;
+                        if (!keyTimes.empty())
+                        {
+                            int idx = static_cast<int>(keyTimes.size()) - 1;
+                            for (std::size_t i = 0; i < keyTimes.size(); ++i)
+                            {
+                                if (localFrame < static_cast<int>(keyTimes[i]))
+                                {
+                                    idx = static_cast<int>(i);
+                                    break;
+                                }
+                            }
+                            k = idx;
+                            if (k >= static_cast<int>(keyCount))
+                                k = static_cast<int>(keyCount) - 1;
+                        }
+                        float t = 0.0f;
+                        if (!keyTimes.empty() && k >= 0 && static_cast<std::size_t>(k) < keyTimes.size())
+                        {
+                            int end = static_cast<int>(keyTimes[static_cast<std::size_t>(k)]);
+                            int start = (k == 0) ? 0 : static_cast<int>(keyTimes[static_cast<std::size_t>(k - 1)]);
+                            int denom = end - start;
+                            if (denom > 0)
+                                t = static_cast<float>(localFrame - start) / static_cast<float>(denom);
+                        }
+                        float ts = t * t;
+                        float tc = ts * t;
+                        float p0 = sampleValue(k, 0, 0);
+                        float p1 = sampleValue(k, 1, 0);
+                        float p2 = sampleValue(k, 2, 0);
+                        float p3 = (k + 1 < static_cast<int>(keyCount)) ? sampleValue(k + 1, 0, 0)
+                                                                        : sampleValueNext(k, 0);
+                        float value = (((p3 - p2) - p1) - p0) * tc + p2 * ts + p1 * t + p0;
+                        return std::tuple<float, float, float, float, float>(t, p0, p1, p2, p3);
+                    };
+                    auto [t0, p0a, p1a, p2a, p3a] = evalFrame(0);
+                    auto [t1, p0b, p1b, p2b, p3b] = evalFrame(midFrame);
+                    std::cout << "[DecodeDbg] bone=" << boneIndex
+                              << " ch=" << channel
+                              << " mask=0x" << std::hex
+                              << (static_cast<std::size_t>(boneIndex) < masks.size() ? masks[static_cast<std::size_t>(boneIndex)] : 0u)
+                              << std::dec
+                              << " frames=" << frameCount
+                              << " keys=" << keyCount
+                              << " key0=" << (keyTimes.empty() ? -1 : keyTimes.front())
+                              << " keyLast=" << (keyTimes.empty() ? -1 : keyTimes.back())
+                              << " min=" << minimum
+                              << " delta=" << delta
+                              << " s0=" << (samples.size() > 0 ? samples[0] : 0)
+                              << " s1=" << (samples.size() > 1 ? samples[1] : 0)
+                              << " s2=" << (samples.size() > 2 ? samples[2] : 0)
+                              << " t0=" << t0 << " p0=" << p0a << " p1=" << p1a << " p2=" << p2a << " p3=" << p3a
+                              << " tMid=" << t1 << " p0m=" << p0b << " p1m=" << p1b << " p2m=" << p2b << " p3m=" << p3b
+                              << std::endl;
+                }
+
+                for (int frame = 0; frame < NumFrames; ++frame)
+                {
+                    int localFrame = frame;
+                    if (frameCount > 0)
+                        localFrame = localFrame % static_cast<int>(frameCount);
+                    if (localFrame < 0)
+                        localFrame = 0;
+
+                    int k = 0;
+                    if (!keyTimes.empty())
+                    {
+                        int idx = static_cast<int>(keyTimes.size()) - 1;
+                        for (std::size_t i = 0; i < keyTimes.size(); ++i)
+                        {
+                            if (localFrame < static_cast<int>(keyTimes[i]))
+                            {
+                                idx = static_cast<int>(i);
+                                break;
+                            }
+                        }
+                        k = idx;
+                        if (k >= static_cast<int>(keyCount))
+                            k = static_cast<int>(keyCount) - 1;
+                    }
+
+                    float t = 0.0f;
+                    if (!keyTimes.empty() && k >= 0 && static_cast<std::size_t>(k) < keyTimes.size())
+                    {
+                        int end = static_cast<int>(keyTimes[static_cast<std::size_t>(k)]);
+                        int start = (k == 0) ? 0 : static_cast<int>(keyTimes[static_cast<std::size_t>(k - 1)]);
+                        int denom = end - start;
+                        if (denom > 0)
+                            t = static_cast<float>(localFrame - start) / static_cast<float>(denom);
+                    }
+
+                    float ts = t * t;
+                    float tc = ts * t;
+                    auto& sample = outSamples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                              static_cast<std::size_t>(boneIndex)];
+
+                    for (int component = 0; component < componentCount; ++component)
+                    {
+                        float p0 = sampleValue(k, 0, component);
+                        float p1 = sampleValue(k, 1, component);
+                        float p2 = sampleValue(k, 2, component);
+                        float p3 = (k + 1 < static_cast<int>(keyCount)) ? sampleValue(k + 1, 0, component)
+                                                                        : sampleValueNext(k, component);
+                        float value = (((p3 - p2) - p1) - p0) * tc + p2 * ts + p1 * t + p0;
+                        if (channel == 0)
+                        {
+                            if (component == 0) sample.Translation.X = value;
+                            if (component == 1) sample.Translation.Y = value;
+                            if (component == 2) sample.Translation.Z = value;
+                        }
+                        else if (channel == 1)
+                        {
+                            if (component == 0) sample.Rotation.X = value;
+                            if (component == 1) sample.Rotation.Y = value;
+                            if (component == 2) sample.Rotation.Z = value;
+                            if (component == 3) sample.Rotation.W = value;
+                        }
+                        else if (channel == 2)
+                        {
+                            if (component == 0) sample.Scale.X = value;
+                            if (component == 1) sample.Scale.Y = value;
+                            if (component == 2) sample.Scale.Z = value;
+                        }
+                    }
+                }
+
+                for (int component = 0; component < componentCount; ++component)
+                {
+                    auto& range = (channel == 0) ? outQuant.Translation[static_cast<std::size_t>(boneIndex)][component]
+                                 : (channel == 1) ? outQuant.Rotation[static_cast<std::size_t>(boneIndex)][component]
+                                 : outQuant.Scale[static_cast<std::size_t>(boneIndex)][component];
+                    range.Minimum = minimum;
+                    range.Delta = delta;
+                    range.Valid = true;
+                }
+            };
+
+            for (int bone = 0; bone < NumBones; ++bone)
+            {
+                std::uint32_t maskBits = masks[static_cast<std::size_t>(bone)];
+                for (int channel : order)
+                {
+                    if (channel == 0 && (maskBits & 0x1u))
+                    {
+                        decodeStream(bone, 0, 3);
+                    }
+                    else if (channel == 1 && (maskBits & 0x2u))
+                    {
+                        outHasRotation[static_cast<std::size_t>(bone)] = true;
+                        decodeStream(bone, 1, 4);
+                    }
+                    else if (channel == 2 && (maskBits & 0x4u))
+                    {
+                        decodeStream(bone, 2, 3);
+                    }
+                    else if (channel == 3 && (maskBits & 0x8u))
+                    {
+                        Type6StreamHeader header = ReadType6HeaderInlineSafe(reader, smallHeader,
+                                                                   static_cast<std::size_t>(NumFrames),
+                                                                   static_cast<std::size_t>(frameIndexSize),
+                                                                   static_cast<std::size_t>(factorSize));
+                        std::size_t frameCount = header.NumFrames == 0 ? static_cast<std::size_t>(NumFrames)
+                                                                  : header.NumFrames;
+                        std::size_t keyCount = header.NumKeys;
+                        if (frameCount == 0 || keyCount == 0)
+                            continue;
+                        std::size_t keyTimesCount = keyCount;
+                        if (!reader.Has(keyTimesCount * static_cast<std::size_t>(frameIndexSize)))
+                            continue;
+                        auto keyTimes = readFrameIndices(keyTimesCount);
+                        reader.Offset = Align2(reader.Offset);
+
+                        for (int frame = 0; frame < NumFrames; ++frame)
+                        {
+                            int localFrame = frameCount > 0 ? frame % static_cast<int>(frameCount) : frame;
+                            if (localFrame < 0)
+                                localFrame = 0;
+                            int idx = static_cast<int>(keyTimes.size()) - 1;
+                            for (std::size_t i = 0; i < keyTimes.size(); ++i)
+                            {
+                                if (localFrame < static_cast<int>(keyTimes[i]))
+                                {
+                                    idx = static_cast<int>(i);
+                                    break;
+                                }
+                            }
+                            if (idx >= static_cast<int>(keyCount))
+                                idx = static_cast<int>(keyCount) - 1;
+                            auto& sample = outSamples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                                      static_cast<std::size_t>(bone)];
+                            sample.Visible = (idx % 2) == 0;
+                        }
+                    }
+                }
+            }
+
+            for (int bone = 0; bone < NumBones; ++bone)
+            {
+                if (!outHasRotation[static_cast<std::size_t>(bone)])
+                    continue;
+                for (int frame = 0; frame < NumFrames; ++frame)
+                {
+                    auto& sample = outSamples[static_cast<std::size_t>(frame) * static_cast<std::size_t>(NumBones) +
+                                              static_cast<std::size_t>(bone)];
+                    float len = std::sqrt(sample.Rotation.X * sample.Rotation.X +
+                                          sample.Rotation.Y * sample.Rotation.Y +
+                                          sample.Rotation.Z * sample.Rotation.Z +
+                                          sample.Rotation.W * sample.Rotation.W);
+                    if (len > 1e-6f)
+                    {
+                        float inv = 1.0f / len;
+                        sample.Rotation.X *= inv;
+                        sample.Rotation.Y *= inv;
+                        sample.Rotation.Z *= inv;
+                        sample.Rotation.W *= inv;
+                    }
+                }
+            }
+        };
+
+        for (auto const& order : orders)
+        {
+            for (int bitWidth : bitWidths)
+            {
+                for (int factorMode : factorModes)
+                {
+                    std::vector<SuAnimationSample> tempSamples;
+                    SuAnimationQuantization tempQuant;
+                    std::vector<bool> tempHasRotation;
+                    decodeWithOrder(order, bitWidth, false, factorMode, tempSamples, tempQuant, tempHasRotation);
+                    double score = scoreSamples(tempSamples, tempHasRotation);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestSamples = std::move(tempSamples);
+                        bestQuant = std::move(tempQuant);
+                        bestHasRotation = std::move(tempHasRotation);
+                        bestEndian = currentBigEndian;
+                    }
+                }
+            }
+        }
+    };
+
+    tryDecode(Type6BigEndian);
+    tryDecode(!Type6BigEndian);
+
+    if (bestSamples.empty())
+        return false;
+
+    Samples = std::move(bestSamples);
+    Quantization = std::move(bestQuant);
+
+    SamplesDecoded = true;
+    Type6BigEndian = bestEndian;
+    return true;
 }
 
 void SuAnimationEntry::Load(SlLib::Serialization::ResourceLoadContext& context)
@@ -1628,7 +3683,7 @@ void SuRenderTree::Load(SlLib::Serialization::ResourceLoadContext& context)
                 if (animPtr + 0x14 > dataSize)
                     return false;
                 int type = context.ReadInt32(animPtr);
-                if (type != 0 && type != 1 && type != 4 && type != 6)
+                if (type != 0 && type != 1 && type != 4 && (type < 6 || type > 10))
                     return false;
                 int frames = context.ReadInt32(animPtr + 4);
                 int bones = context.ReadInt32(animPtr + 8);

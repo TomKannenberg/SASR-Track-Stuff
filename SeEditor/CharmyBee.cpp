@@ -86,6 +86,39 @@ std::size_t AlignUp(std::size_t value, std::size_t align)
     return (value + mask) & ~mask;
 }
 
+SlLib::Math::Matrix4x4 IdentityMatrix()
+{
+    SlLib::Math::Matrix4x4 m{};
+    m(0, 0) = 1.0f;
+    m(1, 1) = 1.0f;
+    m(2, 2) = 1.0f;
+    m(3, 3) = 1.0f;
+    return m;
+}
+
+SlLib::Math::Matrix4x4 TransposeMatrix(SlLib::Math::Matrix4x4 const& in)
+{
+    SlLib::Math::Matrix4x4 out{};
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            out(r, c) = in(c, r);
+    return out;
+}
+
+float IdentityError(SlLib::Math::Matrix4x4 const& m)
+{
+    float err = 0.0f;
+    for (int r = 0; r < 4; ++r)
+    {
+        for (int c = 0; c < 4; ++c)
+        {
+            float target = (r == c) ? 1.0f : 0.0f;
+            err += std::fabs(m(r, c) - target);
+        }
+    }
+    return err;
+}
+
 void WriteInt32LE(std::vector<std::uint8_t>& out, std::size_t offset, std::int32_t value)
 {
     if (offset + 4 > out.size())
@@ -716,6 +749,8 @@ void BuildForestTreeMeshMaps(SeEditor::Forest::ForestLibrary const& library,
         SlLib::Math::Vector3 Pos{};
         SlLib::Math::Vector3 Normal{0.0f, 1.0f, 0.0f};
         SlLib::Math::Vector2 Uv{};
+        std::array<float, 4> Weights{1.0f, 0.0f, 0.0f, 0.0f};
+        std::array<float, 4> Indices{0.0f, 0.0f, 0.0f, 0.0f};
     };
 
     auto readFloat = [](std::vector<std::uint8_t> const& data, std::size_t offset) -> float {
@@ -732,6 +767,11 @@ void BuildForestTreeMeshMaps(SeEditor::Forest::ForestLibrary const& library,
     };
     auto readS16 = [&](std::vector<std::uint8_t> const& data, std::size_t offset) -> std::int16_t {
         return static_cast<std::int16_t>(readU16(data, offset));
+    };
+    auto readU8 = [](std::vector<std::uint8_t> const& data, std::size_t offset) -> std::uint8_t {
+        if (offset >= data.size())
+            return 0;
+        return data[offset];
     };
 
     auto decodeVertex = [&](SeEditor::Forest::SuRenderVertexStream const& stream) {
@@ -805,10 +845,27 @@ void BuildForestTreeMeshMaps(SeEditor::Forest::ForestLibrary const& library,
 
     auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
         auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        auto safe = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+        t.X = safe(t.X, 0.0f);
+        t.Y = safe(t.Y, 0.0f);
+        t.Z = safe(t.Z, 0.0f);
         s.X = clamp(s.X);
         s.Y = clamp(s.Y);
         s.Z = clamp(s.Z);
+        s.X = safe(s.X, 1.0f);
+        s.Y = safe(s.Y, 1.0f);
+        s.Z = safe(s.Z, 1.0f);
         SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
+        float qLen = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+        if (!std::isfinite(qLen) || qLen < 1e-6f)
+        {
+            q = {0.0f, 0.0f, 0.0f, 1.0f};
+        }
+        else
+        {
+            float invLen = 1.0f / qLen;
+            q = q * invLen;
+        }
         SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
         SlLib::Math::Matrix4x4 scale{};
         scale(0, 0) = s.X;
@@ -911,7 +968,9 @@ void BuildForestTreeMeshMaps(SeEditor::Forest::ForestLibrary const& library,
                     }
 
                     SlRenderer::ForestCpuMesh cpu;
-                    cpu.Vertices.reserve(verts.size() * 8);
+                    cpu.Model = IdentityMatrix();
+                    cpu.Skinned = false;
+                    cpu.Vertices.reserve(verts.size() * 16);
                     for (auto const& v : verts)
                     {
                         cpu.Vertices.push_back(v.Pos.X);
@@ -922,6 +981,14 @@ void BuildForestTreeMeshMaps(SeEditor::Forest::ForestLibrary const& library,
                         cpu.Vertices.push_back(v.Normal.Z);
                         cpu.Vertices.push_back(v.Uv.X);
                         cpu.Vertices.push_back(v.Uv.Y);
+                        cpu.Vertices.push_back(1.0f);
+                        cpu.Vertices.push_back(0.0f);
+                        cpu.Vertices.push_back(0.0f);
+                        cpu.Vertices.push_back(0.0f);
+                        cpu.Vertices.push_back(0.0f);
+                        cpu.Vertices.push_back(0.0f);
+                        cpu.Vertices.push_back(0.0f);
+                        cpu.Vertices.push_back(0.0f);
                     }
 
                     std::size_t availableIndices = primitive->IndexData.size() / 2;
@@ -1257,8 +1324,6 @@ CharmyBee::~CharmyBee()
 {
     if (_xpacWorker && _xpacWorker->joinable())
         _xpacWorker->join();
-    if (_unityExportWorker && _unityExportWorker->joinable())
-        _unityExportWorker->join();
 }
 
 CharmyBee::TreeNode::TreeNode(std::string name, bool isFolder)
@@ -1599,15 +1664,12 @@ void CharmyBee::RenderSceneView()
             _navigationTool->OnRender();
     }
 
-    // Orbit controls (right-drag rotate, scroll zoom) when hovering scene.
+    // Free-fly controls (right-drag look) when hovering scene.
     ImGuiIO& io = ImGui::GetIO();
     float dt = io.DeltaTime > 0.0f ? io.DeltaTime : 1.0f / 60.0f;
     bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem |
                                           ImGuiHoveredFlags_AllowWhenBlockedByPopup);
-    if (hovered && io.MouseWheel != 0.0f)
-    {
-        _orbitDistance *= std::pow(0.9f, io.MouseWheel);
-    }
+    _sceneViewHovered = hovered;
 
     if (_debugKeyInput)
         PollGlfwKeyInput();
@@ -1625,6 +1687,12 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
     if (window == nullptr)
         return;
 
+    if (_blockSceneInput)
+    {
+        _mouseOrbitTracking = false;
+        return;
+    }
+
     auto isDown = [&](int key) {
         int state = glfwGetKey(window, key);
         return state == GLFW_PRESS || state == GLFW_REPEAT;
@@ -1633,14 +1701,7 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
     float rotSpeed = 1.8f;
     float moveSpeed = _movementSpeed;
 
-    if (isDown(GLFW_KEY_J)) _orbitYaw   -= rotSpeed * delta;
-    if (isDown(GLFW_KEY_L)) _orbitYaw   += rotSpeed * delta;
-    if (isDown(GLFW_KEY_I)) _orbitPitch -= rotSpeed * delta;
-    if (isDown(GLFW_KEY_K)) _orbitPitch += rotSpeed * delta;
-
-    if (isDown(GLFW_KEY_Z)) _movementSpeed /= 1.05f;
-    if (isDown(GLFW_KEY_X)) _movementSpeed *= 1.05f;
-    _movementSpeed = std::max(_movementSpeed, 0.01f);
+    _movementSpeed = std::clamp(_movementSpeed, 0.05f, 200.0f);
 
     double cursorX = 0.0;
     double cursorY = 0.0;
@@ -1653,14 +1714,14 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
             int state = glfwGetMouseButton(window, button);
             return state == GLFW_PRESS || state == GLFW_REPEAT;
         };
-        if (isMouseDown(GLFW_MOUSE_BUTTON_LEFT) || isMouseDown(GLFW_MOUSE_BUTTON_RIGHT))
+        if (isMouseDown(GLFW_MOUSE_BUTTON_LEFT))
         {
             SlLib::Math::Vector2 current = cursorPos;
             if (_mouseOrbitTracking)
             {
                 SlLib::Math::Vector2 delta = {current.X - _mouseOrbitLastPos.X, current.Y - _mouseOrbitLastPos.Y};
                 constexpr float mouseSensitivity = 0.01f;
-                _orbitYaw   -= delta.X * mouseSensitivity;
+                _orbitYaw   += delta.X * mouseSensitivity;
                 _orbitPitch -= delta.Y * mouseSensitivity;
                 if (_debugKeyInput && (std::abs(delta.X) > 0.0f || std::abs(delta.Y) > 0.0f))
                 {
@@ -1688,9 +1749,30 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
     float cy = std::cos(_orbitYaw);
     float sy = std::sin(_orbitYaw);
 
-    // Camera-forward points toward the target; right is orthogonal in camera space.
-    SlLib::Math::Vector3 forward{-cp * cy, -sp, -cp * sy};
-    SlLib::Math::Vector3 right{sy, 0.0f, -cy};
+    SlLib::Math::Vector3 forward{cp * cy, sp, cp * sy};
+    SlLib::Math::Vector3 right{-sy, 0.0f, cy};
+    SlLib::Math::Vector3 up{0.0f, 1.0f, 0.0f};
+
+    if (isDown(GLFW_KEY_J)) _orbitYaw   -= rotSpeed * delta;
+    if (isDown(GLFW_KEY_L)) _orbitYaw   += rotSpeed * delta;
+    if (isDown(GLFW_KEY_I)) _orbitPitch -= rotSpeed * delta;
+    if (isDown(GLFW_KEY_K)) _orbitPitch += rotSpeed * delta;
+    if (isDown(GLFW_KEY_H))
+    {
+        if (!_originAxesToggleKeyDown)
+        {
+            _originAxesToggleKeyDown = true;
+            _drawOriginAxes = !_drawOriginAxes;
+            _renderer.SetDrawOriginAxes(_drawOriginAxes);
+        }
+    }
+    else
+    {
+        _originAxesToggleKeyDown = false;
+    }
+    if (isDown(GLFW_KEY_Z)) _movementSpeed /= 1.05f;
+    if (isDown(GLFW_KEY_X)) _movementSpeed *= 1.05f;
+    _movementSpeed = std::clamp(_movementSpeed, 0.05f, 200.0f);
 
     SlLib::Math::Vector3 deltaVec{0.0f, 0.0f, 0.0f};
     if (isDown(GLFW_KEY_W)) deltaVec = deltaVec + forward;
@@ -1698,19 +1780,20 @@ void CharmyBee::UpdateOrbitFromInput(float delta)
     if (isDown(GLFW_KEY_A)) deltaVec = deltaVec - right;
     if (isDown(GLFW_KEY_D)) deltaVec = deltaVec + right;
 
-        if (deltaVec.X != 0.0f || deltaVec.Y != 0.0f || deltaVec.Z != 0.0f)
-        {
-            float len = SlLib::Math::length(deltaVec);
-            if (len > 0.0f)
-                deltaVec = deltaVec * (1.0f / len);
-            deltaVec = deltaVec * (moveSpeed * delta * std::max(1.0f, _orbitDistance * 0.2f));
-            _orbitOffset = _orbitOffset + deltaVec;
-        }
+    if (deltaVec.X != 0.0f || deltaVec.Y != 0.0f || deltaVec.Z != 0.0f)
+    {
+        float len = SlLib::Math::length(deltaVec);
+        if (len > 0.0f)
+            deltaVec = deltaVec * (1.0f / len);
+        deltaVec = deltaVec * (moveSpeed * delta);
+        _orbitTarget = _orbitTarget + deltaVec;
+    }
 
     _orbitPitch = std::clamp(_orbitPitch, -1.4f, 1.4f);
-    _orbitDistance = std::max(0.3f, _orbitDistance);
+    _orbitDistance = std::max(0.0f, _orbitDistance);
+    _orbitOffset = {0.0f, 0.0f, 0.0f};
 
-    _renderer.SetOrbitCamera(_orbitYaw, _orbitPitch, _orbitDistance, _orbitTarget + _orbitOffset);
+    _renderer.SetOrbitCamera(_orbitYaw, _orbitPitch, 0.0f, _orbitTarget);
     _renderer.SetDrawCollisionMesh(_drawCollisionMesh);
 }
 
@@ -1755,6 +1838,8 @@ void CharmyBee::RenderSifViewer()
         ImGui::End();
         return;
     }
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
+        _blockSceneInput = true;
 
     if (ImGui::BeginTabBar("SifTabs"))
     {
@@ -2120,6 +2205,296 @@ void CharmyBee::RenderSifViewer()
                     ImGui::TextDisabled("No hierarchy for this chunk.");
                 }
             }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Animator"))
+        {
+            bool animatorChanged = false;
+            if (!_forestLibrary)
+            {
+                ImGui::TextDisabled("No forest data loaded yet.");
+                if (ImGui::Button("Load Forest"))
+                {
+                    LoadForestResources();
+                    _animatorDirty = true;
+                    animatorChanged = true;
+                }
+            }
+            else if (_forestLibrary->Forests.empty())
+            {
+                ImGui::TextDisabled("Forest list is empty.");
+            }
+            else
+            {
+                if (_animatorSelectedForest < 0)
+                    _animatorSelectedForest = 0;
+                if (static_cast<std::size_t>(_animatorSelectedForest) >= _forestLibrary->Forests.size())
+                    _animatorSelectedForest = static_cast<int>(_forestLibrary->Forests.size()) - 1;
+
+                auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(_animatorSelectedForest)];
+                std::string forestLabel = forestEntry.Name.empty()
+                                              ? std::string("Forest ") + std::to_string(_animatorSelectedForest)
+                                              : forestEntry.Name;
+
+                if (ImGui::BeginCombo("Forest", forestLabel.c_str()))
+                {
+                    for (std::size_t i = 0; i < _forestLibrary->Forests.size(); ++i)
+                    {
+                        auto const& entry = _forestLibrary->Forests[i];
+                        std::string name = entry.Name.empty()
+                                               ? std::string("Forest ") + std::to_string(i)
+                                               : entry.Name;
+                        bool selected = static_cast<int>(i) == _animatorSelectedForest;
+                        if (ImGui::Selectable(name.c_str(), selected))
+                        {
+                            _animatorSelectedForest = static_cast<int>(i);
+                            _animatorSelectedTree = 0;
+                            _animatorSelectedAnimation = -1;
+                            _animatorSelectedBranch = 0;
+                            _animatorFrame = 0;
+                            _animatorTime = 0.0f;
+                            _animatorFrameAccumulator = 0.0f;
+                            _animatorDirty = true;
+                            animatorChanged = true;
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+
+                SeEditor::Forest::SuRenderTree* tree = nullptr;
+                if (forestEntry.Forest && !forestEntry.Forest->Trees.empty())
+                {
+                    if (_animatorSelectedTree < 0)
+                        _animatorSelectedTree = 0;
+                    if (static_cast<std::size_t>(_animatorSelectedTree) >= forestEntry.Forest->Trees.size())
+                        _animatorSelectedTree = static_cast<int>(forestEntry.Forest->Trees.size()) - 1;
+
+                    tree = forestEntry.Forest->Trees[static_cast<std::size_t>(_animatorSelectedTree)].get();
+                    std::string treeLabel = tree && tree->Hash != 0
+                                                ? std::string("Tree ") + std::to_string(tree->Hash)
+                                                : std::string("Tree ") + std::to_string(_animatorSelectedTree);
+                    if (ImGui::BeginCombo("Tree", treeLabel.c_str()))
+                    {
+                        for (std::size_t i = 0; i < forestEntry.Forest->Trees.size(); ++i)
+                        {
+                            auto const& treeEntry = forestEntry.Forest->Trees[i];
+                            std::string name = treeEntry && treeEntry->Hash != 0
+                                                   ? std::string("Tree ") + std::to_string(treeEntry->Hash)
+                                                   : std::string("Tree ") + std::to_string(i);
+                            bool selected = static_cast<int>(i) == _animatorSelectedTree;
+                            if (ImGui::Selectable(name.c_str(), selected))
+                            {
+                                _animatorSelectedTree = static_cast<int>(i);
+                                _animatorSelectedAnimation = -1;
+                                _animatorSelectedBranch = 0;
+                                _animatorFrame = 0;
+                                _animatorTime = 0.0f;
+                                _animatorFrameAccumulator = 0.0f;
+                                _animatorDirty = true;
+                                animatorChanged = true;
+                            }
+                            if (selected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+                else
+                {
+                    ImGui::TextDisabled("Selected forest has no trees.");
+                }
+
+                SeEditor::Forest::SuAnimation* animation = nullptr;
+                if (tree)
+                {
+                    std::string animLabel = "None";
+                    if (_animatorSelectedAnimation >= 0 &&
+                        static_cast<std::size_t>(_animatorSelectedAnimation) < tree->AnimationEntries.size())
+                    {
+                        auto const& animEntry = tree->AnimationEntries[static_cast<std::size_t>(_animatorSelectedAnimation)];
+                        animLabel = animEntry.AnimName.empty()
+                                        ? std::string("Anim ") + std::to_string(_animatorSelectedAnimation)
+                                        : animEntry.AnimName;
+                        animation = animEntry.Animation.get();
+                    }
+
+                    if (ImGui::BeginCombo("Animation", animLabel.c_str()))
+                    {
+                        bool noneSelected = _animatorSelectedAnimation < 0;
+                        if (ImGui::Selectable("None", noneSelected))
+                        {
+                            _animatorSelectedAnimation = -1;
+                            _animatorPlaying = false;
+                            _animatorFrame = 0;
+                            _animatorTime = 0.0f;
+                            _animatorFrameAccumulator = 0.0f;
+                            _animatorDirty = true;
+                            animatorChanged = true;
+                        }
+                        if (noneSelected)
+                            ImGui::SetItemDefaultFocus();
+
+                        for (std::size_t i = 0; i < tree->AnimationEntries.size(); ++i)
+                        {
+                            auto const& animEntry = tree->AnimationEntries[i];
+                            std::string name = animEntry.AnimName.empty()
+                                                   ? std::string("Anim ") + std::to_string(i)
+                                                   : animEntry.AnimName;
+                            bool selected = static_cast<int>(i) == _animatorSelectedAnimation;
+                            if (ImGui::Selectable(name.c_str(), selected))
+                            {
+                                _animatorSelectedAnimation = static_cast<int>(i);
+                                _animatorPlaying = false;
+                                _animatorFrame = 0;
+                                _animatorTime = 0.0f;
+                                _animatorFrameAccumulator = 0.0f;
+                                _animatorDirty = true;
+                                animatorChanged = true;
+                            }
+                            if (selected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+
+                if (tree && !tree->Branches.empty())
+                {
+                    int branchCount = static_cast<int>(tree->Branches.size());
+                    if (_animatorSelectedBranch < 0)
+                        _animatorSelectedBranch = 0;
+                    if (_animatorSelectedBranch >= branchCount)
+                        _animatorSelectedBranch = branchCount - 1;
+                    auto const& branch = tree->Branches[static_cast<std::size_t>(_animatorSelectedBranch)];
+                    std::string branchLabel = branch && !branch->Name.empty()
+                                                  ? branch->Name
+                                                  : std::string("Branch ") + std::to_string(_animatorSelectedBranch);
+                    if (ImGui::BeginCombo("Branch", branchLabel.c_str()))
+                    {
+                        for (int i = 0; i < branchCount; ++i)
+                        {
+                            auto const& branchEntry = tree->Branches[static_cast<std::size_t>(i)];
+                            std::string name = branchEntry && !branchEntry->Name.empty()
+                                                   ? branchEntry->Name
+                                                   : std::string("Branch ") + std::to_string(i);
+                            bool selected = i == _animatorSelectedBranch;
+                            if (ImGui::Selectable(name.c_str(), selected))
+                            {
+                                _animatorSelectedBranch = i;
+                                animatorChanged = true;
+                            }
+                            if (selected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+
+                if (animation)
+                {
+                    if (animation->Type < 0x06 || animation->Type > 0x0A)
+                    {
+                        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Unsupported animation type: %d", animation->Type);
+                    }
+                    else
+                    {
+                        if (ImGui::Button("Only Render this"))
+                        {
+                            for (auto& forest : _forestHierarchy)
+                            {
+                                forest.Visible = false;
+                                for (auto& treeEntry : forest.Trees)
+                                    treeEntry.Visible = false;
+                            }
+                            if (_animatorSelectedForest >= 0 &&
+                                static_cast<std::size_t>(_animatorSelectedForest) < _forestHierarchy.size())
+                            {
+                                auto& forest = _forestHierarchy[static_cast<std::size_t>(_animatorSelectedForest)];
+                                forest.Visible = true;
+                                if (_animatorSelectedTree >= 0 &&
+                                    static_cast<std::size_t>(_animatorSelectedTree) < forest.Trees.size())
+                                {
+                                    forest.Trees[static_cast<std::size_t>(_animatorSelectedTree)].Visible = true;
+                                }
+                            }
+                            ApplyTreeVisibilityToLayers();
+                            UpdateForestBoxRenderer();
+                            UpdateForestMeshRendering();
+                            SaveForestHierarchyVisibility();
+                        }
+
+                        if (ImGui::Button(_animatorPlaying ? "Pause" : "Play"))
+                        {
+                            _animatorPlaying = !_animatorPlaying;
+                            _animatorTime = static_cast<float>(_animatorFrame) / _animatorFps;
+                            _animatorFrameAccumulator = 0.0f;
+                            animatorChanged = true;
+                        }
+                        ImGui::SameLine();
+                        ImGui::Text("Frames: %d", animation->NumFrames);
+
+                        if (animation->NumFrames > 0)
+                        {
+                            int frameMin = 0;
+                            int frameMax = std::max(0, animation->NumFrames - 1);
+                            if (ImGui::SliderInt("Frame", &_animatorFrame, frameMin, frameMax))
+                            {
+                                _animatorTime = static_cast<float>(_animatorFrame) / _animatorFps;
+                                _animatorFrameAccumulator = 0.0f;
+                                _animatorDirty = true;
+                                animatorChanged = true;
+                            }
+                            float norm = frameMax > 0 ? static_cast<float>(_animatorFrame) / static_cast<float>(frameMax) : 0.0f;
+                            ImGui::Text("Time: %.3f (normalized %.3f)", _animatorTime, norm);
+                            if (ImGui::Checkbox("Render bones", &_drawAnimatorBones))
+                                animatorChanged = true;
+                        }
+
+                        if (tree && !animation->SamplesDecoded)
+                        {
+                            if (!animation->DecodeType6Samples(*tree))
+                                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Failed to decode Type-6 data.");
+                            else
+                                _animatorDirty = true;
+                        }
+
+                        if (animation->SamplesDecoded &&
+                            _animatorSelectedBranch >= 0 &&
+                            static_cast<std::size_t>(_animatorSelectedBranch) < animation->Quantization.Translation.size())
+                        {
+                            auto showRange = [](char const* label, SeEditor::Forest::SuAnimationQuantRange const& range) {
+                                if (range.Valid)
+                                    ImGui::Text("%s min=%.6f delta=%.6f", label, range.Minimum, range.Delta);
+                                else
+                                    ImGui::TextDisabled("%s default", label);
+                            };
+
+                            auto const& qt = animation->Quantization.Translation[static_cast<std::size_t>(_animatorSelectedBranch)];
+                            auto const& qr = animation->Quantization.Rotation[static_cast<std::size_t>(_animatorSelectedBranch)];
+                            auto const& qs = animation->Quantization.Scale[static_cast<std::size_t>(_animatorSelectedBranch)];
+                            auto const& qv = animation->Quantization.Visibility[static_cast<std::size_t>(_animatorSelectedBranch)];
+
+                            ImGui::SeparatorText("Quantization");
+                            showRange("T.X", qt[0]);
+                            showRange("T.Y", qt[1]);
+                            showRange("T.Z", qt[2]);
+                            showRange("R.X", qr[0]);
+                            showRange("R.Y", qr[1]);
+                            showRange("R.Z", qr[2]);
+                            showRange("R.W", qr[3]);
+                            showRange("S.X", qs[0]);
+                            showRange("S.Y", qs[1]);
+                            showRange("S.Z", qs[2]);
+                            showRange("Vis", qv);
+                        }
+                    }
+                }
+            }
+            if (animatorChanged)
+                SaveAnimatorSettings();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -2953,6 +3328,7 @@ void CharmyBee::LoadForestResources()
     _drawForestMeshes = false;
     _forestLibrary.reset();
     _allForestMeshes.clear();
+    _forestMeshSources.clear();
 
     auto it = std::find_if(_sifChunks.begin(), _sifChunks.end(),
         [](SifChunkInfo const& c) { return c.TypeValue == MakeTypeCode('F', 'O', 'R', 'E'); });
@@ -2995,6 +3371,8 @@ void CharmyBee::LoadForestResources()
         SlLib::Math::Vector3 Pos{};
         SlLib::Math::Vector3 Normal{0.0f, 1.0f, 0.0f};
         SlLib::Math::Vector2 Uv{};
+        std::array<float, 4> Weights{1.0f, 0.0f, 0.0f, 0.0f};
+        std::array<float, 4> Indices{0.0f, 0.0f, 0.0f, 0.0f};
     };
 
     struct BoxState
@@ -3034,6 +3412,11 @@ void CharmyBee::LoadForestResources()
     };
     auto readS16 = [&](std::vector<std::uint8_t> const& data, std::size_t offset) -> std::int16_t {
         return static_cast<std::int16_t>(readU16(data, offset));
+    };
+    auto readU8 = [](std::vector<std::uint8_t> const& data, std::size_t offset) -> std::uint8_t {
+        if (offset >= data.size())
+            return 0;
+        return data[offset];
     };
 
     auto decodeVertex = [&](SeEditor::Forest::SuRenderVertexStream const& stream) {
@@ -3107,8 +3490,56 @@ void CharmyBee::LoadForestResources()
                                 HalfToFloat(readU16(stream.Stream, off + 2))};
                     }
                 }
+                else if (attr.Usage == D3DDeclUsage::BlendWeight)
+                {
+                    if (attr.Type == D3DDeclType::Float4)
+                    {
+                        v.Weights = {readFloat(stream.Stream, off + 0),
+                                     readFloat(stream.Stream, off + 4),
+                                     readFloat(stream.Stream, off + 8),
+                                     readFloat(stream.Stream, off + 12)};
+                    }
+                    else if (attr.Type == D3DDeclType::UByte4N)
+                    {
+                        v.Weights = {readU8(stream.Stream, off + 0) / 255.0f,
+                                     readU8(stream.Stream, off + 1) / 255.0f,
+                                     readU8(stream.Stream, off + 2) / 255.0f,
+                                     readU8(stream.Stream, off + 3) / 255.0f};
+                    }
+                    else if (attr.Type == D3DDeclType::Short4N)
+                    {
+                        v.Weights = {readS16(stream.Stream, off + 0) / 32767.0f,
+                                     readS16(stream.Stream, off + 2) / 32767.0f,
+                                     readS16(stream.Stream, off + 4) / 32767.0f,
+                                     readS16(stream.Stream, off + 6) / 32767.0f};
+                    }
+                }
+                else if (attr.Usage == D3DDeclUsage::BlendIndices)
+                {
+                    if (attr.Type == D3DDeclType::UByte4 || attr.Type == D3DDeclType::UByte4N)
+                    {
+                        v.Indices = {static_cast<float>(readU8(stream.Stream, off + 0)),
+                                     static_cast<float>(readU8(stream.Stream, off + 1)),
+                                     static_cast<float>(readU8(stream.Stream, off + 2)),
+                                     static_cast<float>(readU8(stream.Stream, off + 3))};
+                    }
+                    else if (attr.Type == D3DDeclType::Short4)
+                    {
+                        v.Indices = {static_cast<float>(readS16(stream.Stream, off + 0)),
+                                     static_cast<float>(readS16(stream.Stream, off + 2)),
+                                     static_cast<float>(readS16(stream.Stream, off + 4)),
+                                     static_cast<float>(readS16(stream.Stream, off + 6))};
+                    }
+                }
             }
 
+            float sum = v.Weights[0] + v.Weights[1] + v.Weights[2] + v.Weights[3];
+            if (sum > 0.0f)
+            {
+                float inv = 1.0f / sum;
+                for (auto& w : v.Weights)
+                    w *= inv;
+            }
             verts[static_cast<std::size_t>(i)] = v;
         }
 
@@ -3117,10 +3548,27 @@ void CharmyBee::LoadForestResources()
 
     auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
         auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        auto safe = [](float v, float fallback) { return std::isfinite(v) ? v : fallback; };
+        t.X = safe(t.X, 0.0f);
+        t.Y = safe(t.Y, 0.0f);
+        t.Z = safe(t.Z, 0.0f);
         s.X = clamp(s.X);
         s.Y = clamp(s.Y);
         s.Z = clamp(s.Z);
+        s.X = safe(s.X, 1.0f);
+        s.Y = safe(s.Y, 1.0f);
+        s.Z = safe(s.Z, 1.0f);
         SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
+        float qLen = std::sqrt(q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W);
+        if (!std::isfinite(qLen) || qLen < 1e-6f)
+        {
+            q = {0.0f, 0.0f, 0.0f, 1.0f};
+        }
+        else
+        {
+            float invLen = 1.0f / qLen;
+            q = q * invLen;
+        }
         SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
         SlLib::Math::Matrix4x4 scale{};
         scale(0, 0) = s.X;
@@ -3136,6 +3584,7 @@ void CharmyBee::LoadForestResources()
     };
 
     std::vector<Renderer::SlRenderer::ForestCpuMesh> meshes;
+    std::vector<ForestMeshSource> meshSources;
     std::vector<ForestBoxLayer> layers;
     layers.reserve(library->Forests.size());
     std::size_t debugDroppedLogged = 0;
@@ -3222,26 +3671,48 @@ void CharmyBee::LoadForestResources()
                     if (verts.empty())
                         continue;
 
-                    SlLib::Math::Matrix4x4 normalMatrix = worldMatrix;
-                    normalMatrix(0, 3) = 0.0f;
-                    normalMatrix(1, 3) = 0.0f;
-                    normalMatrix(2, 3) = 0.0f;
-
-                    for (auto& v : verts)
+                    for (auto const& v : verts)
                     {
                         SlLib::Math::Vector4 pos4{v.Pos.X, v.Pos.Y, v.Pos.Z, 1.0f};
                         auto transformed = SlLib::Math::Transform(worldMatrix, pos4);
-                        v.Pos = {transformed.X, transformed.Y, transformed.Z};
-                        treeInfo.Bounds.Include(v.Pos);
-                        forestState.Include(v.Pos);
+                        SlLib::Math::Vector3 p{transformed.X, transformed.Y, transformed.Z};
+                        treeInfo.Bounds.Include(p);
+                        forestState.Include(p);
+                    }
 
-                        SlLib::Math::Vector4 n4{v.Normal.X, v.Normal.Y, v.Normal.Z, 0.0f};
-                        auto nT = SlLib::Math::Transform(normalMatrix, n4);
-                        v.Normal = SlLib::Math::normalize({nT.X, nT.Y, nT.Z});
+                    bool skinned = !mesh->BoneMatrixIndices.empty() && !mesh->BoneInverseMatrices.empty();
+
+                    ForestMeshSource source;
+                    source.Skinned = skinned;
+                    if (skinned)
+                    {
+                        source.BoneMatrixIndices = mesh->BoneMatrixIndices;
+                        source.BoneInverseMatrices = mesh->BoneInverseMatrices;
+                    }
+                    source.Vertices.reserve(verts.size() * 16);
+                    for (auto const& v : verts)
+                    {
+                        source.Vertices.push_back(v.Pos.X);
+                        source.Vertices.push_back(v.Pos.Y);
+                        source.Vertices.push_back(v.Pos.Z);
+                        source.Vertices.push_back(v.Normal.X);
+                        source.Vertices.push_back(v.Normal.Y);
+                        source.Vertices.push_back(v.Normal.Z);
+                        source.Vertices.push_back(v.Uv.X);
+                        source.Vertices.push_back(v.Uv.Y);
+                        source.Vertices.insert(source.Vertices.end(), v.Weights.begin(), v.Weights.end());
+                        source.Vertices.insert(source.Vertices.end(), v.Indices.begin(), v.Indices.end());
                     }
 
                     Renderer::SlRenderer::ForestCpuMesh cpu;
-                    cpu.Vertices.reserve(verts.size() * 8);
+                    cpu.Model = skinned ? IdentityMatrix() : worldMatrix;
+                    cpu.Skinned = skinned;
+                    if (skinned)
+                    {
+                        cpu.BoneMatrixIndices = mesh->BoneMatrixIndices;
+                        cpu.BoneInverseMatrices = mesh->BoneInverseMatrices;
+                    }
+                    cpu.Vertices.reserve(verts.size() * 16);
                     for (auto const& v : verts)
                     {
                         cpu.Vertices.push_back(v.Pos.X);
@@ -3252,6 +3723,8 @@ void CharmyBee::LoadForestResources()
                         cpu.Vertices.push_back(v.Normal.Z);
                         cpu.Vertices.push_back(v.Uv.X);
                         cpu.Vertices.push_back(v.Uv.Y);
+                        cpu.Vertices.insert(cpu.Vertices.end(), v.Weights.begin(), v.Weights.end());
+                        cpu.Vertices.insert(cpu.Vertices.end(), v.Indices.begin(), v.Indices.end());
                     }
 
                     std::size_t availableIndices = primitive->IndexData.size() / 2;
@@ -3548,6 +4021,14 @@ void CharmyBee::LoadForestResources()
                     cpu.TreeIndex = static_cast<int>(treeIdx);
                     cpu.BranchIndex = branchIndex;
                     meshes.push_back(std::move(cpu));
+
+                    if (primitive->Material && !primitive->Material->Textures.empty())
+                        source.Texture = primitive->Material->Textures[0]->TextureResource;
+                    source.ForestIndex = static_cast<int>(forestIdx);
+                    source.TreeIndex = static_cast<int>(treeIdx);
+                    source.BranchIndex = branchIndex;
+                    source.Indices = meshes.back().Indices;
+                    meshSources.push_back(std::move(source));
                 }
             };
 
@@ -3608,6 +4089,7 @@ void CharmyBee::LoadForestResources()
     if (!meshes.empty())
     {
         _allForestMeshes = std::move(meshes);
+        _forestMeshSources = std::move(meshSources);
         _drawForestMeshes = true;
         _forestLibrary = std::move(library);
         std::cout << "[CharmyBee] Forest meshes loaded: " << _forestLibrary->Forests.size() << " forests." << std::endl;
@@ -3615,14 +4097,18 @@ void CharmyBee::LoadForestResources()
     else
     {
         _allForestMeshes.clear();
+        _forestMeshSources.clear();
     }
 
     _forestBoxLayers = std::move(layers);
     LoadForestVisibility();
     UpdateForestHierarchy();
+    LoadForestHierarchyVisibility();
+    LoadAnimatorSettings();
     ApplyTreeVisibilityToLayers();
     UpdateForestBoxRenderer();
     UpdateForestMeshRendering();
+    _animatorDirty = true;
 }
 
 
@@ -4311,7 +4797,12 @@ void CharmyBee::BuildLogicLocatorMeshes()
         for (auto const& mesh : *meshList)
         {
             Renderer::SlRenderer::ForestCpuMesh transformed = mesh;
-            for (std::size_t v = 0; v + 7 < transformed.Vertices.size(); v += 8)
+            transformed.Model = IdentityMatrix();
+            transformed.Skinned = false;
+            transformed.BoneMatrixIndices.clear();
+            transformed.BoneInverseMatrices.clear();
+            transformed.BonePalette.clear();
+            for (std::size_t v = 0; v + 15 < transformed.Vertices.size(); v += 16)
             {
                 SlLib::Math::Vector4 pos{
                     transformed.Vertices[v + 0],
@@ -4754,7 +5245,17 @@ void CharmyBee::UpdateForestMeshRendering()
 
         filtered.erase(std::remove_if(filtered.begin(), filtered.end(),
                                       [this](Renderer::SlRenderer::ForestCpuMesh const& mesh) {
-                                          return !IsBranchVisible(mesh.ForestIndex, mesh.TreeIndex, mesh.BranchIndex);
+                                          if (!IsBranchVisible(mesh.ForestIndex, mesh.TreeIndex, mesh.BranchIndex))
+                                              return true;
+                                          if (_animatorVisibilityForest >= 0 &&
+                                              _animatorVisibilityTree >= 0 &&
+                                              mesh.ForestIndex == _animatorVisibilityForest &&
+                                              mesh.TreeIndex == _animatorVisibilityTree &&
+                                              mesh.BranchIndex >= 0 &&
+                                              static_cast<std::size_t>(mesh.BranchIndex) < _animatorBranchVisibility.size() &&
+                                              !_animatorBranchVisibility[static_cast<std::size_t>(mesh.BranchIndex)])
+                                              return true;
+                                          return false;
                                       }),
                        filtered.end());
 
@@ -4775,6 +5276,24 @@ void CharmyBee::UpdateForestMeshRendering()
     bool hasVisible = !combined.empty();
     _renderer.SetForestMeshes(std::move(combined));
     _renderer.SetDrawForestMeshes(hasVisible);
+
+    if (std::getenv("RENDER_PRE_DEBUG") != nullptr)
+    {
+        static auto s_last = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (now - s_last >= std::chrono::seconds(1))
+        {
+            s_last = now;
+            std::size_t meshCount = _renderer.DebugForestMeshCount();
+            std::size_t skinnedCount = _renderer.DebugForestSkinnedCount();
+            std::size_t dirty = _renderer.DebugForestDirty() ? 1u : 0u;
+            std::cout << "[RenderPre] meshes=" << meshCount
+                      << " skinned=" << skinnedCount
+                      << " dirty=" << dirty
+                      << " draw=" << (hasVisible ? 1 : 0)
+                      << std::endl;
+        }
+    }
 }
 
 void CharmyBee::UpdateForestHierarchy()
@@ -4852,7 +5371,9 @@ void CharmyBee::UpdateForestHierarchy()
 
             std::cout << "[ForestHierarchy] tree=" << treeHierarchy.Name << " branches=" << branchCount
                       << " roots=" << treeHierarchy.Roots.size() << std::endl;
-            for (std::size_t idx = 0; idx < std::min<std::size_t>(5, branchCount); ++idx)
+            bool dumpAll = (std::getenv("FOREST_HIER_DUMP") != nullptr);
+            std::size_t limit = dumpAll ? branchCount : std::min<std::size_t>(5, branchCount);
+            for (std::size_t idx = 0; idx < limit; ++idx)
             {
                 auto const& branch = treeHierarchy.Nodes[idx].Branch;
                 std::string name = branch && !branch->Name.empty()
@@ -4979,6 +5500,8 @@ void CharmyBee::RenderForestHierarchyWindow()
         ImGui::End();
         return;
     }
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
+        _blockSceneInput = true;
 
     if (_forestHierarchy.empty())
     {
@@ -5058,6 +5581,765 @@ void CharmyBee::RenderForestHierarchyList()
         ApplyTreeVisibilityToLayers();
         UpdateForestBoxRenderer();
         UpdateForestMeshRendering();
+        ApplyAnimatorFrame();
+        SaveForestHierarchyVisibility();
+    }
+}
+
+void CharmyBee::BuildForestMeshesFromPose(std::vector<SlLib::Math::Vector4> const& translations,
+                                          std::vector<SlLib::Math::Vector4> const& rotations,
+                                          std::vector<SlLib::Math::Vector4> const& scales,
+                                          int forestIndex,
+                                          int treeIndex)
+{
+    if (!_forestLibrary)
+        return;
+    if (forestIndex < 0 || treeIndex < 0)
+        return;
+    if (static_cast<std::size_t>(forestIndex) >= _forestLibrary->Forests.size())
+        return;
+
+    auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(forestIndex)];
+    if (!forestEntry.Forest)
+        return;
+    if (static_cast<std::size_t>(treeIndex) >= forestEntry.Forest->Trees.size())
+        return;
+
+    auto const& tree = forestEntry.Forest->Trees[static_cast<std::size_t>(treeIndex)];
+    if (!tree)
+        return;
+
+    std::size_t branchCount = tree->Branches.size();
+    std::vector<SlLib::Math::Matrix4x4> world(branchCount);
+    std::vector<bool> computed(branchCount, false);
+
+    auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
+        auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        s.X = clamp(s.X);
+        s.Y = clamp(s.Y);
+        s.Z = clamp(s.Z);
+        SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
+        SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
+        SlLib::Math::Matrix4x4 scale{};
+        scale(0, 0) = s.X;
+        scale(1, 1) = s.Y;
+        scale(2, 2) = s.Z;
+        scale(3, 3) = 1.0f;
+        SlLib::Math::Matrix4x4 local = SlLib::Math::Multiply(rot, scale);
+        local(0, 3) = t.X;
+        local(1, 3) = t.Y;
+        local(2, 3) = t.Z;
+        local(3, 3) = 1.0f;
+        return local;
+    };
+
+    std::function<SlLib::Math::Matrix4x4(int)> computeWorld = [&](int idx) -> SlLib::Math::Matrix4x4 {
+        if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount)
+            return SlLib::Math::Matrix4x4{};
+        if (computed[static_cast<std::size_t>(idx)])
+            return world[static_cast<std::size_t>(idx)];
+
+        SlLib::Math::Vector4 t{};
+        SlLib::Math::Vector4 r{};
+        SlLib::Math::Vector4 s{1.0f, 1.0f, 1.0f, 1.0f};
+        if (static_cast<std::size_t>(idx) < translations.size())
+            t = translations[static_cast<std::size_t>(idx)];
+        if (static_cast<std::size_t>(idx) < rotations.size())
+            r = rotations[static_cast<std::size_t>(idx)];
+        if (static_cast<std::size_t>(idx) < scales.size())
+            s = scales[static_cast<std::size_t>(idx)];
+
+        auto local = buildLocalMatrix(t, r, s);
+        int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+        if (parentIndex >= 0 && parentIndex < static_cast<int>(branchCount))
+            world[static_cast<std::size_t>(idx)] = SlLib::Math::Multiply(computeWorld(parentIndex), local);
+        else
+            world[static_cast<std::size_t>(idx)] = local;
+
+        computed[static_cast<std::size_t>(idx)] = true;
+        return world[static_cast<std::size_t>(idx)];
+    };
+
+    for (int i = 0; i < static_cast<int>(branchCount); ++i)
+        computeWorld(i);
+
+    std::vector<SlLib::Math::Matrix4x4> bindWorld(branchCount);
+    std::vector<bool> bindComputed(branchCount, false);
+    std::function<SlLib::Math::Matrix4x4(int)> computeBindWorld = [&](int idx) -> SlLib::Math::Matrix4x4 {
+        if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount)
+            return SlLib::Math::Matrix4x4{};
+        if (bindComputed[static_cast<std::size_t>(idx)])
+            return bindWorld[static_cast<std::size_t>(idx)];
+
+        SlLib::Math::Vector4 t{};
+        SlLib::Math::Vector4 r{};
+        SlLib::Math::Vector4 s{1.0f, 1.0f, 1.0f, 1.0f};
+        if (static_cast<std::size_t>(idx) < tree->Translations.size())
+            t = tree->Translations[static_cast<std::size_t>(idx)];
+        if (static_cast<std::size_t>(idx) < tree->Rotations.size())
+            r = tree->Rotations[static_cast<std::size_t>(idx)];
+        if (static_cast<std::size_t>(idx) < tree->Scales.size())
+            s = tree->Scales[static_cast<std::size_t>(idx)];
+
+        auto local = buildLocalMatrix(t, r, s);
+        int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+        if (parentIndex >= 0 && parentIndex < static_cast<int>(branchCount))
+            bindWorld[static_cast<std::size_t>(idx)] = SlLib::Math::Multiply(computeBindWorld(parentIndex), local);
+        else
+            bindWorld[static_cast<std::size_t>(idx)] = local;
+
+        bindComputed[static_cast<std::size_t>(idx)] = true;
+        return bindWorld[static_cast<std::size_t>(idx)];
+    };
+
+    for (int i = 0; i < static_cast<int>(branchCount); ++i)
+        computeBindWorld(i);
+
+    _allForestMeshes.clear();
+    _allForestMeshes.reserve(_forestMeshSources.size());
+    for (auto& source : _forestMeshSources)
+    {
+        if (source.ForestIndex != forestIndex || source.TreeIndex != treeIndex)
+            continue;
+        if (source.BranchIndex < 0 || static_cast<std::size_t>(source.BranchIndex) >= branchCount)
+            continue;
+
+        Renderer::SlRenderer::ForestCpuMesh cpu;
+        cpu.Vertices = source.Vertices;
+        cpu.Model = source.Skinned ? IdentityMatrix() : world[static_cast<std::size_t>(source.BranchIndex)];
+        cpu.Skinned = source.Skinned;
+        if (source.Skinned)
+        {
+            cpu.BoneMatrixIndices = source.BoneMatrixIndices;
+            cpu.BoneInverseMatrices = source.BoneInverseMatrices;
+
+            std::vector<SlLib::Math::Matrix4x4> const* bindWorldPtr = &bindWorld;
+
+            std::size_t n = std::min(source.BoneMatrixIndices.size(), source.BoneInverseMatrices.size());
+            cpu.BonePalette.resize(n);
+            for (std::size_t bi = 0; bi < n; ++bi)
+            {
+                int boneIndex = source.BoneMatrixIndices[bi];
+                if (boneIndex < 0 || static_cast<std::size_t>(boneIndex) >= world.size())
+                {
+                    cpu.BonePalette[bi] = IdentityMatrix();
+                    continue;
+                }
+                SlLib::Math::Matrix4x4 inv = source.BoneInverseMatrices[bi];
+                if (bindWorldPtr && static_cast<std::size_t>(boneIndex) < bindWorldPtr->size())
+                    inv = SlLib::Math::Invert((*bindWorldPtr)[static_cast<std::size_t>(boneIndex)]);
+                SlLib::Math::Matrix4x4 w = world[static_cast<std::size_t>(boneIndex)];
+                auto pal = SlLib::Math::Multiply(w, inv);
+                bool bad = false;
+                for (int r = 0; r < 4 && !bad; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        if (!std::isfinite(pal(r, c)))
+                            bad = true;
+                cpu.BonePalette[bi] = bad ? IdentityMatrix() : pal;
+            }
+
+        }
+        cpu.Indices = source.Indices;
+        cpu.Texture = source.Texture;
+        cpu.ForestIndex = source.ForestIndex;
+        cpu.TreeIndex = source.TreeIndex;
+        cpu.BranchIndex = source.BranchIndex;
+        _allForestMeshes.push_back(std::move(cpu));
+    }
+
+    UpdateForestMeshRendering();
+}
+
+void CharmyBee::ApplyAnimatorFrame()
+{
+    if (!_forestLibrary || _forestMeshSources.empty())
+        return;
+
+    bool useAnimation = false;
+    SeEditor::Forest::SuRenderTree* animTree = nullptr;
+    SeEditor::Forest::SuAnimation* animation = nullptr;
+
+    if (_animatorSelectedAnimation >= 0 &&
+        _animatorSelectedForest >= 0 &&
+        _animatorSelectedTree >= 0 &&
+        static_cast<std::size_t>(_animatorSelectedForest) < _forestLibrary->Forests.size())
+    {
+        auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(_animatorSelectedForest)];
+        if (forestEntry.Forest &&
+            static_cast<std::size_t>(_animatorSelectedTree) < forestEntry.Forest->Trees.size())
+        {
+            animTree = forestEntry.Forest->Trees[static_cast<std::size_t>(_animatorSelectedTree)].get();
+            if (animTree && static_cast<std::size_t>(_animatorSelectedAnimation) < animTree->AnimationEntries.size())
+            {
+                auto const& animEntry = animTree->AnimationEntries[static_cast<std::size_t>(_animatorSelectedAnimation)];
+                animation = animEntry.Animation.get();
+            }
+        }
+    }
+
+    if (animation && animTree && animation->Type >= 0x06 && animation->Type <= 0x0A)
+    {
+        useAnimation = animation->DecodeType6Samples(*animTree);
+        if (useAnimation && animation->NumFrames > 0)
+        {
+            if (_animatorFrame < 0)
+                _animatorFrame = 0;
+            if (_animatorFrame >= animation->NumFrames)
+                _animatorFrame = animation->NumFrames - 1;
+        }
+    }
+
+    if (std::getenv("ANIM_PRE_DEBUG") != nullptr)
+    {
+        static auto s_lastAnimPre = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        bool emit = (now - s_lastAnimPre) >= std::chrono::seconds(1);
+        if (emit)
+            s_lastAnimPre = now;
+        int stamp = (_animatorSelectedForest << 16) ^ (_animatorSelectedTree << 8) ^ _animatorSelectedAnimation;
+        if (stamp != _animatorDebugStamp)
+        {
+            _animatorDebugStamp = stamp;
+            if (animation)
+            {
+                std::cout << "[AnimPre] forest=" << _animatorSelectedForest
+                          << " tree=" << _animatorSelectedTree
+                          << " anim=" << _animatorSelectedAnimation
+                          << " type=" << animation->Type
+                          << " frames=" << animation->NumFrames
+                          << " bones=" << animation->NumBones
+                          << " decoded=" << (animation->SamplesDecoded ? 1 : 0)
+                          << " paramGpu=" << (animation->Type6ParamDataIsGpu ? 1 : 0)
+                          << " blockStart=" << animation->Type6BlockStart
+                          << " blockEnd=" << animation->Type6BlockEnd
+                          << " paramOffset=" << animation->Type6ParamDataOffset
+                          << " dataSize=" << animation->Type6DataSize
+                          << std::endl;
+            }
+            else
+            {
+                int animCount = 0;
+                if (animTree)
+                    animCount = static_cast<int>(animTree->AnimationEntries.size());
+                std::cout << "[AnimPre] forest=" << _animatorSelectedForest
+                          << " tree=" << _animatorSelectedTree
+                          << " anim=" << _animatorSelectedAnimation
+                          << " animCount=" << animCount
+                          << " status=no_animation_selected"
+                          << std::endl;
+            }
+        }
+        if (emit)
+        {
+            bool anyDiff = false;
+            bool hasSample = false;
+            if (useAnimation && animation && animTree)
+            {
+                int boneCount = animation->NumBones;
+                int checks[] = {0, boneCount / 2, boneCount - 1};
+                auto diffVec = [](SlLib::Math::Vector4 const& a, SlLib::Math::Vector4 const& b) {
+                    return std::fabs(a.X - b.X) > 1e-4f ||
+                           std::fabs(a.Y - b.Y) > 1e-4f ||
+                           std::fabs(a.Z - b.Z) > 1e-4f ||
+                           std::fabs(a.W - b.W) > 1e-4f;
+                };
+                for (int idx : checks)
+                {
+                    if (idx < 0 || idx >= boneCount)
+                        continue;
+                    auto sample = animation->GetSample(_animatorFrame, idx);
+                    if (!sample)
+                        continue;
+                    hasSample = true;
+                    SlLib::Math::Vector4 bt{};
+                    SlLib::Math::Vector4 br{};
+                    SlLib::Math::Vector4 bs{1.0f, 1.0f, 1.0f, 1.0f};
+                    if (static_cast<std::size_t>(idx) < animTree->Translations.size())
+                        bt = animTree->Translations[static_cast<std::size_t>(idx)];
+                    if (static_cast<std::size_t>(idx) < animTree->Rotations.size())
+                        br = animTree->Rotations[static_cast<std::size_t>(idx)];
+                    if (static_cast<std::size_t>(idx) < animTree->Scales.size())
+                        bs = animTree->Scales[static_cast<std::size_t>(idx)];
+                    if (diffVec(sample->Translation, bt) ||
+                        diffVec(sample->Rotation, br) ||
+                        diffVec(sample->Scale, bs))
+                    {
+                        anyDiff = true;
+                        break;
+                    }
+                }
+            }
+            std::cout << "[AnimPre] frame=" << _animatorFrame
+                      << " useAnimation=" << (useAnimation ? 1 : 0)
+                      << " treeMatch=" << ((animTree != nullptr) ? 1 : 0)
+                      << " hasSample=" << (hasSample ? 1 : 0)
+                      << " anyDiff=" << (anyDiff ? 1 : 0)
+                      << " maskNonZero=" << (animation ? animation->Type6MaskNonZero : 0)
+                      << " mask0=0x" << std::hex << (animation ? animation->Type6MaskSample[0] : 0u)
+                      << " mask1=0x" << (animation ? animation->Type6MaskSample[1] : 0u)
+                      << " mask2=0x" << (animation ? animation->Type6MaskSample[2] : 0u)
+                      << std::dec
+                      << std::endl;
+        }
+    }
+
+    std::vector<std::vector<std::vector<SlLib::Math::Matrix4x4>>> worldByForest;
+    std::vector<std::vector<std::vector<SlLib::Math::Matrix4x4>>> bindWorldByForest;
+    worldByForest.resize(_forestLibrary->Forests.size());
+    bindWorldByForest.resize(_forestLibrary->Forests.size());
+    std::vector<bool> animVisibility;
+    int animForestIndex = _animatorSelectedForest;
+    int animTreeIndex = _animatorSelectedTree;
+    bool hasAnimVisibility = false;
+
+    auto buildLocalMatrix = [](SlLib::Math::Vector4 t, SlLib::Math::Vector4 r, SlLib::Math::Vector4 s) {
+        auto clamp = [](float v) { return (std::abs(v) < 1e-4f) ? 1.0f : v; };
+        s.X = clamp(s.X);
+        s.Y = clamp(s.Y);
+        s.Z = clamp(s.Z);
+        SlLib::Math::Quaternion q{r.X, r.Y, r.Z, r.W};
+        SlLib::Math::Matrix4x4 rot = SlLib::Math::CreateFromQuaternion(q);
+        SlLib::Math::Matrix4x4 scale{};
+        scale(0, 0) = s.X;
+        scale(1, 1) = s.Y;
+        scale(2, 2) = s.Z;
+        scale(3, 3) = 1.0f;
+        SlLib::Math::Matrix4x4 local = SlLib::Math::Multiply(rot, scale);
+        local(0, 3) = t.X;
+        local(1, 3) = t.Y;
+        local(2, 3) = t.Z;
+        local(3, 3) = 1.0f;
+        return local;
+    };
+
+    for (std::size_t forestIdx = 0; forestIdx < _forestLibrary->Forests.size(); ++forestIdx)
+    {
+        auto const& forestEntry = _forestLibrary->Forests[forestIdx];
+        if (!forestEntry.Forest)
+            continue;
+        auto const& trees = forestEntry.Forest->Trees;
+        worldByForest[forestIdx].resize(trees.size());
+        bindWorldByForest[forestIdx].resize(trees.size());
+
+        for (std::size_t treeIdx = 0; treeIdx < trees.size(); ++treeIdx)
+        {
+            auto const& tree = trees[treeIdx];
+            if (!tree)
+                continue;
+
+            std::size_t branchCount = tree->Branches.size();
+            std::vector<SlLib::Math::Matrix4x4> world(branchCount);
+            std::vector<bool> computed(branchCount, false);
+
+            std::vector<SlLib::Math::Vector4> t = tree->Translations;
+            std::vector<SlLib::Math::Vector4> r = tree->Rotations;
+            std::vector<SlLib::Math::Vector4> s = tree->Scales;
+
+            std::vector<SlLib::Math::Matrix4x4> bindWorld(branchCount);
+            std::vector<bool> bindComputed(branchCount, false);
+            std::function<SlLib::Math::Matrix4x4(int)> computeBindWorld = [&](int idx) -> SlLib::Math::Matrix4x4 {
+                if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount)
+                    return SlLib::Math::Matrix4x4{};
+                if (bindComputed[static_cast<std::size_t>(idx)])
+                    return bindWorld[static_cast<std::size_t>(idx)];
+
+                SlLib::Math::Vector4 lt{};
+                SlLib::Math::Vector4 lr{};
+                SlLib::Math::Vector4 ls{1.0f, 1.0f, 1.0f, 1.0f};
+                if (static_cast<std::size_t>(idx) < tree->Translations.size())
+                    lt = tree->Translations[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < tree->Rotations.size())
+                    lr = tree->Rotations[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < tree->Scales.size())
+                    ls = tree->Scales[static_cast<std::size_t>(idx)];
+
+                auto local = buildLocalMatrix(lt, lr, ls);
+                int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+                if (parentIndex >= 0 && parentIndex < static_cast<int>(branchCount))
+                    bindWorld[static_cast<std::size_t>(idx)] = SlLib::Math::Multiply(computeBindWorld(parentIndex), local);
+                else
+                    bindWorld[static_cast<std::size_t>(idx)] = local;
+
+                bindComputed[static_cast<std::size_t>(idx)] = true;
+                return bindWorld[static_cast<std::size_t>(idx)];
+            };
+
+            for (int i = 0; i < static_cast<int>(branchCount); ++i)
+                computeBindWorld(i);
+
+            if (useAnimation &&
+                animTree == tree.get() &&
+                forestIdx == static_cast<std::size_t>(_animatorSelectedForest) &&
+                treeIdx == static_cast<std::size_t>(_animatorSelectedTree))
+            {
+                t.resize(branchCount);
+                r.resize(branchCount);
+                s.resize(branchCount);
+                animVisibility.assign(branchCount, true);
+                hasAnimVisibility = true;
+                for (std::size_t bone = 0; bone < branchCount; ++bone)
+                {
+                    auto sample = animation->GetSample(_animatorFrame, static_cast<int>(bone));
+                    if (!sample)
+                        continue;
+                    t[bone] = sample->Translation;
+                    r[bone] = sample->Rotation;
+                    s[bone] = sample->Scale;
+                    animVisibility[bone] = sample->Visible;
+                }
+            }
+
+            std::function<SlLib::Math::Matrix4x4(int)> computeWorld = [&](int idx) -> SlLib::Math::Matrix4x4 {
+                if (idx < 0 || static_cast<std::size_t>(idx) >= branchCount)
+                    return SlLib::Math::Matrix4x4{};
+                if (computed[static_cast<std::size_t>(idx)])
+                    return world[static_cast<std::size_t>(idx)];
+
+                SlLib::Math::Vector4 lt{};
+                SlLib::Math::Vector4 lr{};
+                SlLib::Math::Vector4 ls{1.0f, 1.0f, 1.0f, 1.0f};
+                if (static_cast<std::size_t>(idx) < t.size())
+                    lt = t[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < r.size())
+                    lr = r[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < s.size())
+                    ls = s[static_cast<std::size_t>(idx)];
+
+                auto local = buildLocalMatrix(lt, lr, ls);
+                int parentIndex = tree->Branches[static_cast<std::size_t>(idx)]->Parent;
+                if (parentIndex >= 0 && parentIndex < static_cast<int>(branchCount))
+                    world[static_cast<std::size_t>(idx)] = SlLib::Math::Multiply(computeWorld(parentIndex), local);
+                else
+                    world[static_cast<std::size_t>(idx)] = local;
+
+                computed[static_cast<std::size_t>(idx)] = true;
+                return world[static_cast<std::size_t>(idx)];
+            };
+
+            for (int i = 0; i < static_cast<int>(branchCount); ++i)
+                computeWorld(i);
+
+            worldByForest[forestIdx][treeIdx] = std::move(world);
+            bindWorldByForest[forestIdx][treeIdx] = std::move(bindWorld);
+
+            if (std::getenv("RENDER_PRE_DEBUG") != nullptr &&
+                useAnimation &&
+                animTree == tree.get() &&
+                forestIdx == static_cast<std::size_t>(_animatorSelectedForest) &&
+                treeIdx == static_cast<std::size_t>(_animatorSelectedTree))
+            {
+                static auto s_last = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (now - s_last >= std::chrono::seconds(1))
+                {
+                    s_last = now;
+                    if (!worldByForest[forestIdx][treeIdx].empty())
+                    {
+                        auto const& wm = worldByForest[forestIdx][treeIdx].front();
+                        std::cout << "[RenderPre] world0 m00=" << wm(0, 0)
+                                  << " m03=" << wm(0, 3)
+                                  << " m13=" << wm(1, 3)
+                                  << " m23=" << wm(2, 3)
+                                  << std::endl;
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> animatorBoneLines;
+    if (_drawAnimatorBones && hasAnimVisibility &&
+        animForestIndex >= 0 && animTreeIndex >= 0 &&
+        animForestIndex < static_cast<int>(worldByForest.size()))
+    {
+        auto const& treeWorlds = worldByForest[static_cast<std::size_t>(animForestIndex)];
+        if (animTreeIndex < static_cast<int>(treeWorlds.size()))
+        {
+            auto const& world = treeWorlds[static_cast<std::size_t>(animTreeIndex)];
+            auto const& branches = animTree ? animTree->Branches : std::vector<std::shared_ptr<Forest::SuBranch>>{};
+            auto extractTranslation = [](SlLib::Math::Matrix4x4 const& matrix) {
+                return SlLib::Math::Vector3{matrix(0, 3), matrix(1, 3), matrix(2, 3)};
+            };
+            for (int branchIdx = 0; branchIdx < static_cast<int>(branches.size()); ++branchIdx)
+            {
+                auto const& branch = branches[static_cast<std::size_t>(branchIdx)];
+                if (!branch)
+                    continue;
+                int parent = branch->Parent;
+                if (parent < 0)
+                    continue;
+                if (!IsBranchVisible(animForestIndex, animTreeIndex, branchIdx))
+                    continue;
+                if (!IsBranchVisible(animForestIndex, animTreeIndex, parent))
+                    continue;
+                if (static_cast<std::size_t>(branchIdx) >= world.size() ||
+                    static_cast<std::size_t>(parent) >= world.size())
+                {
+                    continue;
+                }
+                animatorBoneLines.emplace_back(extractTranslation(world[static_cast<std::size_t>(parent)]),
+                                               extractTranslation(world[static_cast<std::size_t>(branchIdx)]));
+            }
+        }
+    }
+    _renderer.SetBoneLines(animatorBoneLines);
+    _renderer.SetDrawBoneLines(_drawAnimatorBones && !animatorBoneLines.empty());
+
+    std::vector<Renderer::SlRenderer::ForestCpuMesh> meshes;
+    meshes.reserve(_forestMeshSources.size());
+    if (hasAnimVisibility)
+    {
+        _animatorBranchVisibility = std::move(animVisibility);
+        _animatorVisibilityForest = animForestIndex;
+        _animatorVisibilityTree = animTreeIndex;
+    }
+    else
+    {
+        _animatorBranchVisibility.clear();
+        _animatorVisibilityForest = -1;
+        _animatorVisibilityTree = -1;
+    }
+
+    for (auto& source : _forestMeshSources)
+    {
+        if (source.ForestIndex < 0 || source.TreeIndex < 0 || source.BranchIndex < 0)
+            continue;
+        if (static_cast<std::size_t>(source.ForestIndex) >= worldByForest.size())
+            continue;
+        auto const& treeWorlds = worldByForest[static_cast<std::size_t>(source.ForestIndex)];
+        if (static_cast<std::size_t>(source.TreeIndex) >= treeWorlds.size())
+            continue;
+        auto const& world = treeWorlds[static_cast<std::size_t>(source.TreeIndex)];
+        if (static_cast<std::size_t>(source.BranchIndex) >= world.size())
+            continue;
+
+        Renderer::SlRenderer::ForestCpuMesh cpu;
+        cpu.Vertices = source.Vertices;
+        cpu.Model = source.Skinned ? IdentityMatrix() : world[static_cast<std::size_t>(source.BranchIndex)];
+        cpu.Skinned = source.Skinned;
+        if (source.Skinned)
+        {
+            cpu.BoneMatrixIndices = source.BoneMatrixIndices;
+            cpu.BoneInverseMatrices = source.BoneInverseMatrices;
+
+            std::vector<SlLib::Math::Matrix4x4> const* bindWorldPtr = nullptr;
+            if (static_cast<std::size_t>(source.ForestIndex) < bindWorldByForest.size())
+            {
+                auto const& bindTrees = bindWorldByForest[static_cast<std::size_t>(source.ForestIndex)];
+                if (static_cast<std::size_t>(source.TreeIndex) < bindTrees.size())
+                    bindWorldPtr = &bindTrees[static_cast<std::size_t>(source.TreeIndex)];
+            }
+
+            std::size_t n = std::min(source.BoneMatrixIndices.size(), source.BoneInverseMatrices.size());
+            cpu.BonePalette.resize(n);
+            for (std::size_t bi = 0; bi < n; ++bi)
+            {
+                int boneIndex = source.BoneMatrixIndices[bi];
+                if (boneIndex < 0 || static_cast<std::size_t>(boneIndex) >= world.size())
+                {
+                    cpu.BonePalette[bi] = IdentityMatrix();
+                    continue;
+                }
+                SlLib::Math::Matrix4x4 inv = source.BoneInverseMatrices[bi];
+                if (bindWorldPtr && static_cast<std::size_t>(boneIndex) < bindWorldPtr->size())
+                    inv = SlLib::Math::Invert((*bindWorldPtr)[static_cast<std::size_t>(boneIndex)]);
+                SlLib::Math::Matrix4x4 w = world[static_cast<std::size_t>(boneIndex)];
+                auto pal = SlLib::Math::Multiply(w, inv);
+                bool bad = false;
+                for (int r = 0; r < 4 && !bad; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        if (!std::isfinite(pal(r, c)))
+                            bad = true;
+                cpu.BonePalette[bi] = bad ? IdentityMatrix() : pal;
+            }
+
+            if (std::getenv("BONE_DEBUG") != nullptr &&
+                useAnimation && animation && animTree &&
+                source.ForestIndex == _animatorSelectedForest &&
+                source.TreeIndex == _animatorSelectedTree)
+            {
+                static auto s_last = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (now - s_last >= std::chrono::seconds(1))
+                {
+                    s_last = now;
+                    auto emitBone = [&](int boneIdx) {
+                        auto sample = animation->GetSample(_animatorFrame, boneIdx);
+                        float qLen = 0.0f;
+                        if (sample)
+                        {
+                            qLen = std::sqrt(sample->Rotation.X * sample->Rotation.X +
+                                             sample->Rotation.Y * sample->Rotation.Y +
+                                             sample->Rotation.Z * sample->Rotation.Z +
+                                             sample->Rotation.W * sample->Rotation.W);
+                        }
+                        int parentIdx = -1;
+                        if (animTree && static_cast<std::size_t>(boneIdx) < animTree->Branches.size() &&
+                            animTree->Branches[static_cast<std::size_t>(boneIdx)])
+                        {
+                            parentIdx = animTree->Branches[static_cast<std::size_t>(boneIdx)]->Parent;
+                        }
+                        int paletteIndex = -1;
+                        for (std::size_t bi = 0; bi < n; ++bi)
+                        {
+                            if (source.BoneMatrixIndices[bi] == boneIdx)
+                            {
+                                paletteIndex = static_cast<int>(bi);
+                                break;
+                            }
+                        }
+                        std::cout << "[BoneDbg] bone=" << boneIdx
+                                  << " parent=" << parentIdx
+                                  << " sample=" << (sample ? 1 : 0)
+                                  << " qLen=" << qLen
+                                  << " palette=" << paletteIndex;
+                        if (sample)
+                        {
+                            std::cout << " T=(" << sample->Translation.X << "," << sample->Translation.Y << "," << sample->Translation.Z << ")"
+                                      << " R=(" << sample->Rotation.X << "," << sample->Rotation.Y << "," << sample->Rotation.Z << "," << sample->Rotation.W << ")"
+                                      << " S=(" << sample->Scale.X << "," << sample->Scale.Y << "," << sample->Scale.Z << ")";
+                        }
+                        if (animTree && static_cast<std::size_t>(boneIdx) < animTree->Translations.size())
+                        {
+                            auto const& bt = animTree->Translations[static_cast<std::size_t>(boneIdx)];
+                            auto const& br = animTree->Rotations[static_cast<std::size_t>(boneIdx)];
+                            auto const& bs = animTree->Scales[static_cast<std::size_t>(boneIdx)];
+                            std::cout << " bindT=(" << bt.X << "," << bt.Y << "," << bt.Z << ")"
+                                      << " bindR=(" << br.X << "," << br.Y << "," << br.Z << "," << br.W << ")"
+                                      << " bindS=(" << bs.X << "," << bs.Y << "," << bs.Z << ")";
+                        }
+                        if (static_cast<std::size_t>(boneIdx) < world.size())
+                        {
+                            auto const& wm = world[static_cast<std::size_t>(boneIdx)];
+                            std::cout << " Wm00=" << wm(0, 0) << " Wm03=" << wm(0, 3);
+                        }
+                        if (parentIdx >= 0 && static_cast<std::size_t>(parentIdx) < world.size())
+                        {
+                            auto const& pwm = world[static_cast<std::size_t>(parentIdx)];
+                            std::cout << " PWm03=" << pwm(0, 3) << " PWm13=" << pwm(1, 3) << " PWm23=" << pwm(2, 3);
+                        }
+                        if (paletteIndex >= 0)
+                        {
+                            auto const& invSource = source.BoneInverseMatrices[static_cast<std::size_t>(paletteIndex)];
+                            auto const& pal = cpu.BonePalette[static_cast<std::size_t>(paletteIndex)];
+                            SlLib::Math::Matrix4x4 invUsed = invSource;
+                            auto const& bindTreeWorlds = bindWorldByForest[static_cast<std::size_t>(source.ForestIndex)];
+                            if (static_cast<std::size_t>(source.TreeIndex) < bindTreeWorlds.size() &&
+                                static_cast<std::size_t>(boneIdx) < bindTreeWorlds[static_cast<std::size_t>(source.TreeIndex)].size())
+                            {
+                                invUsed = SlLib::Math::Invert(bindTreeWorlds[static_cast<std::size_t>(source.TreeIndex)][static_cast<std::size_t>(boneIdx)]);
+                            }
+                            std::cout << " inv00=" << invSource(0, 0) << " inv03=" << invSource(0, 3)
+                                      << " invUsed00=" << invUsed(0, 0) << " invUsed03=" << invUsed(0, 3)
+                                      << " pal00=" << pal(0, 0) << " pal03=" << pal(0, 3);
+                        }
+                        auto const& bindTreeWorlds = bindWorldByForest[static_cast<std::size_t>(source.ForestIndex)];
+                        if (static_cast<std::size_t>(source.TreeIndex) < bindTreeWorlds.size() &&
+                            static_cast<std::size_t>(boneIdx) < bindTreeWorlds[static_cast<std::size_t>(source.TreeIndex)].size())
+                        {
+                            auto const& bw = bindTreeWorlds[static_cast<std::size_t>(source.TreeIndex)][static_cast<std::size_t>(boneIdx)];
+                            std::cout << " BWm03=" << bw(0, 3) << " BWm13=" << bw(1, 3) << " BWm23=" << bw(2, 3);
+                        }
+                        std::cout << std::endl;
+                    };
+                    emitBone(15);
+                    emitBone(16);
+                }
+            }
+        }
+        cpu.Indices = source.Indices;
+        cpu.Texture = source.Texture;
+        cpu.ForestIndex = source.ForestIndex;
+        cpu.TreeIndex = source.TreeIndex;
+        cpu.BranchIndex = source.BranchIndex;
+        meshes.push_back(std::move(cpu));
+    }
+
+    if (std::getenv("RENDER_PRE_DEBUG") != nullptr)
+    {
+        static auto s_last = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (now - s_last >= std::chrono::seconds(1))
+        {
+            s_last = now;
+            for (auto const& mesh : meshes)
+            {
+                if (!mesh.Skinned || mesh.BonePalette.empty())
+                    continue;
+                auto const& m = mesh.BonePalette.front();
+                std::cout << "[RenderPre] producer firstBone m00=" << m(0, 0)
+                          << " m03=" << m(0, 3)
+                          << " m13=" << m(1, 3)
+                          << " m23=" << m(2, 3)
+                          << std::endl;
+                break;
+            }
+        }
+    }
+
+    _allForestMeshes = std::move(meshes);
+    UpdateForestMeshRendering();
+    _animatorLastAppliedFrame = _animatorFrame;
+}
+
+void CharmyBee::UpdateAnimator(float deltaSeconds)
+{
+    if (!_forestLibrary || _forestMeshSources.empty())
+        return;
+
+    SeEditor::Forest::SuAnimation* animation = nullptr;
+    SeEditor::Forest::SuRenderTree* tree = nullptr;
+    static float s_animDebugTimer = 0.0f;
+
+    if (_animatorSelectedAnimation >= 0 &&
+        _animatorSelectedForest >= 0 &&
+        _animatorSelectedTree >= 0 &&
+        static_cast<std::size_t>(_animatorSelectedForest) < _forestLibrary->Forests.size())
+    {
+        auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(_animatorSelectedForest)];
+        if (forestEntry.Forest &&
+            static_cast<std::size_t>(_animatorSelectedTree) < forestEntry.Forest->Trees.size())
+        {
+            tree = forestEntry.Forest->Trees[static_cast<std::size_t>(_animatorSelectedTree)].get();
+            if (tree && static_cast<std::size_t>(_animatorSelectedAnimation) < tree->AnimationEntries.size())
+                animation = tree->AnimationEntries[static_cast<std::size_t>(_animatorSelectedAnimation)].Animation.get();
+        }
+    }
+
+    if (_animatorPlaying && animation && animation->NumFrames > 0)
+    {
+        if (_animatorFps <= 0.0f)
+            _animatorFps = 30.0f;
+        _animatorTime += deltaSeconds;
+        _animatorFrameAccumulator += deltaSeconds * _animatorFps;
+        int maxFrames = animation->NumFrames;
+        if (maxFrames > 0)
+        {
+            bool advanced = false;
+            while (_animatorFrameAccumulator >= 1.0f)
+            {
+                _animatorFrameAccumulator -= 1.0f;
+                _animatorFrame = (_animatorFrame + 1) % maxFrames;
+                advanced = true;
+            }
+            if (advanced)
+                _animatorDirty = true;
+        }
+        else
+        {
+            _animatorDirty = true;
+        }
+    }
+
+    if (!animation && _animatorLastAppliedFrame >= 0)
+        _animatorDirty = true;
+
+    (void)s_animDebugTimer;
+
+    if (_animatorDirty)
+    {
+        ApplyAnimatorFrame();
+        _animatorDirty = false;
     }
 }
 
@@ -5106,6 +6388,174 @@ std::filesystem::path CharmyBee::GetForestVisibilityPath() const
     return std::filesystem::current_path() / filename;
 }
 
+std::filesystem::path CharmyBee::GetForestHierarchyVisibilityPath() const
+{
+    std::filesystem::path base;
+    std::filesystem::path root = std::filesystem::current_path();
+    if (!_sifFilePath.empty())
+    {
+        std::filesystem::path sifPath(_sifFilePath);
+        base = sifPath.filename();
+        if (!sifPath.parent_path().empty())
+            root = sifPath.parent_path();
+        base.replace_extension("");
+    }
+    else
+    {
+        base = "forest";
+    }
+
+    std::string filename = base.string() + "_forestHierarchy.txt";
+    return root / filename;
+}
+
+std::filesystem::path CharmyBee::GetAnimatorSettingsPath() const
+{
+    std::filesystem::path base;
+    std::filesystem::path root = std::filesystem::current_path();
+    if (!_sifFilePath.empty())
+    {
+        std::filesystem::path sifPath(_sifFilePath);
+        base = sifPath.filename();
+        if (!sifPath.parent_path().empty())
+            root = sifPath.parent_path();
+        base.replace_extension("");
+    }
+    else
+    {
+        base = "forest";
+    }
+
+    std::string filename = base.string() + "_animator.txt";
+    return root / filename;
+}
+
+void CharmyBee::SaveAnimatorSettings() const
+{
+    std::filesystem::path outPath = GetAnimatorSettingsPath();
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out)
+        return;
+
+    out << "forest=" << _animatorSelectedForest << "\n";
+    out << "tree=" << _animatorSelectedTree << "\n";
+    out << "animation=" << _animatorSelectedAnimation << "\n";
+    out << "branch=" << _animatorSelectedBranch << "\n";
+    out << "frame=" << _animatorFrame << "\n";
+    out << "time=" << _animatorTime << "\n";
+    out << "fps=" << _animatorFps << "\n";
+    out << "playing=" << (_animatorPlaying ? 1 : 0) << "\n";
+    out << "renderBones=" << (_drawAnimatorBones ? 1 : 0) << "\n";
+}
+
+void CharmyBee::LoadAnimatorSettings()
+{
+    std::filesystem::path inPath = GetAnimatorSettingsPath();
+    if (std::getenv("ANIM_PRE_DEBUG") != nullptr)
+    {
+        std::error_code ec;
+        bool exists = std::filesystem::exists(inPath, ec);
+        std::cout << "[AnimPre] settingsPath=" << inPath.string()
+                  << " exists=" << (exists ? 1 : 0)
+                  << std::endl;
+    }
+    std::ifstream in(inPath, std::ios::binary);
+    if (!in && !_sifFilePath.empty())
+    {
+        std::filesystem::path legacy = std::filesystem::current_path() / inPath.filename();
+        if (legacy != inPath)
+            in = std::ifstream(legacy, std::ios::binary);
+    }
+    if (!in)
+        return;
+
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.empty())
+            continue;
+        std::size_t eq = line.find('=');
+        if (eq == std::string::npos)
+            continue;
+        std::string key = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+        try
+        {
+            if (key == "forest")
+                _animatorSelectedForest = std::stoi(value);
+            else if (key == "tree")
+                _animatorSelectedTree = std::stoi(value);
+            else if (key == "animation")
+                _animatorSelectedAnimation = std::stoi(value);
+            else if (key == "branch")
+                _animatorSelectedBranch = std::stoi(value);
+            else if (key == "frame")
+                _animatorFrame = std::stoi(value);
+            else if (key == "time")
+                _animatorTime = std::stof(value);
+            else if (key == "fps")
+                _animatorFps = std::stof(value);
+            else if (key == "playing")
+                _animatorPlaying = (std::stoi(value) != 0);
+            else if (key == "renderBones")
+                _drawAnimatorBones = (std::stoi(value) != 0);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    if (_animatorFps <= 0.0f)
+        _animatorFps = 30.0f;
+
+    if (_forestLibrary && !_forestLibrary->Forests.empty())
+    {
+        if (_animatorSelectedForest < 0)
+            _animatorSelectedForest = 0;
+        if (static_cast<std::size_t>(_animatorSelectedForest) >= _forestLibrary->Forests.size())
+            _animatorSelectedForest = static_cast<int>(_forestLibrary->Forests.size()) - 1;
+
+        auto const& forestEntry = _forestLibrary->Forests[static_cast<std::size_t>(_animatorSelectedForest)];
+        if (forestEntry.Forest && !forestEntry.Forest->Trees.empty())
+        {
+            if (_animatorSelectedTree < 0)
+                _animatorSelectedTree = 0;
+            if (static_cast<std::size_t>(_animatorSelectedTree) >= forestEntry.Forest->Trees.size())
+                _animatorSelectedTree = static_cast<int>(forestEntry.Forest->Trees.size()) - 1;
+
+            auto const& tree = forestEntry.Forest->Trees[static_cast<std::size_t>(_animatorSelectedTree)];
+            if (tree)
+            {
+                int animCount = static_cast<int>(tree->AnimationEntries.size());
+                if (_animatorSelectedAnimation >= animCount)
+                    _animatorSelectedAnimation = animCount > 0 ? 0 : -1;
+                if (_animatorSelectedAnimation < -1)
+                    _animatorSelectedAnimation = -1;
+
+                int branchCount = static_cast<int>(tree->Branches.size());
+                if (_animatorSelectedBranch < 0)
+                    _animatorSelectedBranch = 0;
+                if (_animatorSelectedBranch >= branchCount)
+                    _animatorSelectedBranch = branchCount > 0 ? branchCount - 1 : 0;
+            }
+        }
+    }
+
+    _animatorFrameAccumulator = 0.0f;
+    _animatorDirty = true;
+
+    if (std::getenv("ANIM_PRE_DEBUG") != nullptr)
+    {
+        std::cout << "[AnimPre] settingsLoaded forest=" << _animatorSelectedForest
+                  << " tree=" << _animatorSelectedTree
+                  << " anim=" << _animatorSelectedAnimation
+                  << " branch=" << _animatorSelectedBranch
+                  << " fps=" << _animatorFps
+                  << " playing=" << (_animatorPlaying ? 1 : 0)
+                  << std::endl;
+    }
+}
+
 void CharmyBee::SaveForestVisibility() const
 {
     std::unordered_set<std::string> visible;
@@ -5131,6 +6581,30 @@ void CharmyBee::SaveForestVisibility() const
         out << entry << "\n";
 }
 
+void CharmyBee::SaveForestHierarchyVisibility() const
+{
+    std::filesystem::path outPath = GetForestHierarchyVisibilityPath();
+    std::ofstream out(outPath, std::ios::binary);
+    if (!out)
+        return;
+
+    for (std::size_t fi = 0; fi < _forestHierarchy.size(); ++fi)
+    {
+        auto const& forest = _forestHierarchy[fi];
+        out << "F " << fi << " " << (forest.Visible ? 1 : 0) << "\n";
+        for (std::size_t ti = 0; ti < forest.Trees.size(); ++ti)
+        {
+            auto const& tree = forest.Trees[ti];
+            out << "F " << fi << " T " << ti << " " << (tree.Visible ? 1 : 0) << "\n";
+            for (std::size_t bi = 0; bi < tree.Nodes.size(); ++bi)
+            {
+                auto const& node = tree.Nodes[bi];
+                out << "F " << fi << " T " << ti << " B " << bi << " " << (node.Visible ? 1 : 0) << "\n";
+            }
+        }
+    }
+}
+
 void CharmyBee::LoadForestVisibility()
 {
     std::filesystem::path inPath = GetForestVisibilityPath();
@@ -5144,6 +6618,12 @@ void CharmyBee::LoadForestVisibility()
     {
         if (!line.empty())
             visible.insert(line);
+    }
+
+        if (visible.empty())
+    {
+        printf("[CharmyBee] Visibility file exists but is empty -> ignoring\n");
+        return;
     }
 
     std::function<bool(ForestBoxLayer&, std::string const&)> apply =
@@ -5160,6 +6640,74 @@ void CharmyBee::LoadForestVisibility()
 
     for (auto& layer : _forestBoxLayers)
         apply(layer, "");
+}
+
+void CharmyBee::LoadForestHierarchyVisibility()
+{
+    std::filesystem::path inPath = GetForestHierarchyVisibilityPath();
+    std::ifstream in(inPath, std::ios::binary);
+    if (!in && !_sifFilePath.empty())
+    {
+        std::filesystem::path legacy = std::filesystem::current_path() / inPath.filename();
+        if (legacy != inPath)
+            in = std::ifstream(legacy, std::ios::binary);
+    }
+    if (!in)
+        return;
+
+    std::string token;
+    while (in >> token)
+    {
+        if (token != "F")
+        {
+            in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            continue;
+        }
+        std::size_t fi = 0;
+        if (!(in >> fi))
+            break;
+        if (fi >= _forestHierarchy.size())
+        {
+            in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            continue;
+        }
+        std::string next;
+        if (!(in >> next))
+            break;
+        if (next == "T")
+        {
+            std::size_t ti = 0;
+            if (!(in >> ti))
+                break;
+            if (ti >= _forestHierarchy[fi].Trees.size())
+            {
+                in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                continue;
+            }
+            std::string maybeB;
+            if (!(in >> maybeB))
+                break;
+            if (maybeB == "B")
+            {
+                std::size_t bi = 0;
+                int vis = 1;
+                if (!(in >> bi >> vis))
+                    break;
+                if (bi < _forestHierarchy[fi].Trees[ti].Nodes.size())
+                    _forestHierarchy[fi].Trees[ti].Nodes[bi].Visible = (vis != 0);
+            }
+            else
+            {
+                int vis = std::stoi(maybeB);
+                _forestHierarchy[fi].Trees[ti].Visible = (vis != 0);
+            }
+        }
+        else
+        {
+            int vis = std::stoi(next);
+            _forestHierarchy[fi].Visible = (vis != 0);
+        }
+    }
 }
 
 void CharmyBee::ExportForestObj(std::filesystem::path const& outputPath,
@@ -5758,6 +7306,8 @@ void CharmyBee::Run()
         std::chrono::duration<float> delta = now - previousTime;
         previousTime = now;
 
+        _blockSceneInput = false;
+
         _controller->SetPerFrameImGuiData(delta.count());
         _controller->NewFrame();
 
@@ -5768,6 +7318,7 @@ void CharmyBee::Run()
 
         RenderSifViewer();
 
+        UpdateAnimator(delta.count());
         _renderer.Render();
         _controller->Render();
         _controller->SwapBuffers();
@@ -5778,6 +7329,9 @@ void CharmyBee::Run()
     }
 
     _controller->Dispose();
+    if (!_forestHierarchy.empty())
+        SaveForestHierarchyVisibility();
+    SaveAnimatorSettings();
     std::cout << "[CharmyBee] Shutdown complete." << std::endl;
 }
 

@@ -996,6 +996,59 @@ std::shared_ptr<SeEditor::Forest::ForestLibrary> FindItemForestLibrary(
     return {};
 }
 
+std::shared_ptr<SeEditor::Forest::ForestLibrary> FindAnyForestLibrary(
+    std::vector<SifChunkInfo> const& chunks,
+    std::span<const std::uint8_t> gpuData,
+    std::string& error)
+{
+    for (auto const& chunk : chunks)
+    {
+        if (chunk.TypeValue != 0x45524F46)
+            continue;
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        if (!TryLoadForestLibraryFromChunk(chunk, gpuData, library, error))
+            continue;
+
+        if (library && !library->Forests.empty())
+            return library;
+    }
+
+    return {};
+}
+
+bool TryLoadItemForestLibraryFromFile(std::filesystem::path const& path,
+                                      std::shared_ptr<SeEditor::Forest::ForestLibrary>& outLibrary,
+                                      std::string& error)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        error = "File not found";
+        return false;
+    }
+    std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+    std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+
+    auto parsed = ParseSifFile(std::span<const std::uint8_t>(data.data(), data.size()), error);
+    if (!parsed)
+        return false;
+
+    auto gpuData = LoadGpuDataForSif(path, std::nullopt);
+    std::span<const std::uint8_t> gpuSpan;
+    if (!gpuData.empty())
+        gpuSpan = std::span<const std::uint8_t>(gpuData.data(), gpuData.size());
+
+    outLibrary = FindItemForestLibrary(parsed->Chunks, gpuSpan, error);
+    if (!outLibrary)
+    {
+        outLibrary = FindAnyForestLibrary(parsed->Chunks, gpuSpan, error);
+        if (!outLibrary)
+            error = "Forest library not found";
+    }
+    return outLibrary != nullptr;
+}
+
 } // namespace
 
 int Program::Run(int argc, char** argv)
@@ -2165,6 +2218,804 @@ int Program::Run(int argc, char** argv)
                   << " vertices and " << allTriangles.size()
                   << " triangles to " << outputPath.string() << std::endl;
         return 0;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--forest-animation-raw")
+    {
+        std::filesystem::path path = argv[2];
+        std::cout << "[ForestCLI] Loading " << path.string() << std::endl;
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            std::cerr << "[ForestCLI] Failed to open file." << std::endl;
+            return 1;
+        }
+
+        std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+        std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+
+        std::string error;
+        auto parsed = ParseSifFile(std::span<const std::uint8_t>(data.data(), data.size()), error);
+        if (!parsed)
+        {
+            std::cerr << "[ForestCLI] Parse error: " << error << std::endl;
+            return 2;
+        }
+
+        auto gpuData = LoadGpuDataForSif(path, std::nullopt);
+        std::span<const std::uint8_t> gpuSpan;
+        if (!gpuData.empty())
+            gpuSpan = std::span<const std::uint8_t>(gpuData.data(), gpuData.size());
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> itemLibrary;
+        if (!TryLoadItemForestLibraryFromFile(path, itemLibrary, error))
+        {
+            std::cerr << "[ForestCLI] Failed to load forest: " << error << std::endl;
+            return 4;
+        }
+
+        for (auto const& entry : itemLibrary->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            for (std::size_t treeIdx = 0; treeIdx < entry.Forest->Trees.size(); ++treeIdx)
+            {
+                auto const& tree = entry.Forest->Trees[treeIdx];
+                if (!tree)
+                    continue;
+                if (tree->AnimationEntries.empty())
+                    continue;
+                for (std::size_t animIdx = 0; animIdx < tree->AnimationEntries.size(); ++animIdx)
+                {
+                    auto const& animEntry = tree->AnimationEntries[animIdx];
+                    if (!animEntry.Animation)
+                        continue;
+                    auto const& anim = *animEntry.Animation;
+                    if (anim.Type != 6)
+                        continue;
+                    std::cout << "[ForestCLI] Tree " << treeIdx << " animation " << animEntry.AnimName
+                              << " (hash=" << animEntry.Hash << ") type=" << anim.Type
+                              << " frames=" << anim.NumFrames
+                              << " bones=" << anim.NumBones << "\n";
+                    std::cout << "  ChannelMasks(" << anim.ChannelMasks.size() << ")";
+                    for (int mask : anim.ChannelMasks)
+                        std::cout << " " << std::hex << "0x" << mask << std::dec;
+                    std::cout << "\n";
+                    std::cout << "  AnimStreams(" << anim.AnimStreams.size() << ")";
+                    for (std::size_t i = 0; i < std::min(anim.AnimStreams.size(), static_cast<std::size_t>(32)); ++i)
+                        std::cout << " " << std::hex << "0x" << static_cast<uint16_t>(anim.AnimStreams[i]) << std::dec;
+                    std::cout << "\n";
+                    std::cout << "  FrameData(" << anim.FrameData.size() << ")";
+                    for (std::size_t i = 0; i < std::min(anim.FrameData.size(), static_cast<std::size_t>(32)); ++i)
+                        std::cout << " " << std::hex << "0x" << static_cast<uint16_t>(anim.FrameData[i]) << std::dec;
+                    std::cout << "\n";
+                    return 0;
+                }
+            }
+        }
+
+        std::cerr << "[ForestCLI] No Type-6 animation found in " << path.string() << "\n";
+        return 5;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--forest-hierarchy-dump")
+    {
+        std::filesystem::path path = argv[2];
+        std::optional<int> treeFilter;
+        if (argc >= 4)
+            treeFilter = std::stoi(argv[3]);
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        std::string error;
+        if (!TryLoadItemForestLibraryFromFile(path, library, error))
+        {
+            std::cerr << "[ForestCLI] Failed to load forest: " << error << std::endl;
+            return 3;
+        }
+
+        for (auto const& entry : library->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            std::cout << "[ForestCLI] Forest entry: " << entry.Name << " hash=" << entry.Hash
+                      << " treeCount=" << entry.Forest->Trees.size() << std::endl;
+            for (std::size_t treeIdx = 0; treeIdx < entry.Forest->Trees.size(); ++treeIdx)
+            {
+                if (treeFilter && static_cast<int>(treeIdx) != *treeFilter)
+                    continue;
+                auto const& tree = entry.Forest->Trees[treeIdx];
+                if (!tree)
+                    continue;
+                std::cout << "Tree " << treeIdx << " branches=" << tree->Branches.size()
+                          << " translations=" << tree->Translations.size()
+                          << " rotations=" << tree->Rotations.size()
+                          << " scales=" << tree->Scales.size() << std::endl;
+
+                std::vector<int> roots;
+                for (int i = 0; i < static_cast<int>(tree->Branches.size()); ++i)
+                {
+                    auto const& branch = tree->Branches[static_cast<std::size_t>(i)];
+                    if (!branch || branch->Parent >= 0)
+                        continue;
+                    roots.push_back(i);
+                }
+                if (roots.empty() && !tree->Branches.empty())
+                    roots.push_back(0);
+
+                std::function<void(int, int)> dumpBranch = [&](int idx, int indent) {
+                    if (idx < 0 || static_cast<std::size_t>(idx) >= tree->Branches.size())
+                        return;
+                    auto const& branch = tree->Branches[static_cast<std::size_t>(idx)];
+                    if (!branch)
+                        return;
+                    std::string name = branch->Name.empty() ? ("Branch " + std::to_string(idx)) : branch->Name;
+                    std::string indentStr(indent, ' ');
+                    std::cout << indentStr << "- " << name << " idx=" << idx
+                              << " parent=" << branch->Parent
+                              << " child=" << branch->Child
+                              << " sibling=" << branch->Sibling << std::endl;
+                    int child = branch->Child;
+                    while (child >= 0)
+                    {
+                        dumpBranch(child, indent + 2);
+                        auto const& childBranch = tree->Branches[static_cast<std::size_t>(child)];
+                        if (!childBranch)
+                            break;
+                        child = childBranch->Sibling;
+                    }
+                };
+
+                for (int root : roots)
+                    dumpBranch(root, 0);
+            }
+        }
+        return 0;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--forest-anim-list")
+    {
+        std::filesystem::path path = argv[2];
+        std::optional<int> treeFilter;
+        if (argc >= 4)
+            treeFilter = std::stoi(argv[3]);
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        std::string error;
+        if (!TryLoadItemForestLibraryFromFile(path, library, error))
+        {
+            std::cerr << "[ForestCLI] Failed to load forest: " << error << std::endl;
+            return 3;
+        }
+
+        for (auto const& entry : library->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            for (std::size_t treeIdx = 0; treeIdx < entry.Forest->Trees.size(); ++treeIdx)
+            {
+                if (treeFilter && static_cast<int>(treeIdx) != *treeFilter)
+                    continue;
+                auto const& tree = entry.Forest->Trees[treeIdx];
+                if (!tree)
+                    continue;
+                std::cout << "[ForestCLI] Tree " << treeIdx << " animations=" << tree->AnimationEntries.size() << std::endl;
+                for (std::size_t animIdx = 0; animIdx < tree->AnimationEntries.size(); ++animIdx)
+                {
+                    auto const& animEntry = tree->AnimationEntries[animIdx];
+                    int type = animEntry.Animation ? animEntry.Animation->Type : -1;
+                    int frames = animEntry.Animation ? animEntry.Animation->NumFrames : 0;
+                    int bones = animEntry.Animation ? animEntry.Animation->NumBones : 0;
+                    std::string name = animEntry.AnimName.empty()
+                                           ? std::string("Anim ") + std::to_string(animIdx)
+                                           : animEntry.AnimName;
+                    std::cout << "  [" << animIdx << "] " << name
+                              << " type=" << type
+                              << " frames=" << frames
+                              << " bones=" << bones
+                              << " hash=" << animEntry.Hash
+                              << std::endl;
+                }
+            }
+        }
+        return 0;
+    }
+
+    if (argc >= 4 && std::string(argv[1]) == "--forest-trs-snapshot")
+    {
+        std::filesystem::path path = argv[2];
+        int treeIndex = std::stoi(argv[3]);
+        std::optional<int> branchFilter;
+        if (argc >= 5)
+            branchFilter = std::stoi(argv[4]);
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        std::string error;
+        if (!TryLoadItemForestLibraryFromFile(path, library, error))
+        {
+            std::cerr << "[ForestCLI] Failed to load forest: " << error << std::endl;
+            return 3;
+        }
+
+        for (auto const& entry : library->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            if (treeIndex < 0 || static_cast<std::size_t>(treeIndex) >= entry.Forest->Trees.size())
+                continue;
+            auto const& tree = entry.Forest->Trees[static_cast<std::size_t>(treeIndex)];
+            if (!tree)
+                continue;
+            std::cout << "[ForestCLI] TRS snapshot Tree " << treeIndex << " branches=" << tree->Branches.size() << std::endl;
+            for (int idx = 0; idx < static_cast<int>(tree->Branches.size()); ++idx)
+            {
+                if (branchFilter && *branchFilter != idx)
+                    continue;
+                auto const& branch = tree->Branches[static_cast<std::size_t>(idx)];
+                SlLib::Math::Vector4 t{};
+                SlLib::Math::Vector4 r{};
+                SlLib::Math::Vector4 s{1.0f, 1.0f, 1.0f, 1.0f};
+                if (static_cast<std::size_t>(idx) < tree->Translations.size())
+                    t = tree->Translations[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < tree->Rotations.size())
+                    r = tree->Rotations[static_cast<std::size_t>(idx)];
+                if (static_cast<std::size_t>(idx) < tree->Scales.size())
+                    s = tree->Scales[static_cast<std::size_t>(idx)];
+                std::cout << "Branch " << idx << " name=" << (branch ? branch->Name : "<null>")
+                          << " parent=" << (branch ? branch->Parent : -1)
+                          << " [[T:" << t.X << "," << t.Y << "," << t.Z << "]"
+                          << " R:" << r.X << "," << r.Y << "," << r.Z << "," << r.W << "]"
+                          << " S:" << s.X << "," << s.Y << "," << s.Z << "]"
+                          << std::endl;
+            }
+            return 0;
+        }
+        std::cerr << "[ForestCLI] Tree index " << treeIndex << " not found." << std::endl;
+        return 4;
+    }
+
+    if (argc >= 6 && std::string(argv[1]) == "--forest-anim-trs-snapshot")
+    {
+        std::filesystem::path path = argv[2];
+        int treeIndex = std::stoi(argv[3]);
+        int animIndex = std::stoi(argv[4]);
+        int frameIndex = std::stoi(argv[5]);
+        std::optional<int> branchFilter;
+        if (argc >= 7)
+            branchFilter = std::stoi(argv[6]);
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        std::string error;
+        if (!TryLoadItemForestLibraryFromFile(path, library, error))
+        {
+            std::cerr << "[ForestCLI] Failed to load forest: " << error << std::endl;
+            return 3;
+        }
+
+        for (auto const& entry : library->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            if (treeIndex < 0 || static_cast<std::size_t>(treeIndex) >= entry.Forest->Trees.size())
+                continue;
+            auto const& tree = entry.Forest->Trees[static_cast<std::size_t>(treeIndex)];
+            if (!tree)
+                continue;
+            if (animIndex < 0 || static_cast<std::size_t>(animIndex) >= tree->AnimationEntries.size())
+            {
+                std::cerr << "[ForestCLI] Animation index out of range." << std::endl;
+                return 4;
+            }
+
+            auto const& animEntry = tree->AnimationEntries[static_cast<std::size_t>(animIndex)];
+            if (!animEntry.Animation)
+            {
+                std::cerr << "[ForestCLI] Animation entry has no data." << std::endl;
+                return 5;
+            }
+
+            auto& animation = *animEntry.Animation;
+            if (!animation.DecodeType6Samples(*tree))
+            {
+                std::cerr << "[ForestCLI] Failed to decode animation." << std::endl;
+                return 6;
+            }
+
+            int maxFrame = std::max(0, animation.NumFrames - 1);
+            if (frameIndex < 0)
+                frameIndex = 0;
+            if (frameIndex > maxFrame)
+                frameIndex = maxFrame;
+
+            std::cout << "[ForestCLI] Animated TRS snapshot Tree " << treeIndex
+                      << " anim=" << animEntry.AnimName
+                      << " frame=" << frameIndex
+                      << " branches=" << tree->Branches.size() << std::endl;
+
+            for (int idx = 0; idx < static_cast<int>(tree->Branches.size()); ++idx)
+            {
+                if (branchFilter && *branchFilter != idx)
+                    continue;
+                auto const& branch = tree->Branches[static_cast<std::size_t>(idx)];
+                auto sample = animation.GetSample(frameIndex, idx);
+                if (!sample)
+                    continue;
+                std::cout << "Branch " << idx << " name=" << (branch ? branch->Name : "<null>")
+                          << " parent=" << (branch ? branch->Parent : -1)
+                          << " [[T:" << sample->Translation.X << "," << sample->Translation.Y << "," << sample->Translation.Z << "]"
+                          << " R:" << sample->Rotation.X << "," << sample->Rotation.Y << "," << sample->Rotation.Z << "," << sample->Rotation.W << "]"
+                          << " S:" << sample->Scale.X << "," << sample->Scale.Y << "," << sample->Scale.Z << "]"
+                          << " V:" << (sample->Visible ? 1 : 0)
+                          << std::endl;
+            }
+            return 0;
+        }
+
+        std::cerr << "[ForestCLI] Tree index " << treeIndex << " not found." << std::endl;
+        return 4;
+    }
+
+    if (argc >= 6 && std::string(argv[1]) == "--forest-anim-sample")
+    {
+        std::filesystem::path path = argv[2];
+        int treeIndex = std::stoi(argv[3]);
+        int animIndex = std::stoi(argv[4]);
+        int frameIndex = std::stoi(argv[5]);
+        int boneStart = 0;
+        int boneCount = 8;
+        if (argc >= 7)
+            boneStart = std::stoi(argv[6]);
+        if (argc >= 8)
+            boneCount = std::stoi(argv[7]);
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        std::string error;
+        if (!TryLoadItemForestLibraryFromFile(path, library, error))
+        {
+            std::cerr << "[ForestCLI] Failed to load forest: " << error << std::endl;
+            return 3;
+        }
+
+        for (auto const& entry : library->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            if (treeIndex < 0 || static_cast<std::size_t>(treeIndex) >= entry.Forest->Trees.size())
+                continue;
+            auto const& tree = entry.Forest->Trees[static_cast<std::size_t>(treeIndex)];
+            if (!tree)
+                continue;
+            if (animIndex < 0 || static_cast<std::size_t>(animIndex) >= tree->AnimationEntries.size())
+                continue;
+            auto const& animEntry = tree->AnimationEntries[static_cast<std::size_t>(animIndex)];
+            if (!animEntry.Animation)
+                continue;
+            auto& animation = *animEntry.Animation;
+            if (!animation.DecodeType6Samples(*tree))
+            {
+                std::cerr << "[ForestCLI] Failed to decode Type-6 samples." << std::endl;
+                return 5;
+            }
+            if (animation.NumFrames <= 0 || animation.NumBones <= 0)
+            {
+                std::cerr << "[ForestCLI] Animation lacks frames or bones." << std::endl;
+                return 6;
+            }
+            int clampedFrame = std::clamp(frameIndex, 0, animation.NumFrames - 1);
+            boneStart = std::max(0, boneStart);
+            boneCount = std::max(1, boneCount);
+            std::size_t maxBone = std::min(static_cast<std::size_t>(boneStart + boneCount),
+                                           animation.NumBones > 0 ? static_cast<std::size_t>(animation.NumBones) : static_cast<std::size_t>(0));
+            std::cout << "[ForestCLI] Sampled frame " << clampedFrame << " anim=" << animEntry.AnimName
+                      << " tree=" << treeIndex << " bones " << boneStart << "-" << (maxBone > 0 ? (maxBone - 1) : 0) << std::endl;
+            for (std::size_t bone = static_cast<std::size_t>(boneStart); bone < maxBone; ++bone)
+            {
+                auto const* sample = animation.GetSample(clampedFrame, static_cast<int>(bone));
+                if (!sample)
+                    continue;
+                std::cout << "Bone " << bone;
+                if (bone < tree->Branches.size() && tree->Branches[bone])
+                    std::cout << " name=" << tree->Branches[bone]->Name;
+                std::cout << " T=" << sample->Translation.X << "," << sample->Translation.Y << "," << sample->Translation.Z
+                          << " R=" << sample->Rotation.X << "," << sample->Rotation.Y << ","
+                          << sample->Rotation.Z << "," << sample->Rotation.W
+                          << " S=" << sample->Scale.X << "," << sample->Scale.Y << "," << sample->Scale.Z
+                          << " V=" << (sample->Visible ? 1 : 0) << std::endl;
+            }
+            return 0;
+        }
+        std::cerr << "[ForestCLI] Animation index " << animIndex << " not found." << std::endl;
+        return 4;
+    }
+
+    if (argc >= 5 && std::string(argv[1]) == "--forest-anim-block-info")
+    {
+        std::filesystem::path path = argv[2];
+        int treeIndex = std::stoi(argv[3]);
+        int animIndex = std::stoi(argv[4]);
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> library;
+        std::string error;
+        if (!TryLoadItemForestLibraryFromFile(path, library, error))
+        {
+            std::cerr << "[ForestCLI] Failed to load forest: " << error << std::endl;
+            return 3;
+        }
+
+        for (auto const& entry : library->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            if (treeIndex < 0 || static_cast<std::size_t>(treeIndex) >= entry.Forest->Trees.size())
+                continue;
+            auto const& tree = entry.Forest->Trees[static_cast<std::size_t>(treeIndex)];
+            if (!tree)
+                continue;
+            if (animIndex < 0 || static_cast<std::size_t>(animIndex) >= tree->AnimationEntries.size())
+            {
+                std::cerr << "[ForestCLI] Animation index out of range." << std::endl;
+                return 4;
+            }
+
+            auto const& animEntry = tree->AnimationEntries[static_cast<std::size_t>(animIndex)];
+            if (!animEntry.Animation)
+            {
+                std::cerr << "[ForestCLI] Animation entry has no data." << std::endl;
+                return 5;
+            }
+
+            auto const& anim = *animEntry.Animation;
+            if (anim.Type < 0x06 || anim.Type > 0x0A)
+            {
+                std::cerr << "[ForestCLI] Animation is not Type-6." << std::endl;
+                return 6;
+            }
+            if (anim.Type6Block.empty())
+            {
+                std::cerr << "[ForestCLI] Type6Block is empty." << std::endl;
+                return 7;
+            }
+
+            std::cout << "[ForestCLI] Block info Tree " << treeIndex
+                      << " anim=" << animEntry.AnimName
+                      << " type=" << anim.Type
+                      << " frames=" << anim.NumFrames
+                      << " bones=" << anim.NumBones
+                      << " blockBytes=" << anim.Type6Block.size()
+                      << " bigEndian=" << (anim.Type6BigEndian ? 1 : 0)
+                      << " maskEntry=" << anim.Type6MaskEntrySize
+                      << " anchor=" << anim.Type6Anchor
+                      << " blockStart=" << anim.Type6BlockStart
+                      << " blockEnd=" << anim.Type6BlockEnd
+                      << " paramData=" << anim.Type6ParamDataOffset
+                      << " dataSize=" << anim.Type6DataSize
+                      << " windowBytes=" << anim.Type6DebugWindow.size()
+                      << " windowOffset=" << anim.Type6DebugWindowOffset
+                      << std::endl;
+
+            std::size_t numMasks = std::min<std::size_t>(static_cast<std::size_t>(anim.NumBones), 16);
+            std::size_t maskWordCount = 0;
+            {
+                std::size_t bits = static_cast<std::size_t>(anim.NumBones + anim.NumUvBones) * 4u +
+                                   static_cast<std::size_t>(anim.NumFloatStreams);
+                maskWordCount = (bits + 31u) >> 5;
+            }
+            std::size_t maskBytes = maskWordCount * 4u;
+            if (anim.Type6Block.size() < maskBytes)
+            {
+                std::cerr << "[ForestCLI] Block too small for mask preview." << std::endl;
+                return 8;
+            }
+
+            std::cout << "Masks (LE):";
+            for (std::size_t i = 0; i < numMasks; ++i)
+            {
+                std::size_t off = 0;
+                std::uint32_t v = 0;
+                std::size_t dwordIndex = static_cast<std::size_t>(i) / 8u;
+                std::size_t nibbleIndex = static_cast<std::size_t>(i) % 8u;
+                off = dwordIndex * 4u;
+                std::uint32_t dword = static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 0])) |
+                                      (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 1])) << 8) |
+                                      (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 2])) << 16) |
+                                      (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 3])) << 24);
+                v = (dword >> (nibbleIndex * 4u)) & 0xFu;
+                std::cout << " 0x" << std::hex << v << std::dec;
+            }
+            std::cout << "\nMasks (BE):";
+            for (std::size_t i = 0; i < numMasks; ++i)
+            {
+                std::size_t off = 0;
+                std::uint32_t v = 0;
+                std::size_t dwordIndex = static_cast<std::size_t>(i) / 8u;
+                std::size_t nibbleIndex = static_cast<std::size_t>(i) % 8u;
+                off = dwordIndex * 4u;
+                std::uint32_t dword = (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 0])) << 24) |
+                                      (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 1])) << 16) |
+                                      (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 2])) << 8) |
+                                      static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[off + 3]));
+                v = (dword >> (nibbleIndex * 4u)) & 0xFu;
+                std::cout << " 0x" << std::hex << v << std::dec;
+            }
+            std::cout << std::endl;
+
+            bool smallHeader = (anim.Type == 0x07 || anim.Type == 0x0A);
+            int frameIndexSize = (anim.Type == 0x07 || anim.Type == 0x0A) ? 1 : 2;
+            int factorSize = 0;
+            if (anim.Type == 0x08)
+                factorSize = 4;
+            else if (anim.Type == 0x09 || anim.Type == 0x0A)
+                factorSize = 1;
+            else
+                factorSize = 2;
+
+            std::size_t offset = maskBytes;
+            int headerCount = 0;
+            std::cout << "Stream headers (first 8):" << std::endl;
+            while (offset + (smallHeader ? 2 : 4) <= anim.Type6Block.size() && headerCount < 8)
+            {
+                std::uint32_t numFrames = 0;
+                std::uint32_t numKeys = 0;
+                if (smallHeader)
+                {
+                    numFrames = static_cast<unsigned char>(anim.Type6Block[offset + 0]);
+                    numKeys = static_cast<unsigned char>(anim.Type6Block[offset + 1]);
+                    offset += 2;
+                }
+                else
+                {
+                    numFrames = static_cast<unsigned char>(anim.Type6Block[offset + 0]) |
+                                (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[offset + 1])) << 8);
+                    numKeys = static_cast<unsigned char>(anim.Type6Block[offset + 2]) |
+                              (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6Block[offset + 3])) << 8);
+                    offset += 4;
+                }
+                std::size_t frameBytes = numFrames * static_cast<std::size_t>(frameIndexSize);
+                std::size_t factorBytes = numFrames * static_cast<std::size_t>(factorSize);
+                std::size_t packedBytes = (static_cast<std::size_t>(numKeys) * 16 + 7) / 8;
+                std::cout << "  #" << headerCount
+                          << " frames=" << numFrames
+                          << " keys=" << numKeys
+                          << " frameBytes=" << frameBytes
+                          << " factorBytes=" << factorBytes
+                          << " packedBytes=" << packedBytes
+                          << " headerOff=" << (offset - (smallHeader ? 2 : 4))
+                          << std::endl;
+
+                offset += frameBytes + factorBytes;
+                offset = (offset + 3u) & ~static_cast<std::size_t>(3u);
+                if (offset + 8 > anim.Type6Block.size())
+                    break;
+                std::cout << "    min/delta bytes:";
+                for (int b = 0; b < 8; ++b)
+                {
+                    std::cout << " " << std::hex << std::setw(2) << std::setfill('0')
+                              << static_cast<int>(static_cast<unsigned char>(anim.Type6Block[offset + b]))
+                              << std::dec;
+                }
+                std::cout << std::setfill(' ') << std::endl;
+                offset += 8;
+                offset += packedBytes;
+                offset = (offset + 3u) & ~static_cast<std::size_t>(3u);
+
+                ++headerCount;
+            }
+
+            if (!anim.Type6DebugWindow.empty())
+            {
+                auto scanMasks = [&](std::size_t entrySize, bool bigEndian) {
+                    std::size_t start = 0;
+                    std::size_t end = anim.Type6DebugWindow.size();
+                    std::size_t needed = static_cast<std::size_t>(anim.NumBones) * entrySize;
+                    int printed = 0;
+                    std::cout << "Mask scan entrySize=" << entrySize
+                              << " endian=" << (bigEndian ? "BE" : "LE") << ":\n";
+                    for (std::size_t candidate = start; candidate + needed <= end; candidate += entrySize)
+                    {
+                        int nonZero = 0;
+                        bool valid = true;
+                        for (int i = 0; i < anim.NumBones; ++i)
+                        {
+                            std::size_t off = candidate + static_cast<std::size_t>(i) * entrySize;
+                            std::uint32_t v = 0;
+                            if (entrySize == 1)
+                            {
+                                v = static_cast<std::uint8_t>(anim.Type6DebugWindow[off]);
+                            }
+                            else if (entrySize == 2)
+                            {
+                                std::uint16_t a = static_cast<std::uint8_t>(anim.Type6DebugWindow[off + 0]);
+                                std::uint16_t b = static_cast<std::uint8_t>(anim.Type6DebugWindow[off + 1]);
+                                v = bigEndian ? static_cast<std::uint16_t>((a << 8) | b)
+                                              : static_cast<std::uint16_t>(a | (b << 8));
+                            }
+                            else
+                            {
+                                std::uint32_t b0 = static_cast<std::uint8_t>(anim.Type6DebugWindow[off + 0]);
+                                std::uint32_t b1 = static_cast<std::uint8_t>(anim.Type6DebugWindow[off + 1]);
+                                std::uint32_t b2 = static_cast<std::uint8_t>(anim.Type6DebugWindow[off + 2]);
+                                std::uint32_t b3 = static_cast<std::uint8_t>(anim.Type6DebugWindow[off + 3]);
+                                v = bigEndian ? ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+                                              : (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                            }
+                            if ((v & ~0xFu) != 0)
+                            {
+                                valid = false;
+                                break;
+                            }
+                            if (v != 0)
+                                ++nonZero;
+                        }
+                        if (!valid || nonZero < (anim.NumBones / 2))
+                            continue;
+                        std::size_t headerOff = candidate + needed;
+                        std::uint32_t hFrames = 0;
+                        std::uint32_t hKeys = 0;
+                        if (headerOff + (smallHeader ? 2u : 4u) <= end)
+                        {
+                            if (smallHeader)
+                            {
+                                hFrames = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 0]);
+                                hKeys = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 1]);
+                            }
+                            else
+                            {
+                                hFrames = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 0]) |
+                                          (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 1])) << 8);
+                                hKeys = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 2]) |
+                                        (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 3])) << 8);
+                            }
+                        }
+                        std::cout << "  candidate=0x" << std::hex
+                                  << (anim.Type6DebugWindowOffset + candidate) << std::dec
+                                  << " nonZero=" << nonZero
+                                  << " firstHeader(frames=" << hFrames << " keys=" << hKeys << ")\n";
+                        if (++printed >= 5)
+                            break;
+                    }
+                    if (printed == 0)
+                        std::cout << "  <none>\n";
+                };
+
+                scanMasks(1, false);
+                scanMasks(1, true);
+                scanMasks(2, false);
+                scanMasks(2, true);
+                scanMasks(4, false);
+                scanMasks(4, true);
+                std::cout << "Mask scan packed-nibble:\n";
+                {
+                    std::size_t maskBytesPacked = ((static_cast<std::size_t>(anim.NumBones) + 7u) / 8u) * 4u;
+                    int printed = 0;
+                    for (std::size_t candidate = 0; candidate + maskBytesPacked <= anim.Type6DebugWindow.size(); candidate += 4)
+                    {
+                        int nonZero = 0;
+                        for (int bone = 0; bone < anim.NumBones; ++bone)
+                        {
+                            std::size_t dwordIndex = static_cast<std::size_t>(bone) / 8u;
+                            std::size_t nibbleIndex = static_cast<std::size_t>(bone) % 8u;
+                            std::size_t off = candidate + dwordIndex * 4u;
+                            std::uint32_t dword = static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[off + 0])) |
+                                                  (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[off + 1])) << 8) |
+                                                  (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[off + 2])) << 16) |
+                                                  (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[off + 3])) << 24);
+                            std::uint32_t mask = (dword >> (nibbleIndex * 4u)) & 0xFu;
+                            if (mask != 0)
+                                ++nonZero;
+                        }
+                        if (nonZero < (anim.NumBones / 2))
+                            continue;
+                        std::size_t headerOff = candidate + maskBytesPacked;
+                        if (headerOff + (smallHeader ? 2u : 4u) > anim.Type6DebugWindow.size())
+                            continue;
+                        std::uint32_t hFrames = 0;
+                        std::uint32_t hKeys = 0;
+                        if (smallHeader)
+                        {
+                            hFrames = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 0]);
+                            hKeys = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 1]);
+                        }
+                        else
+                        {
+                            hFrames = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 0]) |
+                                      (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 1])) << 8);
+                            hKeys = static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 2]) |
+                                    (static_cast<std::uint32_t>(static_cast<unsigned char>(anim.Type6DebugWindow[headerOff + 3])) << 8);
+                        }
+                        std::cout << "  candidate=0x" << std::hex
+                                  << (anim.Type6DebugWindowOffset + candidate) << std::dec
+                                  << " nonZero=" << nonZero
+                                  << " firstHeader(frames=" << hFrames << " keys=" << hKeys << ")\n";
+                        if (++printed >= 5)
+                            break;
+                    }
+                    if (printed == 0)
+                        std::cout << "  <none>\n";
+                }
+            }
+
+            return 0;
+        }
+
+        std::cerr << "[ForestCLI] Tree index " << treeIndex << " not found." << std::endl;
+        return 4;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--forest-animation-raw")
+    {
+        std::filesystem::path path = argv[2];
+        std::cout << "[ForestCLI] Loading " << path.string() << std::endl;
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            std::cerr << "[ForestCLI] Failed to open file." << std::endl;
+            return 1;
+        }
+
+        std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+        std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+
+        std::string error;
+        auto parsed = ParseSifFile(std::span<const std::uint8_t>(data.data(), data.size()), error);
+        if (!parsed)
+        {
+            std::cerr << "[ForestCLI] Parse error: " << error << std::endl;
+            return 2;
+        }
+
+        auto gpuData = LoadGpuDataForSif(path, std::nullopt);
+        std::span<const std::uint8_t> gpuSpan;
+        if (!gpuData.empty())
+            gpuSpan = std::span<const std::uint8_t>(gpuData.data(), gpuData.size());
+
+        std::shared_ptr<SeEditor::Forest::ForestLibrary> itemLibrary =
+            FindItemForestLibrary(parsed->Chunks, gpuSpan, error);
+        if (!itemLibrary)
+        {
+            std::cerr << "[ForestCLI] item.Forest not found in SIF." << std::endl;
+            return 4;
+        }
+
+        for (auto const& entry : itemLibrary->Forests)
+        {
+            if (!entry.Forest)
+                continue;
+            for (std::size_t treeIdx = 0; treeIdx < entry.Forest->Trees.size(); ++treeIdx)
+            {
+                auto const& tree = entry.Forest->Trees[treeIdx];
+                if (!tree)
+                    continue;
+                if (tree->AnimationEntries.empty())
+                    continue;
+                for (std::size_t animIdx = 0; animIdx < tree->AnimationEntries.size(); ++animIdx)
+                {
+                    auto const& animEntry = tree->AnimationEntries[animIdx];
+                    if (!animEntry.Animation)
+                        continue;
+                    auto const& anim = *animEntry.Animation;
+                    if (anim.Type != 6)
+                        continue;
+                    std::cout << "[ForestCLI] Tree " << treeIdx << " animation " << animEntry.AnimName
+                              << " (hash=" << animEntry.Hash << ") type=" << anim.Type
+                              << " frames=" << anim.NumFrames
+                              << " bones=" << anim.NumBones << "\n";
+                    std::cout << "  ChannelMasks(" << anim.ChannelMasks.size() << ")";
+                    for (int mask : anim.ChannelMasks)
+                        std::cout << " " << std::hex << "0x" << mask << std::dec;
+                    std::cout << "\n";
+                    std::cout << "  AnimStreams(" << anim.AnimStreams.size() << ")";
+                    for (std::size_t i = 0; i < std::min(anim.AnimStreams.size(), static_cast<std::size_t>(32)); ++i)
+                        std::cout << " " << std::hex << "0x" << static_cast<uint16_t>(anim.AnimStreams[i]) << std::dec;
+                    std::cout << "\n";
+                    std::cout << "  FrameData(" << anim.FrameData.size() << ")";
+                    for (std::size_t i = 0; i < std::min(anim.FrameData.size(), static_cast<std::size_t>(32)); ++i)
+                        std::cout << " " << std::hex << "0x" << static_cast<uint16_t>(anim.FrameData[i]) << std::dec;
+                    std::cout << "\n";
+                    return 0;
+                }
+            }
+        }
+
+        std::cerr << "[ForestCLI] No Type-6 animation found in " << path.string() << "\n";
+        return 5;
     }
 
     if (argc >= 3 && std::string(argv[1]) == "--item-scale-report")

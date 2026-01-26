@@ -119,6 +119,8 @@ private:
     bool _drawLogicLocators = true;
     bool _drawLogicTriggerNormals = false;
     bool _drawLogicLocatorAxes = false;
+    bool _drawAnimatorBones = false;
+    bool _drawOriginAxes = true;
     float _logicLocatorBoxSize = 2.0f;
     float _logicLocatorAxisSize = 4.0f;
     float _logicTriggerNormalSize = 6.0f;
@@ -147,10 +149,6 @@ private:
     std::atomic<std::size_t> _xpacRepackProgress{0};
     std::atomic<std::size_t> _xpacRepackTotal{0};
     bool _confirmNukeStuff = false;
-    std::atomic<bool> _unityExportBusy{false};
-    std::string _unityExportStatus;
-    std::mutex _unityExportMutex;
-    std::unique_ptr<std::thread> _unityExportWorker;
     std::mutex _xpacMutex;
     std::unique_ptr<std::thread> _xpacWorker;
     struct XpacRepackEntry
@@ -187,6 +185,37 @@ private:
     std::vector<ForestBoxLayer> _forestBoxLayers;
     std::vector<ForestHierarchy> _forestHierarchy;
     std::vector<Renderer::SlRenderer::ForestCpuMesh> _allForestMeshes;
+    struct ForestMeshSource
+    {
+        std::vector<float> Vertices;
+        std::vector<std::uint32_t> Indices;
+        std::shared_ptr<SeEditor::Forest::SuRenderTextureResource> Texture;
+        bool Skinned = false;
+        std::vector<int> BoneMatrixIndices;
+        std::vector<SlLib::Math::Matrix4x4> BoneInverseMatrices;
+        bool SkinConventionSet = false;
+        bool SkinInvFirst = false;
+        bool SkinInvTranspose = false;
+        float SkinConventionError = 0.0f;
+        int ForestIndex = -1;
+        int TreeIndex = -1;
+        int BranchIndex = -1;
+    };
+    std::vector<ForestMeshSource> _forestMeshSources;
+    int _animatorSelectedForest = 0;
+    int _animatorSelectedTree = 0;
+    int _animatorSelectedAnimation = -1;
+    int _animatorSelectedBranch = 0;
+    bool _animatorPlaying = false;
+    float _animatorTime = 0.0f;
+    int _animatorFrame = 0;
+    int _animatorLastAppliedFrame = -1;
+    float _animatorFps = 30.0f;
+    bool _animatorDirty = false;
+    float _animatorFrameAccumulator = 0.0f;
+    std::vector<bool> _animatorBranchVisibility;
+    int _animatorVisibilityForest = -1;
+    int _animatorVisibilityTree = -1;
     struct NavigationLineEntry
     {
         int LineIndex = 0;
@@ -205,6 +234,7 @@ private:
     std::array<bool, GLFW_KEY_LAST + 1> _glfwKeyStates{};
     std::array<bool, GLFW_MOUSE_BUTTON_LAST + 1> _glfwMouseButtonStates{};
     float _movementSpeed = 6.0f;
+    int _animatorDebugStamp = -1;
     std::string _sifFilePath;
     std::string _sifLoadMessage;
     std::vector<SifChunkInfo> _sifChunks;
@@ -215,6 +245,10 @@ private:
     std::size_t _sifOriginalSize = 0;
     std::size_t _sifDecompressedSize = 0;
     std::string _sifParseError;
+    std::atomic<bool> _unityExportBusy{false};
+    std::string _unityExportStatus;
+    std::mutex _unityExportMutex;
+    std::unique_ptr<std::thread> _unityExportWorker;
     std::optional<SlLib::Excel::ExcelData> _racerData;
     std::optional<SlLib::Excel::ExcelData> _trackData;
     SlLib::Resources::Database::SlResourceDatabase* _database = nullptr;
@@ -234,7 +268,9 @@ private:
     float _localSceneFrameHeight = 0.0f;
     bool _mouseOrbitTracking = false;
     SlLib::Math::Vector2 _mouseOrbitLastPos{0.0f, 0.0f};
+    bool _originAxesToggleKeyDown = false;
     bool _sceneViewHovered = false;
+    bool _blockSceneInput = false;
     std::size_t _totalForestMeshes = 0;
 
     void RenderMainDockWindow();
@@ -256,6 +292,16 @@ private:
     void RenderForestHierarchyWindow();
     void RenderForestHierarchyList();
     bool RenderBranchNode(TreeHierarchy& tree, int index);
+    void UpdateAnimator(float deltaSeconds);
+    void LoadAnimatorSettings();
+    void SaveAnimatorSettings() const;
+    std::filesystem::path GetAnimatorSettingsPath() const;
+    void ApplyAnimatorFrame();
+    void BuildForestMeshesFromPose(std::vector<SlLib::Math::Vector4> const& translations,
+                                   std::vector<SlLib::Math::Vector4> const& rotations,
+                                   std::vector<SlLib::Math::Vector4> const& scales,
+                                   int forestIndex,
+                                   int treeIndex);
     void LoadNavigationResources();
     void LoadLogicResources();
     void LoadItemsForestResources();
@@ -271,6 +317,9 @@ private:
     void LoadForestVisibility();
     void SaveForestVisibility() const;
     std::filesystem::path GetForestVisibilityPath() const;
+    void LoadForestHierarchyVisibility();
+    void SaveForestHierarchyVisibility() const;
+    std::filesystem::path GetForestHierarchyVisibilityPath() const;
     void UpdateNavigationLineVisibility();
     void UpdateNavigationDebugLines();
     void UpdateLogicDebugLines();

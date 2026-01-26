@@ -43,6 +43,14 @@ target_include_directories(SlLibMarioKart PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+add_library(SeEditorForest STATIC ${SEEDITOR_ROOT}/Forest/ForestTypes.cpp)
+target_link_libraries(SeEditorForest PUBLIC SlLib)
+target_include_directories(SeEditorForest PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_subdirectory(UnityTooling)
+
 find_package(OpenGL REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glad CONFIG REQUIRED)
@@ -94,7 +102,28 @@ add_executable(sif_to_unity SeEditor/SifToUnity.cpp)
 target_link_libraries(sif_to_unity PRIVATE SeEditorLib SlLib SeEditorCore)
 target_include_directories(sif_to_unity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(sif_unpacker SeEditor/SifUnpacker.cpp)
+target_link_libraries(sif_unpacker PRIVATE SeEditorCore SeEditorForest)
+target_include_directories(sif_unpacker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(forest_tree_dump SeEditor/ForestTreeDump.cpp)
+target_link_libraries(forest_tree_dump PRIVATE SeEditorCore SeEditorForest)
+target_include_directories(forest_tree_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(anim_debug SeEditor/AnimDebug.cpp)
+target_link_libraries(anim_debug PRIVATE SeEditorCore SeEditorForest)
+target_include_directories(anim_debug PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 target_link_libraries(SlLib PRIVATE ZLIB::ZLIB)
+
+# CLI unit tests.
+add_executable(type6_decode_tests tests/type6_decode_tests.cpp)
+target_link_libraries(type6_decode_tests PRIVATE SeEditorLib SlLib)
+target_include_directories(type6_decode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(type6_decode_tests PRIVATE
+    SSR_WII_ELF_C_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../SSR_Wii.elf.c"
+    SSR_WII_ELF_H_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../SSR_Wii.elf.h"
+)
 
 # Statically link libgcc/libstdc++ for MinGW builds.
 if (MINGW)

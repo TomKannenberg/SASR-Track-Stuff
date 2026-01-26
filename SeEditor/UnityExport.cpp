@@ -1466,6 +1466,25 @@ std::filesystem::path FindUnityProjectRoot(std::filesystem::path const& startDir
     return {};
 }
 
+static std::filesystem::path FindSsARMapTemplateDir(std::filesystem::path const& startDir)
+{
+    std::error_code ec;
+    std::filesystem::path cur = std::filesystem::weakly_canonical(startDir, ec);
+    if (ec)
+        cur = startDir;
+
+    for (int i = 0; i < 8; ++i)
+    {
+        auto candidate = cur / "SSAR_MapTemplate";
+        if (std::filesystem::exists(candidate, ec))
+            return candidate;
+        if (!cur.has_parent_path())
+            break;
+        cur = cur.parent_path();
+    }
+    return {};
+}
+
 static std::optional<std::filesystem::path> TryPrepareUnityProjectAtRoot(std::filesystem::path const& userRoot,
                                                                          std::string& error)
 {
@@ -1488,10 +1507,43 @@ static std::optional<std::filesystem::path> TryPrepareUnityProjectAtRoot(std::fi
         return std::nullopt;
     }
 
-    const std::filesystem::path templateDir = base / "SSAR_MapTemplate";
+    std::filesystem::path templateDir = base / "SSAR_MapTemplate";
     if (!std::filesystem::exists(templateDir, ec))
+        templateDir = FindSsARMapTemplateDir(std::filesystem::current_path());
+
+    if (templateDir.empty() || !std::filesystem::exists(templateDir, ec))
     {
-        error = "SSAR_MapTemplate not found at: " + templateDir.string();
+        // Fall back to a minimal Unity project so export can proceed even without the template.
+        // Keep Assets/ intact, but ensure a valid Packages/manifest.json exists.
+        const std::filesystem::path packages = unity / "Packages";
+        std::filesystem::create_directories(packages, ec);
+        if (ec)
+        {
+            error = "SSAR_MapTemplate not found and failed to create Unity Packages folder: " + ec.message();
+            return std::nullopt;
+        }
+
+        const std::filesystem::path manifest = packages / "manifest.json";
+        if (!std::filesystem::exists(manifest, ec))
+        {
+            std::ofstream out(manifest);
+            if (!out)
+            {
+                error = "SSAR_MapTemplate not found and failed to write Unity manifest: " + manifest.string();
+                return std::nullopt;
+            }
+            out << "{\n"
+                   "  \"dependencies\": {\n"
+                   "  }\n"
+                   "}\n";
+        }
+
+        return unity;
+    }
+
+    if (ec)
+    {
+        error = "Failed to locate SSAR_MapTemplate: " + ec.message();
         return std::nullopt;
     }
 

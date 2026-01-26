@@ -495,6 +495,31 @@ struct StreamOverride
     int GetSizeForSerialization() const;
 };
 
+struct SuAnimationSample
+{
+    SlLib::Math::Vector4 Translation{};
+    SlLib::Math::Vector4 Rotation{};
+    SlLib::Math::Vector4 Scale{1.0f, 1.0f, 1.0f, 1.0f};
+    bool Visible = true;
+};
+
+struct SuAnimationQuantRange
+{
+    float Minimum = 0.0f;
+    float Delta = 0.0f;
+    bool Valid = false;
+};
+
+struct SuAnimationQuantization
+{
+    std::vector<std::array<SuAnimationQuantRange, 3>> Translation;
+    std::vector<std::array<SuAnimationQuantRange, 4>> Rotation;
+    std::vector<std::array<SuAnimationQuantRange, 3>> Scale;
+    std::vector<SuAnimationQuantRange> Visibility;
+
+    void Resize(std::size_t bones);
+};
+
 struct SuAnimation
 {
     int Type = 0;
@@ -509,9 +534,32 @@ struct SuAnimation
     std::vector<SlLib::Math::Vector4> VectorFrameData;
     std::vector<float> FloatFrameData;
     std::vector<std::int16_t> FrameData;
+    std::vector<std::uint8_t> Type6Block;
+    bool Type6BigEndian = false;
+    int Type6MaskEntrySize = 4;
+    const std::uint8_t* Type6DataPtr = nullptr;
+    std::size_t Type6DataSize = 0;
+    const std::uint8_t* Type6GpuDataPtr = nullptr;
+    std::size_t Type6GpuDataSize = 0;
+    bool Type6ParamDataIsGpu = false;
+    int Type6ParamDataOffset = 0;
+    std::size_t Type6Anchor = 0;
+    std::size_t Type6BlockStart = 0;
+    std::size_t Type6BlockEnd = 0;
+    std::vector<std::uint8_t> Type6DebugWindow;
+    std::size_t Type6DebugWindowOffset = 0;
+    bool Type6DebugMasksLogged = false;
+    int Type6MaskNonZero = 0;
+    std::array<std::uint32_t, 4> Type6MaskSample{};
+
+    std::vector<SuAnimationSample> Samples;
+    SuAnimationQuantization Quantization;
+    bool SamplesDecoded = false;
 
     void Load(SlLib::Serialization::ResourceLoadContext& context);
     int GetSizeForSerialization() const;
+    bool DecodeType6Samples(SuRenderTree const& tree);
+    SuAnimationSample const* GetSample(int frame, int bone) const;
 };
 
 struct SuAnimationEntry

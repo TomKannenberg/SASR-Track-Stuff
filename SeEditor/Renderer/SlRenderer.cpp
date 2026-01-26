@@ -26,6 +26,17 @@ namespace SeEditor::Renderer {
 
 SlRenderer::SlRenderer() = default;
 
+std::size_t SlRenderer::DebugForestSkinnedCount() const
+{
+    std::size_t count = 0;
+    for (auto const& mesh : _forestCpuMeshes)
+    {
+        if (mesh.Skinned && !mesh.BonePalette.empty())
+            ++count;
+    }
+    return count;
+}
+
 namespace {
 
 GLuint g_forestProgram = 0;
@@ -64,14 +75,35 @@ GLuint EnsureForestProgram()
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec2 aUv;
-uniform mat4 uMVP;
+layout(location = 3) in vec4 aBoneWeights;
+layout(location = 4) in vec4 aBoneIndices;
+uniform mat4 uVP;
 uniform mat4 uView;
+uniform mat4 uModel;
+uniform int uUseSkinning;
+uniform int uBoneCount;
+const int MAX_BONES = 256;
+uniform mat4 uBones[MAX_BONES];
 out vec3 vNormal;
 out vec2 vUv;
 void main() {
-    vNormal = mat3(uView) * aNormal;
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    vec3 worldNormal = mat3(uModel) * aNormal;
+    if (uUseSkinning != 0) {
+        ivec4 idx = ivec4(aBoneIndices + vec4(0.5));
+        int hi = (uBoneCount > 0) ? min(uBoneCount - 1, MAX_BONES - 1) : 0;
+        idx = clamp(idx, ivec4(0), ivec4(hi));
+        mat4 skin =
+            uBones[idx.x] * aBoneWeights.x +
+            uBones[idx.y] * aBoneWeights.y +
+            uBones[idx.z] * aBoneWeights.z +
+            uBones[idx.w] * aBoneWeights.w;
+        worldPos = skin * vec4(aPos, 1.0);
+        worldNormal = mat3(skin) * aNormal;
+    }
+    vNormal = mat3(uView) * normalize(worldNormal);
     vUv = vec2(aUv.x, 1.0 - aUv.y);
-    gl_Position = uMVP * vec4(aPos, 1.0);
+    gl_Position = uVP * vec4(worldPos.xyz, 1.0);
 })";
 
     const char* fsSource = R"(#version 330 core
@@ -210,6 +242,13 @@ void SlRenderer::SetForestMeshes(std::vector<ForestCpuMesh> meshes)
     _forestDirty = true;
 }
 
+void SlRenderer::UpdateForestBonePalettes(std::vector<std::vector<SlLib::Math::Matrix4x4>> palettes)
+{
+    std::size_t n = std::min(palettes.size(), _forestCpuMeshes.size());
+    for (std::size_t i = 0; i < n; ++i)
+        _forestCpuMeshes[i].BonePalette = std::move(palettes[i]);
+}
+
 void SlRenderer::Render()
 {
     if (!_framebuffer.IsValid())
@@ -249,16 +288,13 @@ void SlRenderer::Render()
         return m;
     };
 
-    SlLib::Math::Vector3 eye{3.5f, 3.0f, 3.5f};
-    SlLib::Math::Vector3 target{0.0f, 0.5f, 0.0f};
-    {
-        float r = std::max(1.0f, _orbitDistance);
-        eye = {
-            _orbitTarget.X + r * std::cos(_orbitPitch) * std::cos(_orbitYaw),
-            _orbitTarget.Y + r * std::sin(_orbitPitch),
-            _orbitTarget.Z + r * std::cos(_orbitPitch) * std::sin(_orbitYaw)};
-        target = _orbitTarget;
-    }
+    SlLib::Math::Vector3 eye = _orbitTarget;
+    float cp = std::cos(_orbitPitch);
+    float sp = std::sin(_orbitPitch);
+    float cy = std::cos(_orbitYaw);
+    float sy = std::sin(_orbitYaw);
+    SlLib::Math::Vector3 forward{cp * cy, sp, cp * sy};
+    SlLib::Math::Vector3 target = eye + forward;
 
     auto proj = makePerspective(60.0f * 3.14159265f / 180.0f, aspect, 0.1f, 200000.0f);
     auto view = makeLookAt(eye, target, {0.0f, 1.0f, 0.0f});
@@ -267,10 +303,13 @@ void SlRenderer::Render()
     PrimitiveRenderer::BeginPrimitiveScene();
 
     // Draw simple axes
-    using SlLib::Math::Vector3;
-    PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {1.5f, 0.0f, 0.0f}, {1.0f, 0.1f, 0.1f});
-    PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 1.5f, 0.0f}, {0.1f, 1.0f, 0.1f});
-    PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.5f}, {0.1f, 0.1f, 1.0f});
+    if (_drawOriginAxes)
+    {
+        using SlLib::Math::Vector3;
+        PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {1.5f, 0.0f, 0.0f}, {1.0f, 0.1f, 0.1f});
+        PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 1.5f, 0.0f}, {0.1f, 1.0f, 0.1f});
+        PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.5f}, {0.1f, 0.1f, 1.0f});
+    }
 
     if (_drawCollisionMesh && !_collisionTriangles.empty())
     {
@@ -359,6 +398,13 @@ void SlRenderer::Render()
             PrimitiveRenderer::DrawLine(line.From, line.To, line.Color);
     }
 
+    if (_drawBoneLines && !_boneLines.empty())
+    {
+        SlLib::Math::Vector3 boneColor{0.9f, 0.6f, 0.1f};
+        for (auto const& bone : _boneLines)
+            PrimitiveRenderer::DrawLine(bone.first, bone.second, boneColor);
+    }
+
     if (_forestDirty)
     {
         for (auto& mesh : _forestGpuMeshes)
@@ -374,8 +420,9 @@ void SlRenderer::Render()
         _forestTextureCache.clear();
 
         GLuint fallback = UploadFallbackTexture();
-        for (auto const& cpu : _forestCpuMeshes)
+        for (std::size_t cpuIndex = 0; cpuIndex < _forestCpuMeshes.size(); ++cpuIndex)
         {
+            auto const& cpu = _forestCpuMeshes[cpuIndex];
             ForestGpuMesh gpu;
             gpu.IndexCount = cpu.Indices.size();
 
@@ -394,13 +441,19 @@ void SlRenderer::Render()
                          cpu.Indices.data(), GL_STATIC_DRAW);
 
             glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), reinterpret_cast<void*>(0));
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 16 * sizeof(float), reinterpret_cast<void*>(0));
             glEnableVertexAttribArray(1);
-            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 16 * sizeof(float),
                                   reinterpret_cast<void*>(3 * sizeof(float)));
             glEnableVertexAttribArray(2);
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 16 * sizeof(float),
                                   reinterpret_cast<void*>(6 * sizeof(float)));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, 16 * sizeof(float),
+                                  reinterpret_cast<void*>(8 * sizeof(float)));
+            glEnableVertexAttribArray(4);
+            glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, 16 * sizeof(float),
+                                  reinterpret_cast<void*>(12 * sizeof(float)));
 
             glBindVertexArray(0);
 
@@ -422,27 +475,101 @@ void SlRenderer::Render()
                 }
             }
             gpu.Texture = texture;
+            gpu.CpuIndex = cpuIndex;
             _forestGpuMeshes.push_back(gpu);
         }
         _forestDirty = false;
+    }
+
+    if (std::getenv("RENDER_PRE_DEBUG") != nullptr)
+    {
+        static auto s_last = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (now - s_last >= std::chrono::seconds(1))
+        {
+            s_last = now;
+            std::size_t gpuCount = _forestGpuMeshes.size();
+            std::size_t cpuCount = _forestCpuMeshes.size();
+            std::size_t boneCount = 0;
+            bool skinned = false;
+            if (!_forestCpuMeshes.empty())
+            {
+                auto const& cpu = _forestCpuMeshes.front();
+                skinned = cpu.Skinned && !cpu.BonePalette.empty();
+                boneCount = cpu.BonePalette.size();
+                if (skinned && !cpu.BonePalette.empty())
+                {
+                    auto const& m = cpu.BonePalette.front();
+                    std::cout << "[RenderPre] firstBone m00=" << m(0, 0)
+                              << " m03=" << m(0, 3)
+                              << " m13=" << m(1, 3)
+                              << " m23=" << m(2, 3)
+                              << std::endl;
+                }
+            }
+            std::cout << "[RenderPre] gpuMeshes=" << gpuCount
+                      << " cpuMeshes=" << cpuCount
+                      << " dirty=" << (_forestDirty ? 1 : 0)
+                      << " firstSkinned=" << (skinned ? 1 : 0)
+                      << " firstBones=" << boneCount
+                      << std::endl;
+        }
     }
 
     if (_drawForestMeshes && !_forestGpuMeshes.empty())
     {
         GLuint program = EnsureForestProgram();
         glUseProgram(program);
-        auto mvp = ToColumnMajor(SlLib::Math::Multiply(proj, view));
+        auto vp = ToColumnMajor(SlLib::Math::Multiply(proj, view));
         auto viewMat = ToColumnMajor(view);
-        GLint locMvp = glGetUniformLocation(program, "uMVP");
+        GLint locVp = glGetUniformLocation(program, "uVP");
         GLint locView = glGetUniformLocation(program, "uView");
-        if (locMvp >= 0)
-            glUniformMatrix4fv(locMvp, 1, GL_FALSE, mvp.data());
+        GLint locModel = glGetUniformLocation(program, "uModel");
+        GLint locUseSkinning = glGetUniformLocation(program, "uUseSkinning");
+        GLint locBoneCount = glGetUniformLocation(program, "uBoneCount");
+        GLint locBones = glGetUniformLocation(program, "uBones");
+        if (locVp >= 0)
+            glUniformMatrix4fv(locVp, 1, GL_FALSE, vp.data());
         if (locView >= 0)
             glUniformMatrix4fv(locView, 1, GL_FALSE, viewMat.data());
         glUniform1i(glGetUniformLocation(program, "uTexture"), 0);
 
         for (auto const& mesh : _forestGpuMeshes)
         {
+            SlLib::Math::Matrix4x4 model{};
+            bool skinned = false;
+            std::size_t boneCount = 0;
+            if (mesh.CpuIndex < _forestCpuMeshes.size())
+            {
+                auto const& cpu = _forestCpuMeshes[mesh.CpuIndex];
+                model = cpu.Model;
+                skinned = cpu.Skinned && !cpu.BonePalette.empty();
+                boneCount = cpu.BonePalette.size();
+                if (boneCount > 256)
+                    boneCount = 256;
+                if (skinned && locBones >= 0)
+                {
+                    std::vector<float> boneFloats;
+                    boneFloats.reserve(boneCount * 16);
+                    for (std::size_t i = 0; i < boneCount; ++i)
+                    {
+                        auto cm = ToColumnMajor(cpu.BonePalette[i]);
+                        boneFloats.insert(boneFloats.end(), cm.begin(), cm.end());
+                    }
+                    glUniformMatrix4fv(locBones, static_cast<GLsizei>(boneCount), GL_FALSE, boneFloats.data());
+                }
+            }
+
+            if (locModel >= 0)
+            {
+                auto modelCol = ToColumnMajor(model);
+                glUniformMatrix4fv(locModel, 1, GL_FALSE, modelCol.data());
+            }
+            if (locUseSkinning >= 0)
+                glUniform1i(locUseSkinning, skinned ? 1 : 0);
+            if (locBoneCount >= 0)
+                glUniform1i(locBoneCount, static_cast<GLint>(boneCount));
+
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, mesh.Texture);
             glBindVertexArray(mesh.Vao);
@@ -505,11 +632,16 @@ void SlRenderer::SetDebugLines(std::vector<DebugLine> lines)
     _debugLines = std::move(lines);
 }
 
+void SlRenderer::SetBoneLines(std::vector<std::pair<SlLib::Math::Vector3, SlLib::Math::Vector3>> bones)
+{
+    _boneLines = std::move(bones);
+}
+
 void SlRenderer::SetOrbitCamera(float yaw, float pitch, float distance, SlLib::Math::Vector3 target)
 {
     _orbitYaw = yaw;
     _orbitPitch = std::clamp(pitch, -1.4f, 1.4f);
-    _orbitDistance = std::max(0.3f, distance);
+    _orbitDistance = std::max(0.0f, distance);
     _orbitTarget = target;
 }
 

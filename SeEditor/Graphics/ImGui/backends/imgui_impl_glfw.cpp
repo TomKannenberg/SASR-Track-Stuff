@@ -222,8 +222,13 @@ ImGuiKey ImGui_ImplGlfw_KeyToImGuiKey(int keycode, int scancode)
         case GLFW_KEY_EQUAL: return ImGuiKey_Equal;
         case GLFW_KEY_LEFT_BRACKET: return ImGuiKey_LeftBracket;
         case GLFW_KEY_BACKSLASH: return ImGuiKey_Backslash;
+        // Older ImGui versions (as packaged by some vcpkg revisions) may not define ImGuiKey_Oem102.
+#ifdef ImGuiKey_Oem102
         case GLFW_KEY_WORLD_1: return ImGuiKey_Oem102;
+#endif
+#ifdef ImGuiKey_Oem102
         case GLFW_KEY_WORLD_2: return ImGuiKey_Oem102;
+#endif
         case GLFW_KEY_RIGHT_BRACKET: return ImGuiKey_RightBracket;
         case GLFW_KEY_GRAVE_ACCENT: return ImGuiKey_GraveAccent;
         case GLFW_KEY_CAPS_LOCK: return ImGuiKey_CapsLock;
