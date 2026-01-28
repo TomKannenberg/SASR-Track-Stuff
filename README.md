@@ -1,31 +1,32 @@
 CppSLib C++ port of tools from https://github.com/ennuo/SlMod (direct port). Thanks to ennuo.
 
-## Building
+## Building (Windows, MinGW)
 
 - Install dependencies via vcpkg:
   ```bash
   vcpkg install zlib glfw3 imgui glad
   ```
-- Configure CMake with your vcpkg toolchain (static triplet recommended):
+- Configure CMake (Release, fastest):
   ```bash
-  cmake -S . -B build_mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-mingw-static
+  cmake -S . -B build_mingw -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release ^
+    -DCMAKE_MAKE_PROGRAM=C:\msys64\mingw64\bin\mingw32-make.exe ^
+    -DCMAKE_C_COMPILER=C:\msys64\mingw64\bin\gcc.exe ^
+    -DCMAKE_CXX_COMPILER=C:\msys64\mingw64\bin\c++.exe ^
+    -DCMAKE_PREFIX_PATH=F:\vcpkg\installed\x64-mingw-static ^
+    -Dglad_DIR=F:\vcpkg\installed\x64-mingw-static\share\glad ^
+    -Dglfw3_DIR=F:\vcpkg\installed\x64-mingw-static\share\glfw3 ^
+    -Dimgui_DIR=F:\vcpkg\installed\x64-mingw-static\share\imgui
   ```
 - Build and run:
   ```bash
-  cmake --build build_mingw
-  ./build_mingw/CppSLib.exe
+  cmake --build build_mingw --config Release --parallel 16
+  .\build_mingw\CppSLib.exe
   ```
-- Release build (smaller/faster, recommended):
-  ```bash
-  cmake -S . -B build_release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-mingw-static
-  cmake --build build_release
-  ./build_release/CppSLib.exe
-  ```
-  
+
 - Optional CLI tool targets:
   ```bash
-  cmake --build build_mingw --target sif_to_unity
-  cmake --build build_mingw --target sif_unpacker
+  cmake --build build_mingw --config Release --target sif_to_unity
+  cmake --build build_mingw --config Release --target sif_unpacker
   ```
 
 ## Usage

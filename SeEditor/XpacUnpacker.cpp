@@ -3,14 +3,19 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <condition_variable>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <span>
@@ -517,32 +522,43 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
     std::uint64_t fileSize = static_cast<std::uint64_t>(file.tellg());
     file.seekg(0, std::ios::beg);
 
-    std::array<std::uint8_t, 24> header{};
-    if (!file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size())))
+    std::vector<std::uint8_t> xpacBytes(static_cast<std::size_t>(fileSize));
+    if (fileSize == 0 || !file.read(reinterpret_cast<char*>(xpacBytes.data()), static_cast<std::streamsize>(xpacBytes.size())))
     {
-        result.Errors.push_back("Failed to read XPAC header.");
+        result.Errors.push_back("Failed to read XPAC file bytes.");
         return result;
     }
 
+    std::array<std::uint8_t, 24> header{};
+    if (xpacBytes.size() < header.size())
+    {
+        result.Errors.push_back("XPAC file is too small.");
+        return result;
+    }
+    std::memcpy(header.data(), xpacBytes.data(), header.size());
+
     std::uint32_t totalFiles = ReadU32LE(header, 12);
     result.TotalEntries = totalFiles;
+
+    std::size_t tableOffset = header.size();
+    std::size_t tableSize = static_cast<std::size_t>(totalFiles) * 20;
+    if (tableOffset + tableSize > xpacBytes.size())
+    {
+        result.Errors.push_back("XPAC entry table out of bounds.");
+        return result;
+    }
 
     std::vector<XpacEntry> entries;
     entries.reserve(totalFiles);
     for (std::uint32_t i = 0; i < totalFiles; ++i)
     {
-        std::array<std::uint8_t, 20> entryBuf{};
-        if (!file.read(reinterpret_cast<char*>(entryBuf.data()), static_cast<std::streamsize>(entryBuf.size())))
-        {
-            result.Errors.push_back("Failed to read XPAC entry table.");
-            return result;
-        }
+        std::size_t entryOff = tableOffset + static_cast<std::size_t>(i) * 20;
         XpacEntry entry;
-        entry.Hash = ReadU32LE(entryBuf, 0);
-        entry.Offset = ReadU32LE(entryBuf, 4);
-        entry.Size = ReadU32LE(entryBuf, 8);
-        entry.CompressedSize = ReadU32LE(entryBuf, 12);
-        entry.Flags = ReadU32LE(entryBuf, 16);
+        entry.Hash = ReadU32LE(xpacBytes, entryOff + 0);
+        entry.Offset = ReadU32LE(xpacBytes, entryOff + 4);
+        entry.Size = ReadU32LE(xpacBytes, entryOff + 8);
+        entry.CompressedSize = ReadU32LE(xpacBytes, entryOff + 12);
+        entry.Flags = ReadU32LE(xpacBytes, entryOff + 16);
         entries.push_back(entry);
     }
 
@@ -566,43 +582,76 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
         std::filesystem::path Zig;
     };
     std::unordered_map<std::string, PairPaths> pairMap;
-    std::size_t processed = 0;
+    std::mutex pairMutex;
+    std::mutex errorMutex;
+    std::mutex progressMutex;
+    std::mutex resultsMutex;
+    std::atomic<std::size_t> processed{0};
+    std::atomic<std::size_t> skipped{0};
+    std::atomic<std::size_t> extractedZif{0};
+    std::atomic<std::size_t> extractedZig{0};
 
-    for (auto const& entry : entries)
+    struct WriteTask
     {
+        std::size_t Index = 0;
+        std::filesystem::path Path;
+        std::vector<std::uint8_t> Data;
+        bool IsMainOutput = false;
+        bool IsPairCandidate = false;
+        std::string PairBase;
+        std::string Extension;
+    };
+
+    std::queue<WriteTask> writeQueue;
+    std::mutex writeMutex;
+    std::condition_variable writeCv;
+    bool writerDone = false;
+
+    struct EntryResult
+    {
+        bool WroteFile = false;
+        bool IsSif = false;
+        std::filesystem::path OutputPath;
+        std::string MappedName;
+    };
+    std::vector<EntryResult> entryResults(entries.size());
+
+    auto processEntry = [&](std::size_t index) {
+        auto const& entry = entries[index];
         if (options.Progress)
-            options.Progress(processed, entries.size());
+        {
+            std::lock_guard<std::mutex> lock(progressMutex);
+            options.Progress(processed.load(), entries.size());
+        }
 
         std::uint64_t endOffset = static_cast<std::uint64_t>(entry.Offset) + entry.CompressedSize;
-        if (endOffset > fileSize)
+        if (endOffset > fileSize || entry.Offset >= xpacBytes.size())
         {
-            result.SkippedEntries++;
+            skipped.fetch_add(1);
+            std::lock_guard<std::mutex> lock(errorMutex);
             result.Errors.push_back("Entry out of bounds for hash " + HashHex(entry.Hash));
-            continue;
+            processed.fetch_add(1);
+            return;
         }
 
-        std::vector<std::uint8_t> compressed(entry.CompressedSize);
-        file.seekg(entry.Offset, std::ios::beg);
-        if (!file.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compressed.size())))
-        {
-            result.SkippedEntries++;
-            result.Errors.push_back("Failed to read entry data for hash " + HashHex(entry.Hash));
-            continue;
-        }
+        std::span<const std::uint8_t> compressedSpan(xpacBytes.data() + entry.Offset,
+                                                     static_cast<std::size_t>(entry.CompressedSize));
 
         std::vector<std::uint8_t> payload;
         try
         {
             if (entry.CompressedSize != entry.Size)
-                payload = DecompressZlib(compressed, entry.Size);
+                payload = DecompressZlib(compressedSpan, entry.Size);
             else
-                payload = std::move(compressed);
+                payload.assign(compressedSpan.begin(), compressedSpan.end());
         }
         catch (std::exception const& ex)
         {
-            result.SkippedEntries++;
+            skipped.fetch_add(1);
+            std::lock_guard<std::mutex> lock(errorMutex);
             result.Errors.push_back("Decompression failed for hash " + HashHex(entry.Hash) + ": " + ex.what());
-            continue;
+            processed.fetch_add(1);
+            return;
         }
 
         std::string mappedName;
@@ -629,30 +678,25 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
         if (!relativePath.empty())
         {
             outputPath = xpacRoot / relativePath;
-            if (WriteFile(outputPath, payload, error))
+            WriteTask task;
+            task.Index = index;
+            task.Path = outputPath;
+            task.Data = std::move(payload);
+            task.IsMainOutput = true;
+            task.IsPairCandidate = (!extension.empty() && (extension == ".zif" || extension == ".zig"));
+            task.Extension = extension;
+            if (task.IsPairCandidate)
             {
-                wroteFile = true;
-                if (!extension.empty() && (extension == ".zif" || extension == ".zig"))
-                {
-                    if (extension == ".zif")
-                        result.ExtractedZif++;
-                    else
-                        result.ExtractedZig++;
-
-                    std::filesystem::path base = outputPath;
-                    base.replace_extension();
-                    PairPaths& pair = pairMap[base.string()];
-                    if (extension == ".zif")
-                        pair.Zif = outputPath;
-                    else
-                        pair.Zig = outputPath;
-                }
+                std::filesystem::path base = outputPath;
+                base.replace_extension();
+                task.PairBase = base.string();
             }
-            else
             {
-                result.Errors.push_back(error);
-                result.SkippedEntries++;
+                std::lock_guard<std::mutex> lock(writeMutex);
+                writeQueue.push(std::move(task));
             }
+            writeCv.notify_one();
+            wroteFile = true;
         }
         else
         {
@@ -661,41 +705,136 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
             isSif = unknown.IsSif;
             std::filesystem::path binPath = unknownDir / ("hash_" + HashHex(entry.Hash) + ".bin");
             outputPath = binPath;
-            if (WriteFile(binPath, payload, error))
             {
+                WriteTask task;
+                task.Index = index;
+                task.Path = outputPath;
+                task.Data = std::move(payload);
+                task.IsMainOutput = true;
+                {
+                    std::lock_guard<std::mutex> lock(writeMutex);
+                    writeQueue.push(std::move(task));
+                }
+                writeCv.notify_one();
                 wroteFile = true;
-            }
-            else
-            {
-                result.Errors.push_back(error);
-                result.SkippedEntries++;
             }
 
             if (unknown.Decoded)
             {
                 std::filesystem::path decodedPath =
                     unknownDir / ("hash_" + HashHex(entry.Hash) + (unknown.IsSif ? ".sif" : ".sig"));
-                if (!WriteFile(decodedPath, unknown.Data, error))
+                WriteTask task;
+                task.Index = index;
+                task.Path = decodedPath;
+                task.Data = std::move(unknown.Data);
                 {
-                    result.Errors.push_back(error);
-                    result.SkippedEntries++;
+                    std::lock_guard<std::mutex> lock(writeMutex);
+                    writeQueue.push(std::move(task));
                 }
+                writeCv.notify_one();
             }
         }
 
-        if (manifest && wroteFile)
+        {
+            std::lock_guard<std::mutex> lock(resultsMutex);
+            entryResults[index] = {wroteFile, isSif, outputPath, mappedName};
+        }
+        processed.fetch_add(1);
+    };
+
+    const std::size_t workerCount = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    std::atomic<std::size_t> nextIndex{0};
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+    std::thread writer([&]() {
+        for (;;)
+        {
+            WriteTask task;
+            {
+                std::unique_lock<std::mutex> lock(writeMutex);
+                writeCv.wait(lock, [&]() { return writerDone || !writeQueue.empty(); });
+                if (writeQueue.empty())
+                {
+                    if (writerDone)
+                        break;
+                    continue;
+                }
+                task = std::move(writeQueue.front());
+                writeQueue.pop();
+            }
+
+            std::string error;
+            bool ok = WriteFile(task.Path, task.Data, error);
+            if (!ok)
+            {
+                skipped.fetch_add(1);
+                std::lock_guard<std::mutex> lock(errorMutex);
+                result.Errors.push_back(error);
+            }
+
+            if (task.IsMainOutput)
+            {
+                std::lock_guard<std::mutex> lock(resultsMutex);
+                entryResults[task.Index].WroteFile = ok;
+            }
+
+            if (ok && task.IsPairCandidate)
+            {
+                std::lock_guard<std::mutex> lock(pairMutex);
+                PairPaths& pair = pairMap[task.PairBase];
+                if (task.Extension == ".zif")
+                {
+                    extractedZif.fetch_add(1);
+                    pair.Zif = task.Path;
+                }
+                else if (task.Extension == ".zig")
+                {
+                    extractedZig.fetch_add(1);
+                    pair.Zig = task.Path;
+                }
+            }
+        }
+    });
+    for (std::size_t i = 0; i < workerCount; ++i)
+    {
+        workers.emplace_back([&]() {
+            for (;;)
+            {
+                std::size_t index = nextIndex.fetch_add(1);
+                if (index >= entries.size())
+                    break;
+                processEntry(index);
+            }
+        });
+    }
+    for (auto& t : workers)
+        t.join();
+    {
+        std::lock_guard<std::mutex> lock(writeMutex);
+        writerDone = true;
+    }
+    writeCv.notify_all();
+    writer.join();
+
+    result.SkippedEntries += skipped.load();
+    result.ExtractedZif += extractedZif.load();
+    result.ExtractedZig += extractedZig.load();
+
+    for (std::size_t i = 0; i < entries.size(); ++i)
+    {
+        auto const& entry = entries[i];
+        auto const& entryResult = entryResults[i];
+        if (manifest && entryResult.WroteFile)
         {
             manifest << HashHex(entry.Hash) << ",";
             manifest << entry.Hash << ",";
-            manifest << (mappedName.empty() ? "" : mappedName) << ",";
+            manifest << (entryResult.MappedName.empty() ? "" : entryResult.MappedName) << ",";
             manifest << entry.Size << ",";
             manifest << entry.CompressedSize << ",";
             manifest << entry.Flags << ",";
-            manifest << outputPath.string() << ",";
-            manifest << (isSif ? "1" : "0") << "\n";
+            manifest << entryResult.OutputPath.string() << ",";
+            manifest << (entryResult.IsSif ? "1" : "0") << "\n";
         }
-
-        ++processed;
     }
 
     if (options.ConvertToSifSig)

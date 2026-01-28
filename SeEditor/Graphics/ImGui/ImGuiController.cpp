@@ -84,7 +84,7 @@ void ImGuiController::InitializeWindow()
         throw std::runtime_error("Failed to create GLFW window");
 
     glfwMakeContextCurrent(_window);
-    glfwSwapInterval(1);
+    glfwSwapInterval(0);
 
     if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress)))
         throw std::runtime_error("Failed to initialize OpenGL loader");

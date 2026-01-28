@@ -70,6 +70,19 @@ public:
     std::size_t DebugForestMeshCount() const { return _forestCpuMeshes.size(); }
     std::size_t DebugForestSkinnedCount() const;
     bool DebugForestDirty() const { return _forestDirty; }
+    double DebugFrameMs() const { return _frameMs; }
+    double DebugForestMs() const { return _forestMs; }
+    double DebugForestSetupMs() const { return _forestSetupMs; }
+    double DebugForestBonesMs() const { return _forestBonesMs; }
+    double DebugForestDrawMs() const { return _forestDrawMs; }
+    double DebugGpuWaitMs() const { return _gpuWaitMs; }
+    double DebugCollisionMs() const { return _collisionMs; }
+    double DebugForestBoxesMs() const { return _forestBoxesMs; }
+    double DebugTriggerBoxesMs() const { return _triggerBoxesMs; }
+    double DebugDebugLinesMs() const { return _debugLinesMs; }
+    double DebugOriginAxesMs() const { return _originAxesMs; }
+    double DebugPrimitiveMs() const { return _primitiveMs; }
+    double DebugForestUploadMs() const { return _forestUploadMs; }
 
 private:
     struct ForestGpuMesh
@@ -107,6 +120,19 @@ private:
     bool _drawCollisionMesh = true;
     bool _drawDebugLines = false;
     bool _drawOriginAxes = true;
+    double _frameMs = 0.0;
+    double _forestMs = 0.0;
+    double _forestSetupMs = 0.0;
+    double _forestBonesMs = 0.0;
+    double _forestDrawMs = 0.0;
+    double _gpuWaitMs = 0.0;
+    double _collisionMs = 0.0;
+    double _forestBoxesMs = 0.0;
+    double _triggerBoxesMs = 0.0;
+    double _debugLinesMs = 0.0;
+    double _originAxesMs = 0.0;
+    double _primitiveMs = 0.0;
+    double _forestUploadMs = 0.0;
 };
 
 } // namespace SeEditor::Renderer

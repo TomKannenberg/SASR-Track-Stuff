@@ -2606,8 +2606,47 @@ void CharmyBee::RenderStuffSifVirtualTree(std::filesystem::path const& root)
     if (!std::filesystem::exists(xpacRoot, ec))
         return;
 
+    if (_stuffSifCacheDirty.load() || _stuffSifCacheRoot != root)
+        BuildStuffSifCache(root);
+
     if (!ImGui::TreeNodeEx("SIF Files", ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth))
         return;
+
+    for (auto const& group : _stuffSifCache)
+    {
+        if (!ImGui::TreeNodeEx(group.XpacName.c_str(), ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth))
+            continue;
+
+        for (auto const& entry : group.Entries)
+        {
+            ImGui::PushID(entry.Path.string().c_str());
+            ImGui::Selectable(entry.Label.c_str());
+            if (ImGui::BeginPopupContextItem())
+            {
+                if (ImGui::MenuItem("Load SIF"))
+                    LoadSifFile(entry.Path);
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::TreePop();
+    }
+
+    ImGui::TreePop();
+}
+
+void CharmyBee::BuildStuffSifCache(std::filesystem::path const& root)
+{
+    _stuffSifCacheRoot = root;
+    _stuffSifCache.clear();
+    std::filesystem::path xpacRoot = root / "xpac";
+    std::error_code ec;
+    if (!std::filesystem::exists(xpacRoot, ec))
+    {
+        _stuffSifCacheDirty = false;
+        return;
+    }
 
     std::vector<std::filesystem::path> xpacs;
     for (auto const& entry : std::filesystem::directory_iterator(xpacRoot, ec))
@@ -2623,9 +2662,8 @@ void CharmyBee::RenderStuffSifVirtualTree(std::filesystem::path const& root)
 
     for (auto const& xpacDir : xpacs)
     {
-        std::string xpacName = xpacDir.filename().string();
-        if (!ImGui::TreeNodeEx(xpacName.c_str(), ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth))
-            continue;
+        CachedSifGroup group;
+        group.XpacName = xpacDir.filename().string();
 
         std::vector<std::filesystem::path> sifs;
         for (auto const& entry : std::filesystem::recursive_directory_iterator(xpacDir, ec))
@@ -2674,27 +2712,24 @@ void CharmyBee::RenderStuffSifVirtualTree(std::filesystem::path const& root)
             if (label.empty())
                 label = sifPath.filename().string();
 
-            ImGui::PushID(sifPath.string().c_str());
-            ImGui::Selectable(label.c_str());
-            if (ImGui::BeginPopupContextItem())
-            {
-                if (ImGui::MenuItem("Load SIF"))
-                    LoadSifFile(sifPath);
-                ImGui::EndPopup();
-            }
-            ImGui::PopID();
+            group.Entries.push_back({sifPath, label});
         }
 
-        ImGui::TreePop();
+        _stuffSifCache.push_back(std::move(group));
     }
 
-    ImGui::TreePop();
+    _stuffSifCacheDirty = false;
 }
 
 void CharmyBee::RenderStuffWindow()
 {
     if (!_showStuffWindow)
         return;
+
+    _stuffHeaderMs = 0.0f;
+    _stuffTreeMs = 0.0f;
+    _stuffSifMs = 0.0f;
+    _stuffPopupMs = 0.0f;
 
     constexpr float kStuffWidth = 320.0f;
     ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -2712,6 +2747,7 @@ void CharmyBee::RenderStuffWindow()
     }
 
     std::filesystem::path root = GetStuffRoot();
+    auto headerStart = std::chrono::steady_clock::now();
     ImGui::TextWrapped("Root: %s", root.string().c_str());
     if (ImGui::Button("Change Root..."))
     {
@@ -2723,8 +2759,12 @@ void CharmyBee::RenderStuffWindow()
             std::error_code ec;
             std::filesystem::create_directories(*_stuffRootOverride, ec);
             _xpacStatus = "Stuff root changed.";
+            _stuffSifCacheDirty = true;
         }
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh SIF list"))
+        _stuffSifCacheDirty = true;
     if (!_xpacStatus.empty())
         ImGui::TextWrapped("%s", _xpacStatus.c_str());
     if (ImGui::Button("Unpack XPAC..."))
@@ -2733,15 +2773,25 @@ void CharmyBee::RenderStuffWindow()
         RepackXpac();
     if (ImGui::Button("Nuke Stuff Folder"))
         _confirmNukeStuff = true;
+    auto headerEnd = std::chrono::steady_clock::now();
+    _stuffHeaderMs = std::chrono::duration<float, std::milli>(headerEnd - headerStart).count();
 
     ImGui::Separator();
     ImGui::BeginChild("StuffTree", ImVec2(0.0f, 0.0f), true);
+    auto treeStart = std::chrono::steady_clock::now();
     RenderStuffTreeNode(root);
+    auto treeEnd = std::chrono::steady_clock::now();
+    _stuffTreeMs = std::chrono::duration<float, std::milli>(treeEnd - treeStart).count();
+
+    auto sifStart = std::chrono::steady_clock::now();
     RenderStuffSifVirtualTree(root);
+    auto sifEnd = std::chrono::steady_clock::now();
+    _stuffSifMs = std::chrono::duration<float, std::milli>(sifEnd - sifStart).count();
     ImGui::EndChild();
 
     ImGui::End();
 
+    auto popupStart = std::chrono::steady_clock::now();
     if (_showXpacRepackPopup)
         ImGui::OpenPopup("Select SIFs to Repack");
     if (ImGui::BeginPopupModal("Select SIFs to Repack", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
@@ -2831,6 +2881,7 @@ void CharmyBee::RenderStuffWindow()
                 for (auto const& err : repackResult.Errors)
                     std::cout << "[XPAC] " << err << std::endl;
 
+                _stuffSifCacheDirty = true;
                 _xpacRepackBusy = false;
             });
 
@@ -2925,6 +2976,9 @@ void CharmyBee::RenderStuffWindow()
         }
         ImGui::EndPopup();
     }
+
+    auto popupEnd = std::chrono::steady_clock::now();
+    _stuffPopupMs = std::chrono::duration<float, std::milli>(popupEnd - popupStart).count();
 }
 
 void CharmyBee::UnpackXpac()
@@ -2989,6 +3043,7 @@ void CharmyBee::UnpackXpac()
         for (auto const& err : unpackResult.Errors)
             std::cout << "[XPAC] " << err << std::endl;
 
+        _stuffSifCacheDirty = true;
         _xpacBusy = false;
     });
 }
@@ -5212,6 +5267,10 @@ void CharmyBee::UpdateTriggerPhantomBoxes()
 void CharmyBee::UpdateForestMeshRendering()
 {
     std::vector<Renderer::SlRenderer::ForestCpuMesh> combined;
+    std::uint64_t selectionHash = 1469598103934665603ull;
+    auto hashMix = [&](std::uint64_t value) {
+        selectionHash ^= value + 0x9e3779b97f4a7c15ull + (selectionHash << 6) + (selectionHash >> 2);
+    };
 
     if (_drawForestMeshes && !_allForestMeshes.empty())
     {
@@ -5264,6 +5323,13 @@ void CharmyBee::UpdateForestMeshRendering()
             combined.reserve(filtered.size() + _logicLocatorMeshes.size());
             combined.insert(combined.end(), filtered.begin(), filtered.end());
         }
+
+        for (auto const& mesh : filtered)
+        {
+            hashMix(static_cast<std::uint64_t>(mesh.ForestIndex));
+            hashMix(static_cast<std::uint64_t>(mesh.TreeIndex));
+            hashMix(static_cast<std::uint64_t>(mesh.BranchIndex));
+        }
     }
 
     if (_drawLogic && _drawLogicLocators && !_logicLocatorMeshes.empty())
@@ -5271,9 +5337,22 @@ void CharmyBee::UpdateForestMeshRendering()
         if (combined.empty())
             combined.reserve(_logicLocatorMeshes.size());
         combined.insert(combined.end(), _logicLocatorMeshes.begin(), _logicLocatorMeshes.end());
+        hashMix(0x10C1C0u);
+        hashMix(static_cast<std::uint64_t>(_logicLocatorMeshes.size()));
     }
 
     bool hasVisible = !combined.empty();
+    if (selectionHash == _forestRenderHash &&
+        _forestRenderCount == combined.size() &&
+        _forestRenderVisible == hasVisible)
+    {
+        _renderer.SetDrawForestMeshes(hasVisible);
+        return;
+    }
+
+    _forestRenderHash = selectionHash;
+    _forestRenderCount = combined.size();
+    _forestRenderVisible = hasVisible;
     _renderer.SetForestMeshes(std::move(combined));
     _renderer.SetDrawForestMeshes(hasVisible);
 
@@ -7256,7 +7335,8 @@ void CharmyBee::RenderMainDockWindow()
             {
                 if (ImGui::BeginTabItem("Hierarchy"))
                 {
-                    ImGui::TextWrapped("Hierarchy and definition panels stay in their own window to the side.");
+                    float framerate = ImGui::GetIO().Framerate;
+                    ImGui::Text("FPS %.1f", framerate);
                     ImGui::EndTabItem();
                 }
 
@@ -7271,8 +7351,8 @@ void CharmyBee::RenderMainDockWindow()
 
             float width = ImGui::GetWindowWidth();
             float framerate = ImGui::GetIO().Framerate;
-            ImGui::SetCursorPosX(width - 100);
-            ImGui::Text("(%.1f FPS)", framerate);
+            ImGui::SetCursorPosX(width - 360);
+            ImGui::Text("FPS %.1f", framerate);
             ImGui::EndMainMenuBar();
         }
     }
@@ -7302,6 +7382,7 @@ void CharmyBee::Run()
     auto previousTime = std::chrono::steady_clock::now();
     while (!_controller->ShouldClose())
     {
+        auto loopStart = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
         std::chrono::duration<float> delta = now - previousTime;
         previousTime = now;
@@ -7309,23 +7390,71 @@ void CharmyBee::Run()
         _blockSceneInput = false;
 
         _controller->SetPerFrameImGuiData(delta.count());
+        auto newFrameStart = std::chrono::steady_clock::now();
         _controller->NewFrame();
+        auto newFrameEnd = std::chrono::steady_clock::now();
+        _imguiNewFrameMs = std::chrono::duration<float, std::milli>(newFrameEnd - newFrameStart).count();
 
+        auto uiStart = std::chrono::steady_clock::now();
+        auto dockStart = std::chrono::steady_clock::now();
         RenderMainDockWindow();
+        auto dockEnd = std::chrono::steady_clock::now();
+        _uiDockMs = std::chrono::duration<float, std::milli>(dockEnd - dockStart).count();
+
+        auto racingStart = std::chrono::steady_clock::now();
         RenderRacingLineEditor();
+        auto racingEnd = std::chrono::steady_clock::now();
+        _uiRacingMs = std::chrono::duration<float, std::milli>(racingEnd - racingStart).count();
+
+        auto stuffStart = std::chrono::steady_clock::now();
         RenderStuffWindow();
+        auto stuffEnd = std::chrono::steady_clock::now();
+        _uiStuffMs = std::chrono::duration<float, std::milli>(stuffEnd - stuffStart).count();
+
+        auto forestStart = std::chrono::steady_clock::now();
         RenderForestHierarchyWindow();
+        auto forestEnd = std::chrono::steady_clock::now();
+        _uiForestMs = std::chrono::duration<float, std::milli>(forestEnd - forestStart).count();
 
+        auto sifStart = std::chrono::steady_clock::now();
         RenderSifViewer();
+        auto sifEnd = std::chrono::steady_clock::now();
+        _uiSifMs = std::chrono::duration<float, std::milli>(sifEnd - sifStart).count();
 
+        auto uiEnd = std::chrono::steady_clock::now();
+        _uiBuildMs = std::chrono::duration<float, std::milli>(uiEnd - uiStart).count();
+
+        auto animStart = std::chrono::steady_clock::now();
         UpdateAnimator(delta.count());
+        auto animEnd = std::chrono::steady_clock::now();
+        _animMs = std::chrono::duration<float, std::milli>(animEnd - animStart).count();
         _renderer.Render();
+        auto imguiStart = std::chrono::steady_clock::now();
         _controller->Render();
-        _controller->SwapBuffers();
-        _controller->PollEvents();
-        PollGlfwKeyInput();
+        auto imguiEnd = std::chrono::steady_clock::now();
+        _imguiRenderMs = std::chrono::duration<float, std::milli>(imguiEnd - imguiStart).count();
 
+        auto swapStart = std::chrono::steady_clock::now();
+        _controller->SwapBuffers();
+        auto swapEnd = std::chrono::steady_clock::now();
+        _swapMs = std::chrono::duration<float, std::milli>(swapEnd - swapStart).count();
+
+        auto pollStart = std::chrono::steady_clock::now();
+        _controller->PollEvents();
+        auto pollEnd = std::chrono::steady_clock::now();
+        _pollMs = std::chrono::duration<float, std::milli>(pollEnd - pollStart).count();
+        auto inputStart = std::chrono::steady_clock::now();
+        PollGlfwKeyInput();
+        auto inputEnd = std::chrono::steady_clock::now();
+        _inputMs = std::chrono::duration<float, std::milli>(inputEnd - inputStart).count();
+
+        auto orbitStart = std::chrono::steady_clock::now();
         UpdateOrbitFromInput(delta.count());
+        auto orbitEnd = std::chrono::steady_clock::now();
+        _orbitMs = std::chrono::duration<float, std::milli>(orbitEnd - orbitStart).count();
+
+        auto loopEnd = std::chrono::steady_clock::now();
+        _frameLoopMs = std::chrono::duration<float, std::milli>(loopEnd - loopStart).count();
     }
 
     _controller->Dispose();

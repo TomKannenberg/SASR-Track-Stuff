@@ -75,32 +75,14 @@ GLuint EnsureForestProgram()
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec2 aUv;
-layout(location = 3) in vec4 aBoneWeights;
-layout(location = 4) in vec4 aBoneIndices;
 uniform mat4 uVP;
 uniform mat4 uView;
 uniform mat4 uModel;
-uniform int uUseSkinning;
-uniform int uBoneCount;
-const int MAX_BONES = 256;
-uniform mat4 uBones[MAX_BONES];
 out vec3 vNormal;
 out vec2 vUv;
 void main() {
     vec4 worldPos = uModel * vec4(aPos, 1.0);
     vec3 worldNormal = mat3(uModel) * aNormal;
-    if (uUseSkinning != 0) {
-        ivec4 idx = ivec4(aBoneIndices + vec4(0.5));
-        int hi = (uBoneCount > 0) ? min(uBoneCount - 1, MAX_BONES - 1) : 0;
-        idx = clamp(idx, ivec4(0), ivec4(hi));
-        mat4 skin =
-            uBones[idx.x] * aBoneWeights.x +
-            uBones[idx.y] * aBoneWeights.y +
-            uBones[idx.z] * aBoneWeights.z +
-            uBones[idx.w] * aBoneWeights.w;
-        worldPos = skin * vec4(aPos, 1.0);
-        worldNormal = mat3(skin) * aNormal;
-    }
     vNormal = mat3(uView) * normalize(worldNormal);
     vUv = vec2(aUv.x, 1.0 - aUv.y);
     gl_Position = uVP * vec4(worldPos.xyz, 1.0);
@@ -254,6 +236,9 @@ void SlRenderer::Render()
     if (!_framebuffer.IsValid())
         return;
 
+    auto frameStart = std::chrono::high_resolution_clock::now();
+    _forestMs = 0.0;
+    _collisionMs = 0.0;
     _framebuffer.Bind();
 
     glEnable(GL_DEPTH_TEST);
@@ -300,19 +285,28 @@ void SlRenderer::Render()
     auto view = makeLookAt(eye, target, {0.0f, 1.0f, 0.0f});
     PrimitiveRenderer::SetCamera(view, proj);
 
+    auto primStart = std::chrono::high_resolution_clock::now();
     PrimitiveRenderer::BeginPrimitiveScene();
 
     // Draw simple axes
     if (_drawOriginAxes)
     {
+        auto axesStart = std::chrono::high_resolution_clock::now();
         using SlLib::Math::Vector3;
         PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {1.5f, 0.0f, 0.0f}, {1.0f, 0.1f, 0.1f});
         PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 1.5f, 0.0f}, {0.1f, 1.0f, 0.1f});
         PrimitiveRenderer::DrawLine({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.5f}, {0.1f, 0.1f, 1.0f});
+        auto axesEnd = std::chrono::high_resolution_clock::now();
+        _originAxesMs = std::chrono::duration<double, std::milli>(axesEnd - axesStart).count();
+    }
+    else
+    {
+        _originAxesMs = 0.0;
     }
 
     if (_drawCollisionMesh && !_collisionTriangles.empty())
     {
+        auto collisionStart = std::chrono::high_resolution_clock::now();
         SlLib::Math::Vector3 col = {0.4f, 0.9f, 0.9f};
         for (auto const& tri : _collisionTriangles)
         {
@@ -323,10 +317,17 @@ void SlRenderer::Render()
             PrimitiveRenderer::DrawLine(b, c, col);
             PrimitiveRenderer::DrawLine(c, a, col);
         }
+        auto collisionEnd = std::chrono::high_resolution_clock::now();
+        _collisionMs = std::chrono::duration<double, std::milli>(collisionEnd - collisionStart).count();
+    }
+    else
+    {
+        _collisionMs = 0.0;
     }
     // Forest boxes
     if (_drawForestBoxes && !_forestBoxes.empty())
     {
+        auto boxesStart = std::chrono::high_resolution_clock::now();
         SlLib::Math::Vector3 col = {0.2f, 0.9f, 0.2f};
         const std::array<std::pair<int, int>, 12> edges = {{
             {0, 1}, {1, 2}, {2, 3}, {3, 0},
@@ -356,11 +357,18 @@ void SlRenderer::Render()
             for (auto const& edge : edges)
                 drawEdge(edge.first, edge.second);
         }
+        auto boxesEnd = std::chrono::high_resolution_clock::now();
+        _forestBoxesMs = std::chrono::duration<double, std::milli>(boxesEnd - boxesStart).count();
+    }
+    else
+    {
+        _forestBoxesMs = 0.0;
     }
 
     // Trigger phantom boxes (kill/respawn zones)
     if (_drawTriggerBoxes && !_triggerBoxes.empty())
     {
+        auto boxesStart = std::chrono::high_resolution_clock::now();
         SlLib::Math::Vector3 col = {0.9f, 0.2f, 0.2f};
         const std::array<std::pair<int, int>, 12> edges = {{
             {0, 1}, {1, 2}, {2, 3}, {3, 0},
@@ -390,12 +398,25 @@ void SlRenderer::Render()
             for (auto const& edge : edges)
                 drawEdge(edge.first, edge.second);
         }
+        auto boxesEnd = std::chrono::high_resolution_clock::now();
+        _triggerBoxesMs = std::chrono::duration<double, std::milli>(boxesEnd - boxesStart).count();
+    }
+    else
+    {
+        _triggerBoxesMs = 0.0;
     }
 
     if (_drawDebugLines && !_debugLines.empty())
     {
+        auto linesStart = std::chrono::high_resolution_clock::now();
         for (auto const& line : _debugLines)
             PrimitiveRenderer::DrawLine(line.From, line.To, line.Color);
+        auto linesEnd = std::chrono::high_resolution_clock::now();
+        _debugLinesMs = std::chrono::duration<double, std::milli>(linesEnd - linesStart).count();
+    }
+    else
+    {
+        _debugLinesMs = 0.0;
     }
 
     if (_drawBoneLines && !_boneLines.empty())
@@ -407,6 +428,7 @@ void SlRenderer::Render()
 
     if (_forestDirty)
     {
+        auto uploadStart = std::chrono::high_resolution_clock::now();
         for (auto& mesh : _forestGpuMeshes)
         {
             if (mesh.Ebo) glDeleteBuffers(1, &mesh.Ebo);
@@ -479,6 +501,12 @@ void SlRenderer::Render()
             _forestGpuMeshes.push_back(gpu);
         }
         _forestDirty = false;
+        auto uploadEnd = std::chrono::high_resolution_clock::now();
+        _forestUploadMs = std::chrono::duration<double, std::milli>(uploadEnd - uploadStart).count();
+    }
+    else
+    {
+        _forestUploadMs = 0.0;
     }
 
     if (std::getenv("RENDER_PRE_DEBUG") != nullptr)
@@ -518,6 +546,8 @@ void SlRenderer::Render()
 
     if (_drawForestMeshes && !_forestGpuMeshes.empty())
     {
+        auto forestStart = std::chrono::high_resolution_clock::now();
+        auto setupStart = std::chrono::high_resolution_clock::now();
         GLuint program = EnsureForestProgram();
         glUseProgram(program);
         auto vp = ToColumnMajor(SlLib::Math::Multiply(proj, view));
@@ -533,7 +563,11 @@ void SlRenderer::Render()
         if (locView >= 0)
             glUniformMatrix4fv(locView, 1, GL_FALSE, viewMat.data());
         glUniform1i(glGetUniformLocation(program, "uTexture"), 0);
+        auto setupEnd = std::chrono::high_resolution_clock::now();
+        _forestSetupMs = std::chrono::duration<double, std::milli>(setupEnd - setupStart).count();
 
+        double bonesMs = 0.0;
+        double drawMs = 0.0;
         for (auto const& mesh : _forestGpuMeshes)
         {
             SlLib::Math::Matrix4x4 model{};
@@ -549,6 +583,7 @@ void SlRenderer::Render()
                     boneCount = 256;
                 if (skinned && locBones >= 0)
                 {
+                    auto bonesStart = std::chrono::high_resolution_clock::now();
                     std::vector<float> boneFloats;
                     boneFloats.reserve(boneCount * 16);
                     for (std::size_t i = 0; i < boneCount; ++i)
@@ -557,6 +592,8 @@ void SlRenderer::Render()
                         boneFloats.insert(boneFloats.end(), cm.begin(), cm.end());
                     }
                     glUniformMatrix4fv(locBones, static_cast<GLsizei>(boneCount), GL_FALSE, boneFloats.data());
+                    auto bonesEnd = std::chrono::high_resolution_clock::now();
+                    bonesMs += std::chrono::duration<double, std::milli>(bonesEnd - bonesStart).count();
                 }
             }
 
@@ -573,16 +610,38 @@ void SlRenderer::Render()
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, mesh.Texture);
             glBindVertexArray(mesh.Vao);
+            auto drawStart = std::chrono::high_resolution_clock::now();
             glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(mesh.IndexCount), GL_UNSIGNED_INT, nullptr);
+            auto drawEnd = std::chrono::high_resolution_clock::now();
+            drawMs += std::chrono::duration<double, std::milli>(drawEnd - drawStart).count();
         }
 
         glBindVertexArray(0);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
+        auto forestEnd = std::chrono::high_resolution_clock::now();
+        _forestMs = std::chrono::duration<double, std::milli>(forestEnd - forestStart).count();
+        _forestBonesMs = bonesMs;
+        _forestDrawMs = drawMs;
+    }
+    else
+    {
+        _forestMs = 0.0;
+        _forestSetupMs = 0.0;
+        _forestBonesMs = 0.0;
+        _forestDrawMs = 0.0;
     }
 
     PrimitiveRenderer::EndPrimitiveScene();
+    auto primEnd = std::chrono::high_resolution_clock::now();
+    _primitiveMs = std::chrono::duration<double, std::milli>(primEnd - primStart).count();
     _framebuffer.Unbind();
+    auto gpuStart = std::chrono::high_resolution_clock::now();
+    glFinish();
+    auto gpuEnd = std::chrono::high_resolution_clock::now();
+    _gpuWaitMs = std::chrono::duration<double, std::milli>(gpuEnd - gpuStart).count();
+    auto frameEnd = std::chrono::high_resolution_clock::now();
+    _frameMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
 }
 
 void SlRenderer::Resize(int width, int height)

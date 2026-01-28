@@ -151,6 +151,19 @@ private:
     bool _confirmNukeStuff = false;
     std::mutex _xpacMutex;
     std::unique_ptr<std::thread> _xpacWorker;
+    struct CachedSifEntry
+    {
+        std::filesystem::path Path;
+        std::string Label;
+    };
+    struct CachedSifGroup
+    {
+        std::string XpacName;
+        std::vector<CachedSifEntry> Entries;
+    };
+    std::filesystem::path _stuffSifCacheRoot;
+    std::vector<CachedSifGroup> _stuffSifCache;
+    std::atomic<bool> _stuffSifCacheDirty{true};
     struct XpacRepackEntry
     {
         std::filesystem::path Path;
@@ -233,7 +246,7 @@ private:
     bool _debugKeyInput = false;
     std::array<bool, GLFW_KEY_LAST + 1> _glfwKeyStates{};
     std::array<bool, GLFW_MOUSE_BUTTON_LAST + 1> _glfwMouseButtonStates{};
-    float _movementSpeed = 6.0f;
+    float _movementSpeed = 32.0f;
     int _animatorDebugStamp = -1;
     std::string _sifFilePath;
     std::string _sifLoadMessage;
@@ -272,6 +285,27 @@ private:
     bool _sceneViewHovered = false;
     bool _blockSceneInput = false;
     std::size_t _totalForestMeshes = 0;
+    std::uint64_t _forestRenderHash = 0;
+    std::size_t _forestRenderCount = 0;
+    bool _forestRenderVisible = false;
+    float _frameLoopMs = 0.0f;
+    float _swapMs = 0.0f;
+    float _pollMs = 0.0f;
+    float _imguiRenderMs = 0.0f;
+    float _uiBuildMs = 0.0f;
+    float _imguiNewFrameMs = 0.0f;
+    float _animMs = 0.0f;
+    float _orbitMs = 0.0f;
+    float _inputMs = 0.0f;
+    float _stuffHeaderMs = 0.0f;
+    float _stuffTreeMs = 0.0f;
+    float _stuffSifMs = 0.0f;
+    float _stuffPopupMs = 0.0f;
+    float _uiDockMs = 0.0f;
+    float _uiRacingMs = 0.0f;
+    float _uiStuffMs = 0.0f;
+    float _uiForestMs = 0.0f;
+    float _uiSifMs = 0.0f;
 
     void RenderMainDockWindow();
     void RenderStuffWindow();
@@ -344,6 +378,7 @@ private:
     std::filesystem::path GetStuffRoot() const;
     void RenderStuffTreeNode(std::filesystem::path const& path);
     void RenderStuffSifVirtualTree(std::filesystem::path const& root);
+    void BuildStuffSifCache(std::filesystem::path const& root);
 };
 
 } // namespace SeEditor
