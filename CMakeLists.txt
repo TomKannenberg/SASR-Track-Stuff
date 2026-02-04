@@ -6,11 +6,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # Root directories for source and include layouts.
 set(SLLIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/SlLib")
 set(SEEDITOR_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/SeEditor")
 set(SLLIB_MARIOKART_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/SlLib.MarioKart")
 set(MAPPING_GC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/SeEditor/Resources/MAPPING.GC")
+set(MAPPING_GS3_PATH "${CMAKE_CURRENT_SOURCE_DIR}/SeEditor/Resources/MAPPING.GS3")
 
 # Collect sources for each logical target.
 file(GLOB_RECURSE SLLIB_SOURCES
@@ -21,6 +26,13 @@ file(GLOB_RECURSE SEEDITOR_SOURCES
     "${SEEDITOR_ROOT}/*.cpp"
 )
 list(FILTER SEEDITOR_SOURCES EXCLUDE REGEX ".*/SifParser\\.cpp$")
+if (WIN32)
+    list(FILTER SEEDITOR_SOURCES EXCLUDE REGEX ".*/Dialogs/TinyFileDialog_stub\\.cpp$")
+endif()
+if (NOT WIN32)
+    list(FILTER SEEDITOR_SOURCES EXCLUDE REGEX ".*/Dialogs/TinyFileDialog\\.cpp$")
+    list(APPEND SEEDITOR_SOURCES "${SEEDITOR_ROOT}/Dialogs/TinyFileDialog_stub.cpp")
+endif()
 
 add_library(SeEditorCore STATIC "${SEEDITOR_ROOT}/SifParser.cpp")
 target_include_directories(SeEditorCore PUBLIC
@@ -53,7 +65,10 @@ add_subdirectory(UnityTooling)
 
 find_package(OpenGL REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
-find_package(glad CONFIG REQUIRED)
+find_package(glad CONFIG QUIET)
+if (NOT TARGET glad::glad)
+    add_subdirectory(linux_libs/glad EXCLUDE_FROM_ALL)
+endif()
 set(ZLIB_USE_STATIC_LIBS ON)
 if (DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
     set(_vcpkg_zlib_lib "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libz.a")
@@ -73,13 +88,25 @@ target_include_directories(SeEditorLib PUBLIC
 )
 if (EXISTS "${MAPPING_GC_PATH}")
     set(EMBEDDED_MAPPING_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/EmbeddedMapping.hpp")
-    file(READ "${MAPPING_GC_PATH}" MAPPING_GC_TEXT)
-    file(WRITE "${EMBEDDED_MAPPING_HEADER}"
-        "#pragma once\n"
-        "#include <cstddef>\n"
-        "inline constexpr char kEmbeddedMapping[] = R\"MAPPINGGC(\n${MAPPING_GC_TEXT}\n)MAPPINGGC\";\n"
-        "inline constexpr std::size_t kEmbeddedMappingSize = sizeof(kEmbeddedMapping) - 1;\n"
-        )
+    set(EMBEDDED_MAPPING_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/SeEditor/Resources/GenerateEmbeddedMapping.cmake")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    set(EMBEDDED_MAPPING_DEPENDS "${MAPPING_GC_PATH}" "${EMBEDDED_MAPPING_SCRIPT}")
+    if (EXISTS "${MAPPING_GS3_PATH}")
+        list(APPEND EMBEDDED_MAPPING_DEPENDS "${MAPPING_GS3_PATH}")
+    endif()
+    add_custom_command(
+        OUTPUT "${EMBEDDED_MAPPING_HEADER}"
+        COMMAND ${CMAKE_COMMAND}
+            -DMAPPING_GC_PATH="${MAPPING_GC_PATH}"
+            -DMAPPING_GS3_PATH="${MAPPING_GS3_PATH}"
+            -DEMBEDDED_MAPPING_HEADER="${EMBEDDED_MAPPING_HEADER}"
+            -P "${EMBEDDED_MAPPING_SCRIPT}"
+        DEPENDS ${EMBEDDED_MAPPING_DEPENDS}
+        COMMENT "Generating EmbeddedMapping.hpp from MAPPING.GC/MAPPING.GS3"
+        VERBATIM
+    )
+    add_custom_target(EmbeddedMapping DEPENDS "${EMBEDDED_MAPPING_HEADER}")
+    add_dependencies(SeEditorLib EmbeddedMapping)
     target_include_directories(SeEditorLib PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_definitions(SeEditorLib PRIVATE SEEDITOR_EMBED_MAPPING=1)
 endif()
@@ -87,11 +114,22 @@ endif()
 add_executable(CppSLib main.cpp)
 target_link_libraries(CppSLib PRIVATE SeEditorLib SlLibMarioKart)
 
+# Convenience: copy the built CppSLib.exe two directories up after a successful build.
+if (WIN32)
+    add_custom_command(TARGET CppSLib POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:CppSLib>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../$<TARGET_FILE_NAME:CppSLib>"
+        COMMENT "Copying CppSLib to ../../"
+        VERBATIM
+    )
+endif()
+
 add_executable(forest_extractor SeEditor/ForestExtractor.cpp)
 target_link_libraries(forest_extractor PRIVATE SeEditorCore)
 target_include_directories(forest_extractor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(forest_to_obj SeEditor/ForestToObj.cpp)
-target_link_libraries(forest_to_obj PRIVATE SeEditorCore SlLib SeEditorLib)
+target_link_libraries(forest_to_obj PRIVATE SeEditorCore SeEditorForest SlLib)
 target_include_directories(forest_to_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(forest_unpacker SeEditor/ForestUnpacker.cpp)
 target_link_libraries(forest_unpacker PRIVATE SeEditorCore)
@@ -132,7 +170,10 @@ if (MINGW)
     endforeach()
 endif()
 
-find_package(imgui CONFIG REQUIRED)
+find_package(imgui CONFIG QUIET)
+if (NOT TARGET imgui::imgui)
+    add_subdirectory(linux_libs/imgui EXCLUDE_FROM_ALL)
+endif()
 
 include(GNUInstallDirs)
 

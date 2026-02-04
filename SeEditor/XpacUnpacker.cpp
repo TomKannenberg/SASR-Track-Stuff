@@ -49,6 +49,14 @@ std::uint32_t ReadU32LE(std::span<const std::uint8_t> data, std::size_t offset)
            (static_cast<std::uint32_t>(data[offset + 3]) << 24);
 }
 
+std::uint32_t ReadU32BE(std::span<const std::uint8_t> data, std::size_t offset)
+{
+    return (static_cast<std::uint32_t>(data[offset]) << 24) |
+           (static_cast<std::uint32_t>(data[offset + 1]) << 16) |
+           (static_cast<std::uint32_t>(data[offset + 2]) << 8) |
+           static_cast<std::uint32_t>(data[offset + 3]);
+}
+
 void WriteU32LE(std::vector<std::uint8_t>& data, std::size_t offset, std::uint32_t value)
 {
     if (offset + 4 > data.size())
@@ -57,6 +65,24 @@ void WriteU32LE(std::vector<std::uint8_t>& data, std::size_t offset, std::uint32
     data[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
     data[offset + 2] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
     data[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
+}
+
+void WriteU32BE(std::vector<std::uint8_t>& data, std::size_t offset, std::uint32_t value)
+{
+    if (offset + 4 > data.size())
+        return;
+    data[offset + 0] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
+    data[offset + 1] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+    data[offset + 2] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    data[offset + 3] = static_cast<std::uint8_t>(value & 0xFF);
+}
+
+constexpr std::uint32_t MakeTypeCodeBE(char a, char b, char c, char d)
+{
+    return (static_cast<std::uint32_t>(static_cast<unsigned char>(a)) << 24) |
+           (static_cast<std::uint32_t>(static_cast<unsigned char>(b)) << 16) |
+           (static_cast<std::uint32_t>(static_cast<unsigned char>(c)) << 8) |
+           static_cast<std::uint32_t>(static_cast<unsigned char>(d));
 }
 
 bool LooksLikeZlib(std::span<const std::uint8_t> data)
@@ -96,6 +122,73 @@ bool LooksLikeSif(std::span<const std::uint8_t> data)
     default:
         return false;
     }
+}
+
+bool LooksLikeSifBE(std::span<const std::uint8_t> data)
+{
+    if (data.size() < 0x10)
+        return false;
+
+    std::size_t offset = 0;
+    std::uint32_t possibleLength = ReadU32BE(data, 0);
+    if (possibleLength == data.size() - 4 || possibleLength == data.size())
+        offset = 4;
+
+    if (offset + 0x10 > data.size())
+        return false;
+
+    std::uint32_t type = ReadU32BE(data, offset);
+    switch (type)
+    {
+    case MakeTypeCodeBE('T', 'R', 'A', 'K'):
+    case MakeTypeCodeBE('F', 'O', 'R', 'E'):
+    case MakeTypeCodeBE('C', 'O', 'L', 'I'):
+    case MakeTypeCodeBE('L', 'O', 'G', 'C'):
+    case MakeTypeCodeBE('P', 'T', 'E', 'X'):
+    case MakeTypeCodeBE('I', 'N', 'F', 'O'):
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool LooksLikeSifAny(std::span<const std::uint8_t> data)
+{
+    return LooksLikeSif(data) || LooksLikeSifBE(data);
+}
+
+bool IsSifPrefixValid(std::span<const std::uint8_t> data, std::uint32_t expectedTotal)
+{
+    if (data.size() < 0x10)
+        return true;
+
+    auto readLE = [&](std::size_t off) {
+        return ReadU32LE(data, off);
+    };
+    auto readBE = [&](std::size_t off) {
+        return ReadU32BE(data, off);
+    };
+
+    std::size_t offset = 0;
+    while (offset + 0x10 <= data.size())
+    {
+        std::uint32_t endianMarkerLE = readLE(offset + 12);
+        bool bigEndian = endianMarkerLE == 0x11223344;
+        auto read32 = [&](std::size_t off) {
+            return bigEndian ? readBE(off) : readLE(off);
+        };
+
+        std::uint32_t chunkSize = read32(offset + 4);
+        std::uint32_t dataSize = read32(offset + 8);
+        if (chunkSize < 0x10 || dataSize > chunkSize - 0x10)
+            return false;
+        if (expectedTotal > 0 && offset + chunkSize > expectedTotal)
+            return false;
+        if (offset + chunkSize > data.size())
+            return true; // partial chunk, prefix looks valid so far
+        offset += chunkSize;
+    }
+    return true;
 }
 
 std::vector<std::uint8_t> DecompressZlib(std::span<const std::uint8_t> data, std::size_t expectedSize)
@@ -144,9 +237,200 @@ std::vector<std::uint8_t> DecompressZlib(std::span<const std::uint8_t> data, std
     return result;
 }
 
+std::vector<std::uint8_t> DecompressRawDeflate(std::span<const std::uint8_t> data)
+{
+    constexpr int kZlibBufError = -5;
+    z_stream inflater{};
+    inflater.next_in = const_cast<std::uint8_t*>(data.data());
+    inflater.avail_in = static_cast<uInt>(data.size());
+
+    if (inflateInit2(&inflater, -15) != Z_OK)
+        throw std::runtime_error("Failed to init raw deflate inflater.");
+
+    std::vector<std::uint8_t> result;
+    std::array<std::uint8_t, 16 * 1024> buffer{};
+    int status = Z_OK;
+    while (status != Z_STREAM_END)
+    {
+        inflater.next_out = buffer.data();
+        inflater.avail_out = static_cast<uInt>(buffer.size());
+        status = inflate(&inflater, 0);
+        if (status != Z_OK && status != Z_STREAM_END && status != kZlibBufError)
+        {
+            inflateEnd(&inflater);
+            throw std::runtime_error("Raw deflate decompression failed.");
+        }
+        std::size_t have = buffer.size() - inflater.avail_out;
+        if (have > 0)
+            result.insert(result.end(), buffer.begin(), buffer.begin() + have);
+        if (status == kZlibBufError && inflater.avail_in == 0 && have == 0)
+            break;
+    }
+
+    inflateEnd(&inflater);
+    return result;
+}
+
+std::vector<std::uint8_t> CompressRawDeflate(std::span<const std::uint8_t> input)
+{
+    z_stream stream{};
+    stream.next_in = const_cast<std::uint8_t*>(input.data());
+    stream.avail_in = static_cast<decltype(stream.avail_in)>(input.size());
+
+    constexpr int level = 9;
+    constexpr int wbits = -15;
+    constexpr int memLevel = 8;
+    constexpr int strategy = Z_DEFAULT_STRATEGY;
+    if (deflateInit2(&stream, level, Z_DEFLATED, wbits, memLevel, strategy) != Z_OK)
+        throw std::runtime_error("Failed to init raw deflate compressor.");
+
+    std::vector<std::uint8_t> output;
+    std::vector<std::uint8_t> buffer(1 << 14);
+    int status = Z_OK;
+    while (status == Z_OK)
+    {
+        stream.next_out = buffer.data();
+        stream.avail_out = static_cast<decltype(stream.avail_out)>(buffer.size());
+        status = deflate(&stream, Z_FINISH);
+        if (status != Z_OK && status != Z_STREAM_END)
+        {
+            deflateEnd(&stream);
+            throw std::runtime_error("Raw deflate compression failed.");
+        }
+        std::size_t have = buffer.size() - stream.avail_out;
+        output.insert(output.end(), buffer.begin(), buffer.begin() + have);
+    }
+
+    deflateEnd(&stream);
+    return output;
+}
+
+bool DecodeZifZigPs3Internal(std::span<const std::uint8_t> data, std::vector<std::uint8_t>& out, std::string& error)
+{
+    constexpr std::size_t kSectorSize = 0x80000;
+    if (data.size() < 8)
+        return false;
+
+    std::uint32_t expectedTotal = ReadU32BE(data, 0);
+    if (expectedTotal == 0)
+        return false;
+
+    auto decodeSector = [&](std::size_t base, bool hasTotal, std::uint32_t& countOut, std::size_t& cursorOut,
+                            std::vector<std::uint32_t>& entries) -> bool {
+        if (base + 4 > data.size())
+            return false;
+        std::size_t cursor = base;
+        if (hasTotal)
+            cursor += 4; // skip total size
+        std::uint32_t count = ReadU32BE(data, cursor);
+        cursor += 4;
+        if (count == 0 || count > 4096)
+            return false;
+        if (cursor + static_cast<std::size_t>(count) * 4 > data.size())
+            return false;
+        entries.clear();
+        entries.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i)
+        {
+            std::uint32_t v = ReadU32BE(data, cursor);
+            cursor += 4;
+            entries.push_back(v);
+        }
+        countOut = count;
+        cursorOut = cursor;
+        return true;
+    };
+
+    out.clear();
+    std::vector<std::uint32_t> entries;
+    std::size_t base = 0;
+    bool first = true;
+    while (base < data.size())
+    {
+        std::uint32_t count = 0;
+        std::size_t cursor = 0;
+        bool ok = decodeSector(base, first, count, cursor, entries);
+        if (!ok)
+        {
+            // if a sector header is zeroed, skip it
+            if (base + 4 <= data.size() && ReadU32BE(data, base) == 0)
+            {
+                base += kSectorSize;
+                first = false;
+                continue;
+            }
+            break;
+        }
+
+        for (std::uint32_t i = 0; i < count; ++i)
+        {
+            std::uint32_t entry = entries[i];
+            bool compressed = (entry & 0x80000000u) != 0;
+            std::uint32_t size = entry & 0x7FFFFFFFu;
+            if (size == 0)
+                continue;
+            if (cursor + size > data.size())
+            {
+                error = "PS3 ZIF/ZIG chunk out of bounds.";
+                return false;
+            }
+            std::span<const std::uint8_t> block = data.subspan(cursor, size);
+            cursor += size;
+            if (!compressed)
+            {
+                out.insert(out.end(), block.begin(), block.end());
+            }
+            else
+            {
+                try
+                {
+                    std::vector<std::uint8_t> decoded = DecompressRawDeflate(block);
+                    out.insert(out.end(), decoded.begin(), decoded.end());
+                }
+                catch (std::exception const& ex)
+                {
+                    error = ex.what();
+                    return false;
+                }
+            }
+        }
+
+        if (out.size() >= expectedTotal)
+            break;
+        base += kSectorSize;
+        first = false;
+    }
+
+    if (out.size() != expectedTotal)
+    {
+        error = "PS3 ZIF/ZIG size mismatch.";
+        return false;
+    }
+    return true;
+}
+
 std::unordered_map<std::uint32_t, std::string> LoadMappingFromText(std::string_view text)
 {
     std::unordered_map<std::uint32_t, std::string> mapping;
+    auto isEndMarker = [](std::string_view value) {
+        return value == "__END__OF__FILE__" ||
+               value == "./__END__OF__FILE__" ||
+               value == ".\\__END__OF__FILE__";
+    };
+    auto normalizeValue = [](std::string value) {
+        if (value.empty())
+            return value;
+        if (value.rfind("./", 0) == 0 || value.rfind(".\\", 0) == 0)
+            return value;
+        if (!value.empty() && (value.front() == '/' || value.front() == '\\'))
+            return value;
+        if (value.size() > 1 &&
+            std::isalpha(static_cast<unsigned char>(value[0])) &&
+            value[1] == ':')
+            return value;
+        return std::string(".\\") + value;
+    };
+
     std::size_t start = 0;
     while (start < text.size())
     {
@@ -164,13 +448,16 @@ std::unordered_map<std::uint32_t, std::string> LoadMappingFromText(std::string_v
             {
                 std::string key(line.substr(0, colon));
                 std::string value(line.substr(colon + 1, semi - colon - 1));
-                try
+                if (!isEndMarker(value))
                 {
-                    std::uint32_t hash = static_cast<std::uint32_t>(std::stoul(key));
-                    mapping.emplace(hash, value);
-                }
-                catch (...)
-                {
+                    try
+                    {
+                        std::uint32_t hash = static_cast<std::uint32_t>(std::stoul(key));
+                        mapping[hash] = normalizeValue(std::move(value));
+                    }
+                    catch (...)
+                    {
+                    }
                 }
             }
         }
@@ -259,7 +546,7 @@ bool WriteFile(std::filesystem::path const& path, std::span<const std::uint8_t> 
     }
 }
 
-bool DecodeZifZig(std::span<const std::uint8_t> data, std::vector<std::uint8_t>& out, std::string& error)
+bool DecodeZifZigInternal(std::span<const std::uint8_t> data, std::vector<std::uint8_t>& out, std::string& error)
 {
     if (data.empty())
     {
@@ -267,26 +554,39 @@ bool DecodeZifZig(std::span<const std::uint8_t> data, std::vector<std::uint8_t>&
         return false;
     }
 
-    auto stripLengthPrefix = [&](std::span<const std::uint8_t> buffer, std::vector<std::uint8_t>& target) {
-        if (buffer.size() < 4)
-        {
-            target.assign(buffer.begin(), buffer.end());
-            return;
-        }
+      auto stripLengthPrefix = [&](std::span<const std::uint8_t> buffer, std::vector<std::uint8_t>& target) {
+          if (buffer.size() < 4)
+          {
+              target.assign(buffer.begin(), buffer.end());
+              return;
+          }
 
-        std::uint32_t expected = ReadU32LE(buffer, 0);
-        std::size_t payloadSize = buffer.size() - 4;
-        if (expected > 0 && expected <= payloadSize)
-        {
-            target.assign(buffer.begin() + 4, buffer.begin() + 4 + expected);
-            return;
-        }
+          std::uint32_t expectedLE = ReadU32LE(buffer, 0);
+          std::uint32_t expectedBE = ReadU32BE(buffer, 0);
+          std::size_t payloadSize = buffer.size() - 4;
 
-        target.assign(buffer.begin(), buffer.end());
-    };
+          auto matches = [&](std::uint32_t expected) {
+              return expected > 0 && (expected == payloadSize || expected == buffer.size());
+          };
+
+          if (matches(expectedLE) || matches(expectedBE))
+          {
+              target.assign(buffer.begin() + 4, buffer.end());
+              return;
+          }
+
+          target.assign(buffer.begin(), buffer.end());
+      };
 
     if (!LooksLikeZlib(data))
     {
+        std::vector<std::uint8_t> decoded;
+        if (DecodeZifZigPs3Internal(data, decoded, error))
+        {
+            stripLengthPrefix(decoded, out);
+            return true;
+        }
+
         stripLengthPrefix(data, out);
         return true;
     }
@@ -419,7 +719,7 @@ struct UnknownDecodeResult
 UnknownDecodeResult DecodeUnknownPayload(std::vector<std::uint8_t> const& payload)
 {
     UnknownDecodeResult result;
-    if (LooksLikeSif(payload))
+    if (LooksLikeSifAny(payload))
     {
         result.Data = payload;
         result.IsSif = true;
@@ -428,10 +728,10 @@ UnknownDecodeResult DecodeUnknownPayload(std::vector<std::uint8_t> const& payloa
 
     std::string error;
     std::vector<std::uint8_t> decoded;
-    if (DecodeZifZig(payload, decoded, error) && !decoded.empty())
+    if (DecodeZifZigInternal(payload, decoded, error) && !decoded.empty())
     {
         result.Data = std::move(decoded);
-        result.IsSif = LooksLikeSif(result.Data);
+        result.IsSif = LooksLikeSifAny(result.Data);
         result.Decoded = true;
         return result;
     }
@@ -442,9 +742,77 @@ UnknownDecodeResult DecodeUnknownPayload(std::vector<std::uint8_t> const& payloa
 
 } // namespace
 
+bool DecodeZifZig(std::span<const std::uint8_t> data, std::vector<std::uint8_t>& out, std::string& error)
+{
+    return DecodeZifZigInternal(data, out, error);
+}
+
+bool DecodeZifZigPs3(std::span<const std::uint8_t> data, std::vector<std::uint8_t>& out, std::string& error)
+{
+    return DecodeZifZigPs3Internal(data, out, error);
+}
+
 bool EncodeZifZig(std::span<const std::uint8_t> raw, std::vector<std::uint8_t>& out, std::string& error)
 {
     return EncodeZifZigImpl(raw, out, error);
+}
+
+bool EncodeZifZigPs3(std::span<const std::uint8_t> raw, std::vector<std::uint8_t>& out, std::string& error)
+{
+    if (raw.empty())
+    {
+        error = "Source payload is empty.";
+        return false;
+    }
+
+    constexpr std::size_t kChunkSize = 0x10000;
+    std::size_t count = (raw.size() + kChunkSize - 1) / kChunkSize;
+    if (count > 256)
+    {
+        error = "PS3 ZIF/ZIG too many chunks.";
+        return false;
+    }
+
+    std::vector<std::vector<std::uint8_t>> compressedChunks;
+    std::vector<std::uint32_t> sizes;
+    compressedChunks.reserve(count);
+    sizes.reserve(count);
+
+    try
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            std::size_t start = i * kChunkSize;
+            std::size_t len = std::min(kChunkSize, raw.size() - start);
+            std::span<const std::uint8_t> chunk = raw.subspan(start, len);
+            std::vector<std::uint8_t> compressed = CompressRawDeflate(chunk);
+            if (compressed.empty())
+            {
+                error = "PS3 ZIF/ZIG compressed chunk empty.";
+                return false;
+            }
+            sizes.push_back(static_cast<std::uint32_t>(compressed.size()) | 0x80000000u);
+            compressedChunks.push_back(std::move(compressed));
+        }
+    }
+    catch (std::exception const& ex)
+    {
+        error = ex.what();
+        return false;
+    }
+
+    std::size_t headerSize = 8 + count * 4;
+    out.clear();
+    out.resize(headerSize);
+    WriteU32BE(out, 0, static_cast<std::uint32_t>(raw.size()));
+    WriteU32BE(out, 4, static_cast<std::uint32_t>(count));
+    for (std::size_t i = 0; i < count; ++i)
+        WriteU32BE(out, 8 + i * 4, sizes[i]);
+
+    for (auto const& chunk : compressedChunks)
+        out.insert(out.end(), chunk.begin(), chunk.end());
+
+    return true;
 }
 
 std::optional<std::filesystem::path> FindDefaultMappingPath(std::filesystem::path const& xpacPath,
@@ -453,15 +821,25 @@ std::optional<std::filesystem::path> FindDefaultMappingPath(std::filesystem::pat
     std::vector<std::filesystem::path> candidates;
     if (!xpacPath.empty())
     {
+        candidates.push_back(xpacPath.parent_path() / "MAPPING.GS3");
         candidates.push_back(xpacPath.parent_path() / "MAPPING.GC");
         candidates.push_back(xpacPath.parent_path() / "MAPPINGS.GC");
     }
+    candidates.push_back(std::filesystem::current_path() / "MAPPING.GS3");
     candidates.push_back(std::filesystem::current_path() / "MAPPING.GC");
     candidates.push_back(std::filesystem::current_path() / "MAPPINGS.GC");
+    candidates.push_back(std::filesystem::current_path() / "SeEditor" / "Resources" / "MAPPING.GS3");
+    candidates.push_back(std::filesystem::current_path() / "SeEditor" / "Resources" / "MAPPING.GC");
+    candidates.push_back(std::filesystem::current_path() / "SeEditor" / "Resources" / "MAPPINGS.GC");
+    candidates.push_back(outputRoot / "MAPPING.GS3");
     candidates.push_back(outputRoot / "MAPPING.GC");
     candidates.push_back(outputRoot / "MAPPINGS.GC");
 
     std::filesystem::path repoRoot = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+    candidates.push_back(repoRoot / "SeEditor" / "Resources" / "MAPPING.GS3");
+    candidates.push_back(repoRoot / "SeEditor" / "Resources" / "MAPPING.GC");
+    candidates.push_back(repoRoot / "SeEditor" / "Resources" / "MAPPINGS.GC");
+    candidates.push_back(repoRoot / "xpac-Tool" / "MAPPING.GS3");
     candidates.push_back(repoRoot / "xpac-Tool" / "MAPPING.GC");
     candidates.push_back(repoRoot / "xpac-Tool" / "MAPPINGS.GC");
 
@@ -497,12 +875,15 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
         return result;
     }
 
-    std::optional<std::filesystem::path> mappingPath = options.MappingPath;
-    if (!mappingPath)
-        mappingPath = FindDefaultMappingPath(options.XpacPath, outputRoot);
     std::unordered_map<std::uint32_t, std::string> mapping;
-    if (mappingPath)
-        mapping = LoadMapping(*mappingPath);
+    if (options.MappingPath && !options.MappingPath->empty())
+        mapping = LoadMapping(*options.MappingPath);
+    if (mapping.empty())
+    {
+        auto defaultMapping = FindDefaultMappingPath(options.XpacPath, outputRoot);
+        if (defaultMapping)
+            mapping = LoadMapping(*defaultMapping);
+    }
 #if defined(SEEDITOR_EMBED_MAPPING)
     if (mapping.empty() && kEmbeddedMappingSize > 0)
     {
@@ -537,15 +918,57 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
     }
     std::memcpy(header.data(), xpacBytes.data(), header.size());
 
-    std::uint32_t totalFiles = ReadU32LE(header, 12);
+    auto readU32 = [&](std::span<const std::uint8_t> data, std::size_t offset, bool bigEndian) {
+        return bigEndian ? ReadU32BE(data, offset) : ReadU32LE(data, offset);
+    };
+
+    auto headerLooksValid = [&](bool bigEndian, std::uint32_t total) {
+        if (total == 0)
+            return false;
+        std::size_t maxEntries = (xpacBytes.size() - header.size()) / 20;
+        if (total > maxEntries)
+            return false;
+        std::size_t tableSizeCheck = static_cast<std::size_t>(total) * 20;
+        if (header.size() + tableSizeCheck > xpacBytes.size())
+            return false;
+        if (total > 0) {
+            std::size_t entryOff = header.size();
+            std::uint32_t offset = readU32(xpacBytes, entryOff + 4, bigEndian);
+            std::uint32_t comp = readU32(xpacBytes, entryOff + 12, bigEndian);
+            if (offset >= xpacBytes.size())
+                return false;
+            std::uint64_t endOffset = static_cast<std::uint64_t>(offset) + comp;
+            if (endOffset > xpacBytes.size())
+                return false;
+        }
+        return true;
+    };
+
+    std::uint32_t totalFilesLE = ReadU32LE(header, 12);
+    std::uint32_t totalFilesBE = ReadU32BE(header, 12);
+    bool bigEndianXpac = false;
+    bool leValid = headerLooksValid(false, totalFilesLE);
+    bool beValid = headerLooksValid(true, totalFilesBE);
+    if (!leValid && beValid)
+        bigEndianXpac = true;
+
+    std::uint32_t totalFiles = bigEndianXpac ? totalFilesBE : totalFilesLE;
     result.TotalEntries = totalFiles;
 
     std::size_t tableOffset = header.size();
+    std::uint32_t tableOffsetField = readU32(header, 16, bigEndianXpac);
+    if (tableOffsetField >= header.size() && tableOffsetField < xpacBytes.size())
+        tableOffset = static_cast<std::size_t>(tableOffsetField);
     std::size_t tableSize = static_cast<std::size_t>(totalFiles) * 20;
     if (tableOffset + tableSize > xpacBytes.size())
     {
-        result.Errors.push_back("XPAC entry table out of bounds.");
-        return result;
+        // Fallback to header-sized table offset if the field is bogus.
+        tableOffset = header.size();
+        if (tableOffset + tableSize > xpacBytes.size())
+        {
+            result.Errors.push_back("XPAC entry table out of bounds.");
+            return result;
+        }
     }
 
     std::vector<XpacEntry> entries;
@@ -554,12 +977,41 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
     {
         std::size_t entryOff = tableOffset + static_cast<std::size_t>(i) * 20;
         XpacEntry entry;
-        entry.Hash = ReadU32LE(xpacBytes, entryOff + 0);
-        entry.Offset = ReadU32LE(xpacBytes, entryOff + 4);
-        entry.Size = ReadU32LE(xpacBytes, entryOff + 8);
-        entry.CompressedSize = ReadU32LE(xpacBytes, entryOff + 12);
-        entry.Flags = ReadU32LE(xpacBytes, entryOff + 16);
+        entry.Hash = readU32(xpacBytes, entryOff + 0, bigEndianXpac);
+        entry.Offset = readU32(xpacBytes, entryOff + 4, bigEndianXpac);
+        entry.Size = readU32(xpacBytes, entryOff + 8, bigEndianXpac);
+        entry.CompressedSize = readU32(xpacBytes, entryOff + 12, bigEndianXpac);
+        entry.Flags = readU32(xpacBytes, entryOff + 16, bigEndianXpac);
         entries.push_back(entry);
+    }
+
+    std::uint32_t tableSizeField = readU32(header, 8, bigEndianXpac);
+    std::size_t dataBase = tableOffset + tableSize;
+    bool relativeOffsets = false;
+    if (tableSizeField >= tableSize && tableOffset + tableSizeField <= xpacBytes.size())
+    {
+        dataBase = tableOffset + static_cast<std::size_t>(tableSizeField);
+        relativeOffsets = (tableSizeField != tableSize);
+    }
+    if (relativeOffsets)
+    {
+        // Heuristic: choose absolute vs relative offsets based on how many entries fit.
+        std::size_t validRel = 0;
+        std::size_t validAbs = 0;
+        for (std::size_t i = 0; i < entries.size(); ++i)
+        {
+            auto const& entry = entries[i];
+            if (entry.CompressedSize == 0)
+                continue;
+            std::uint64_t absOff = entry.Offset;
+            std::uint64_t relOff = static_cast<std::uint64_t>(dataBase) + entry.Offset;
+            if (absOff + entry.CompressedSize <= xpacBytes.size())
+                ++validAbs;
+            if (relOff + entry.CompressedSize <= xpacBytes.size())
+                ++validRel;
+        }
+        if (validAbs > validRel)
+            relativeOffsets = false;
     }
 
     std::filesystem::path xpacBase = options.XpacPath.stem();
@@ -569,6 +1021,12 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
     {
         result.Errors.push_back("Failed to create XPAC output directory: " + xpacRoot.string());
         return result;
+    }
+    // If we have mappings, clear stale unknown hash outputs from previous runs.
+    if (!mapping.empty())
+    {
+        std::error_code removeEc;
+        std::filesystem::remove_all(xpacRoot / "unknown", removeEc);
     }
 
     std::filesystem::path manifestPath = xpacRoot / "manifest.csv";
@@ -624,8 +1082,11 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
             options.Progress(processed.load(), entries.size());
         }
 
-        std::uint64_t endOffset = static_cast<std::uint64_t>(entry.Offset) + entry.CompressedSize;
-        if (endOffset > fileSize || entry.Offset >= xpacBytes.size())
+        std::uint64_t entryOffset = relativeOffsets
+            ? static_cast<std::uint64_t>(dataBase) + entry.Offset
+            : static_cast<std::uint64_t>(entry.Offset);
+        std::uint64_t endOffset = entryOffset + entry.CompressedSize;
+        if (endOffset > fileSize || entryOffset >= xpacBytes.size())
         {
             skipped.fetch_add(1);
             std::lock_guard<std::mutex> lock(errorMutex);
@@ -634,7 +1095,7 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
             return;
         }
 
-        std::span<const std::uint8_t> compressedSpan(xpacBytes.data() + entry.Offset,
+        std::span<const std::uint8_t> compressedSpan(xpacBytes.data() + static_cast<std::size_t>(entryOffset),
                                                      static_cast<std::size_t>(entry.CompressedSize));
 
         std::vector<std::uint8_t> payload;
@@ -663,7 +1124,7 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
         if (!mappedName.empty())
             relativePath = BuildXpacToolRelativePath(mappedName);
 
-        bool isSif = LooksLikeSif(payload);
+        bool isSif = LooksLikeSifAny(payload);
         std::filesystem::path outputPath;
         std::string extension;
         if (!relativePath.empty())
@@ -862,7 +1323,7 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
             std::string error;
             std::vector<std::uint8_t> zifBytes;
             if (!ReadFileBytes(pair.Zif, zifBytes, error) ||
-                !DecodeZifZig(zifBytes, sif, error))
+                !DecodeZifZigInternal(zifBytes, sif, error))
             {
                 result.Errors.push_back("Failed to convert " + pair.Zif.string() + ": " + error);
                 continue;
@@ -878,7 +1339,7 @@ XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options)
 
             std::vector<std::uint8_t> zigBytes;
             if (!ReadFileBytes(pair.Zig, zigBytes, error) ||
-                !DecodeZifZig(zigBytes, sig, error))
+                !DecodeZifZigInternal(zigBytes, sig, error))
             {
                 result.Errors.push_back("Failed to convert " + pair.Zig.string() + ": " + error);
                 continue;
@@ -931,12 +1392,15 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
         return result;
     }
 
-    std::optional<std::filesystem::path> mappingPath = options.MappingPath;
-    if (!mappingPath)
-        mappingPath = FindDefaultMappingPath(options.XpacPath, options.InputRoot);
     std::unordered_map<std::uint32_t, std::string> mapping;
-    if (mappingPath)
-        mapping = LoadMapping(*mappingPath);
+    if (options.MappingPath && !options.MappingPath->empty())
+        mapping = LoadMapping(*options.MappingPath);
+    if (mapping.empty())
+    {
+        auto defaultMapping = FindDefaultMappingPath(options.XpacPath, options.InputRoot);
+        if (defaultMapping)
+            mapping = LoadMapping(*defaultMapping);
+    }
 #if defined(SEEDITOR_EMBED_MAPPING)
     if (mapping.empty() && kEmbeddedMappingSize > 0)
     {
@@ -959,8 +1423,43 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
         return result;
     }
 
-    std::uint32_t totalFiles = ReadU32LE(header, 12);
+    file.seekg(0, std::ios::end);
+    std::uint64_t fileSize = static_cast<std::uint64_t>(file.tellg());
+    file.seekg(static_cast<std::streamoff>(header.size()), std::ios::beg);
+
+    auto headerLooksValid = [&](bool bigEndian, std::uint32_t total) {
+        if (total == 0)
+            return false;
+        std::size_t maxEntries = (fileSize >= header.size()) ? (static_cast<std::size_t>(fileSize - header.size()) / 20) : 0;
+        if (total > maxEntries)
+            return false;
+        std::size_t tableSizeCheck = static_cast<std::size_t>(total) * 20;
+        if (header.size() + tableSizeCheck > fileSize)
+            return false;
+        return true;
+    };
+
+    std::uint32_t totalFilesLE = ReadU32LE(header, 12);
+    std::uint32_t totalFilesBE = ReadU32BE(header, 12);
+    bool bigEndianXpac = false;
+    bool leValid = headerLooksValid(false, totalFilesLE);
+    bool beValid = headerLooksValid(true, totalFilesBE);
+    if (!leValid && beValid)
+        bigEndianXpac = true;
+
+    std::uint32_t totalFiles = bigEndianXpac ? totalFilesBE : totalFilesLE;
     result.TotalEntries = totalFiles;
+
+    std::uint32_t tableSizeField = bigEndianXpac ? ReadU32BE(header, 8) : ReadU32LE(header, 8);
+    std::size_t headerSize = header.size();
+    std::size_t tableSize = static_cast<std::size_t>(totalFiles) * 20;
+    std::size_t dataBase = headerSize + tableSize;
+    bool relativeOffsets = false;
+    if (tableSizeField >= tableSize && headerSize + tableSizeField <= fileSize)
+    {
+        dataBase = headerSize + static_cast<std::size_t>(tableSizeField);
+        relativeOffsets = (tableSizeField != tableSize);
+    }
 
     struct XpacEntryFull
     {
@@ -969,6 +1468,10 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
     };
     std::vector<XpacEntryFull> entries;
     entries.reserve(totalFiles);
+    auto readU32 = [&](std::span<const std::uint8_t> data, std::size_t offset) {
+        return bigEndianXpac ? ReadU32BE(data, offset) : ReadU32LE(data, offset);
+    };
+
     for (std::uint32_t i = 0; i < totalFiles; ++i)
     {
         std::array<std::uint8_t, 20> entryBuf{};
@@ -978,11 +1481,11 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
             return result;
         }
         XpacEntry entry;
-        entry.Hash = ReadU32LE(entryBuf, 0);
-        entry.Offset = ReadU32LE(entryBuf, 4);
-        entry.Size = ReadU32LE(entryBuf, 8);
-        entry.CompressedSize = ReadU32LE(entryBuf, 12);
-        entry.Flags = ReadU32LE(entryBuf, 16);
+        entry.Hash = readU32(entryBuf, 0);
+        entry.Offset = readU32(entryBuf, 4);
+        entry.Size = readU32(entryBuf, 8);
+        entry.CompressedSize = readU32(entryBuf, 12);
+        entry.Flags = readU32(entryBuf, 16);
         entries.push_back({entry, entry.CompressedSize != entry.Size});
     }
 
@@ -998,7 +1501,10 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
     auto readOriginalStored = [&](XpacEntryFull const& entry, std::vector<std::uint8_t>& out) -> bool {
         if (entry.Entry.CompressedSize == 0)
             return false;
-        file.seekg(entry.Entry.Offset, std::ios::beg);
+        std::uint64_t offset = relativeOffsets
+            ? static_cast<std::uint64_t>(dataBase) + entry.Entry.Offset
+            : static_cast<std::uint64_t>(entry.Entry.Offset);
+        file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
         out.resize(entry.Entry.CompressedSize);
         if (!file.read(reinterpret_cast<char*>(out.data()),
                        static_cast<std::streamsize>(out.size())))
@@ -1121,21 +1627,32 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
     }
 
     std::vector<std::uint8_t> output;
-    std::size_t headerSize = header.size();
-    std::size_t tableSize = static_cast<std::size_t>(totalFiles) * 20;
-    std::size_t cursor = headerSize + tableSize;
+    std::size_t tableSizeStored = tableSize;
+    if (tableSizeField >= tableSize)
+        tableSizeStored = static_cast<std::size_t>(tableSizeField);
+    std::size_t cursor = headerSize + tableSizeStored;
     output.resize(cursor);
 
-    std::uint32_t tableSizeU32 = static_cast<std::uint32_t>(tableSize);
-    WriteU32LE(output, 0, ReadU32LE(header, 0));
-    WriteU32LE(output, 4, ReadU32LE(header, 4));
-    WriteU32LE(output, 8, tableSizeU32);
-    WriteU32LE(output, 12, totalFiles);
-    std::uint32_t dirTable = ReadU32LE(header, 16);
+    auto readHeaderU32 = [&](std::span<const std::uint8_t> data, std::size_t offset) {
+        return bigEndianXpac ? ReadU32BE(data, offset) : ReadU32LE(data, offset);
+    };
+    auto writeHeaderU32 = [&](std::vector<std::uint8_t>& data, std::size_t offset, std::uint32_t value) {
+        if (bigEndianXpac)
+            WriteU32BE(data, offset, value);
+        else
+            WriteU32LE(data, offset, value);
+    };
+
+    std::uint32_t tableSizeU32 = static_cast<std::uint32_t>(tableSizeStored);
+    writeHeaderU32(output, 0, readHeaderU32(header, 0));
+    writeHeaderU32(output, 4, readHeaderU32(header, 4));
+    writeHeaderU32(output, 8, tableSizeU32);
+    writeHeaderU32(output, 12, totalFiles);
+    std::uint32_t dirTable = readHeaderU32(header, 16);
     if (dirTable == 0)
         dirTable = static_cast<std::uint32_t>(headerSize);
-    WriteU32LE(output, 16, dirTable);
-    WriteU32LE(output, 20, ReadU32LE(header, 20));
+    writeHeaderU32(output, 16, dirTable);
+    writeHeaderU32(output, 20, readHeaderU32(header, 20));
 
     auto ensureCapacity = [&](std::size_t size) {
         if (output.size() < size)
@@ -1158,7 +1675,10 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
         auto readFromXpac = [&](std::vector<std::uint8_t>& out) -> bool {
             if (entry.Entry.CompressedSize == 0)
                 return false;
-            file.seekg(entry.Entry.Offset, std::ios::beg);
+            std::uint64_t offset = relativeOffsets
+                ? static_cast<std::uint64_t>(dataBase) + entry.Entry.Offset
+                : static_cast<std::uint64_t>(entry.Entry.Offset);
+            file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
             std::vector<std::uint8_t> raw(entry.Entry.CompressedSize);
             if (!file.read(reinterpret_cast<char*>(raw.data()),
                            static_cast<std::streamsize>(raw.size())))
@@ -1303,7 +1823,8 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
             }
         }
 
-        entry.Entry.Offset = static_cast<std::uint32_t>(cursor);
+        std::size_t storedOffset = relativeOffsets ? (cursor - dataBase) : cursor;
+        entry.Entry.Offset = static_cast<std::uint32_t>(storedOffset);
         entry.Entry.Size = static_cast<std::uint32_t>(payload.size());
         entry.Entry.CompressedSize = static_cast<std::uint32_t>(stored.size());
 
@@ -1318,11 +1839,11 @@ XpacRepackResult RepackXpac(XpacRepackOptions const& options)
     for (std::size_t i = 0; i < entries.size(); ++i)
     {
         std::size_t entryOffset = headerSize + i * 20;
-        WriteU32LE(output, entryOffset + 0, entries[i].Entry.Hash);
-        WriteU32LE(output, entryOffset + 4, entries[i].Entry.Offset);
-        WriteU32LE(output, entryOffset + 8, entries[i].Entry.Size);
-        WriteU32LE(output, entryOffset + 12, entries[i].Entry.CompressedSize);
-        WriteU32LE(output, entryOffset + 16, entries[i].Entry.Flags);
+        writeHeaderU32(output, entryOffset + 0, entries[i].Entry.Hash);
+        writeHeaderU32(output, entryOffset + 4, entries[i].Entry.Offset);
+        writeHeaderU32(output, entryOffset + 8, entries[i].Entry.Size);
+        writeHeaderU32(output, entryOffset + 12, entries[i].Entry.CompressedSize);
+        writeHeaderU32(output, entryOffset + 16, entries[i].Entry.Flags);
     }
 
     std::ofstream out(options.OutputPath, std::ios::binary);

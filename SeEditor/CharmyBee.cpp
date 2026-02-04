@@ -15,6 +15,7 @@
 #include "LogicLoader.hpp"
 #include "XpacUnpacker.hpp"
 #include "UnityExport.hpp"
+#include "Platform/Stricmp.hpp"
 #include "SlLib/Resources/Database/SlPlatform.hpp"
 #include "SlLib/Utilities/SlUtil.hpp"
 #include "Forest/ForestArchive.hpp"
@@ -66,6 +67,24 @@
 namespace {
 
 using SeEditor::SifChunkInfo;
+
+bool ReadFileBytes(std::filesystem::path const& path, std::vector<std::uint8_t>& out)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    out.assign(std::istreambuf_iterator<char>(file), {});
+    return true;
+}
+
+bool WriteFileBytes(std::filesystem::path const& path, std::span<const std::uint8_t> data)
+{
+    std::ofstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    file.write(reinterpret_cast<char const*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return static_cast<bool>(file);
+}
 
 std::string DescribeTriggerHash(int hash)
 {
@@ -689,16 +708,18 @@ bool TryParseForestArchive(std::span<const std::uint8_t> input,
     return true;
 }
 
-bool TryLoadForestLibraryFromChunk(SifChunkInfo const& chunk,
-                                   std::span<const std::uint8_t> gpuData,
-                                   std::shared_ptr<SeEditor::Forest::ForestLibrary>& outLibrary,
-                                   std::string& error)
-{
+  bool TryLoadForestLibraryFromChunk(SifChunkInfo const& chunk,
+                                     std::span<const std::uint8_t> gpuData,
+                                     std::shared_ptr<SeEditor::Forest::ForestLibrary>& outLibrary,
+                                     std::string& error)
+  {
     if (chunk.Data.empty())
     {
         error = "Forest chunk has no data.";
         return false;
     }
+
+      std::span<const std::uint8_t> forestData(chunk.Data.data(), chunk.Data.size());
 
     std::vector<SlLib::Resources::Database::SlResourceRelocation> relocations;
     relocations.reserve(chunk.Relocations.size());
@@ -706,12 +727,12 @@ bool TryLoadForestLibraryFromChunk(SifChunkInfo const& chunk,
         relocations.push_back({static_cast<int>(offset), 0});
 
     SlLib::Serialization::ResourceLoadContext context(
-        std::span<const std::uint8_t>(chunk.Data.data(), chunk.Data.size()),
+        forestData,
         gpuData,
         std::move(relocations));
     static SlLib::Resources::Database::SlPlatform s_win32("win32", false, false, 0);
-    static SlLib::Resources::Database::SlPlatform s_xbox360("x360", true, false, 0);
-    context.Platform = chunk.BigEndian ? &s_xbox360 : &s_win32;
+    static SlLib::Resources::Database::SlPlatform s_ps3("ps3", true, false, 0);
+    context.Platform = chunk.BigEndian ? &s_ps3 : &s_win32;
 
     auto library = std::make_shared<SeEditor::Forest::ForestLibrary>();
     try
@@ -1904,17 +1925,19 @@ void CharmyBee::RenderSifViewer()
                             ImGui::SameLine();
                             ImGui::Checkbox("Draw", &_drawCollisionMesh);
                         }
-                        else if (chunk.TypeValue == MakeTypeCode('F', 'O', 'R', 'E'))
-                        {
-                            if (ImGui::Button("Show Forest Meshes"))
-                            {
-                                _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
-                                LoadForestResources();
-                            }
-                            if (ImGui::Checkbox("Draw", &_drawForestMeshes))
-                                UpdateForestMeshRendering();
-                            if (ImGui::Checkbox("Draw boxes", &_drawForestBoxes))
-                                UpdateForestBoxRenderer();
+                         else if (chunk.TypeValue == MakeTypeCode('F', 'O', 'R', 'E'))
+                         {
+                             if (ImGui::Button("Show Forest Meshes"))
+                             {
+                                 _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                                 LoadForestResources();
+                                 _drawForestMeshes = true;
+                                 UpdateForestMeshRendering();
+                             }
+                             if (ImGui::Checkbox("Draw", &_drawForestMeshes))
+                                 UpdateForestMeshRendering();
+                             if (ImGui::Checkbox("Draw boxes", &_drawForestBoxes))
+                                 UpdateForestBoxRenderer();
                             if (ImGui::Button("Export track.Forest OBJ"))
                             {
                                 SeEditor::Dialogs::FileDialogOptions options;
@@ -2020,6 +2043,13 @@ void CharmyBee::RenderSifViewer()
                     if (_forestHierarchy.empty())
                     {
                         ImGui::Text("No forest data loaded yet.");
+                        if (ImGui::Button("Load Forest"))
+                        {
+                            _selectedChunk = static_cast<int>(&chunk - &_sifChunks[0]);
+                            LoadForestResources();
+                            UpdateForestHierarchy();
+                            _showForestHierarchyWindow = true;
+                        }
                     }
                     else
                     {
@@ -2588,14 +2618,72 @@ void CharmyBee::RenderStuffTreeNode(std::filesystem::path const& path)
             for (auto const& dir : dirs)
                 RenderStuffTreeNode(dir);
             for (auto const& file : files)
-                ImGui::BulletText("%s", file.filename().string().c_str());
+            {
+                ImGui::PushID(file.string().c_str());
+                ImGui::Selectable(file.filename().string().c_str());
+                if (ImGui::BeginPopupContextItem())
+                {
+                    std::string ext = file.extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+                        return static_cast<char>(std::tolower(ch));
+                    });
+                    if (ext == ".zif" || ext == ".zig")
+                    {
+                        if (ImGui::MenuItem("Decompress (auto)"))
+                            DecompressZifZigFile(file);
+                    }
+                    else if (ext == ".sif" || ext == ".sig")
+                    {
+                        if (ImGui::MenuItem("Load SIF"))
+                            LoadSifFile(file);
+                        if (ImGui::MenuItem("Re-ZIF (PC)"))
+                            RecompressToZifZig(file, false, false);
+                        if (ImGui::MenuItem("Re-ZIF (PS3)"))
+                            RecompressToZifZig(file, false, true);
+                        if (ImGui::MenuItem("Re-ZIG (PC)"))
+                            RecompressToZifZig(file, true, false);
+                        if (ImGui::MenuItem("Re-ZIG (PS3)"))
+                            RecompressToZifZig(file, true, true);
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
 
             ImGui::TreePop();
         }
     }
     else
     {
-        ImGui::BulletText("%s", label.c_str());
+        ImGui::PushID(path.string().c_str());
+        ImGui::Selectable(label.c_str());
+        if (ImGui::BeginPopupContextItem())
+        {
+            std::string ext = path.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+            if (ext == ".zif" || ext == ".zig")
+            {
+                if (ImGui::MenuItem("Decompress (auto)"))
+                    DecompressZifZigFile(path);
+            }
+            else if (ext == ".sif" || ext == ".sig")
+            {
+                if (ImGui::MenuItem("Load SIF"))
+                    LoadSifFile(path);
+                if (ImGui::MenuItem("Re-ZIF (PC)"))
+                    RecompressToZifZig(path, false, false);
+                if (ImGui::MenuItem("Re-ZIF (PS3)"))
+                    RecompressToZifZig(path, false, true);
+                if (ImGui::MenuItem("Re-ZIG (PC)"))
+                    RecompressToZifZig(path, true, false);
+                if (ImGui::MenuItem("Re-ZIG (PS3)"))
+                    RecompressToZifZig(path, true, true);
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopID();
     }
 }
 
@@ -2672,7 +2760,7 @@ void CharmyBee::BuildStuffSifCache(std::filesystem::path const& root)
                 break;
             if (!entry.is_regular_file())
                 continue;
-            if (_stricmp(entry.path().extension().string().c_str(), ".sif") == 0)
+            if (SeStricmp(entry.path().extension().string().c_str(), ".sif") == 0)
                 sifs.push_back(entry.path());
         }
         std::sort(sifs.begin(), sifs.end(), [](auto const& a, auto const& b) {
@@ -2688,7 +2776,7 @@ void CharmyBee::BuildStuffSifCache(std::filesystem::path const& root)
                 std::string seg = part.string();
                 if (seg.empty())
                     continue;
-                if (_stricmp(seg.c_str(), "_Resource") == 0)
+                if (SeStricmp(seg.c_str(), "_Resource") == 0)
                     continue;
                 if (!seg.empty() && seg[0] == '_')
                     seg.erase(seg.begin());
@@ -2719,6 +2807,78 @@ void CharmyBee::BuildStuffSifCache(std::filesystem::path const& root)
     }
 
     _stuffSifCacheDirty = false;
+}
+
+void CharmyBee::DecompressZifZigFile(std::filesystem::path const& path)
+{
+    std::vector<std::uint8_t> input;
+    if (!ReadFileBytes(path, input))
+    {
+        _xpacStatus = "Failed to read " + path.string();
+        return;
+    }
+
+    std::string error;
+    std::vector<std::uint8_t> output;
+    if (!SeEditor::Xpac::DecodeZifZig(input, output, error) || output.empty())
+    {
+        _xpacStatus = "Decode failed: " + error;
+        return;
+    }
+
+    std::filesystem::path outPath = path;
+    std::string ext = outPath.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (ext == ".zif")
+        outPath.replace_extension(".sif");
+    else if (ext == ".zig")
+        outPath.replace_extension(".sig");
+    else
+        outPath.replace_extension(".bin");
+
+    if (!WriteFileBytes(outPath, output))
+    {
+        _xpacStatus = "Failed to write " + outPath.string();
+        return;
+    }
+
+    _xpacStatus = "Decoded " + path.filename().string() + " -> " + outPath.filename().string();
+}
+
+void CharmyBee::RecompressToZifZig(std::filesystem::path const& path, bool zig, bool ps3)
+{
+    std::vector<std::uint8_t> input;
+    if (!ReadFileBytes(path, input))
+    {
+        _xpacStatus = "Failed to read " + path.string();
+        return;
+    }
+
+    std::vector<std::uint8_t> output;
+    std::string error;
+    bool ok = false;
+    if (ps3)
+        ok = SeEditor::Xpac::EncodeZifZigPs3(input, output, error);
+    else
+        ok = SeEditor::Xpac::EncodeZifZig(input, output, error);
+
+    if (!ok || output.empty())
+    {
+        _xpacStatus = "Encode failed: " + error;
+        return;
+    }
+
+    std::filesystem::path outPath = path;
+    outPath.replace_extension(zig ? ".zig" : ".zif");
+    if (!WriteFileBytes(outPath, output))
+    {
+        _xpacStatus = "Failed to write " + outPath.string();
+        return;
+    }
+
+    _xpacStatus = "Encoded " + path.filename().string() + " -> " + outPath.filename().string();
 }
 
 void CharmyBee::RenderStuffWindow()
@@ -2764,7 +2924,10 @@ void CharmyBee::RenderStuffWindow()
     }
     ImGui::SameLine();
     if (ImGui::Button("Refresh SIF list"))
+    {
         _stuffSifCacheDirty = true;
+        BuildStuffSifCache(root);
+    }
     if (!_xpacStatus.empty())
         ImGui::TextWrapped("%s", _xpacStatus.c_str());
     if (ImGui::Button("Unpack XPAC..."))
@@ -2858,7 +3021,7 @@ void CharmyBee::RenderStuffWindow()
                     std::filesystem::path src = pair.second;
                     std::filesystem::path rel = src.filename();
                     options.SelectedSifRelativePaths.push_back(rel);
-                    if (_stricmp(src.extension().string().c_str(), ".sif") == 0)
+                    if (SeStricmp(src.extension().string().c_str(), ".sif") == 0)
                     {
                         std::filesystem::path sigPath = src;
                         sigPath.replace_extension(".sig");
@@ -3095,7 +3258,7 @@ void CharmyBee::RepackXpac()
             break;
         if (!entry.is_regular_file())
             continue;
-        if (_stricmp(entry.path().extension().string().c_str(), ".sif") != 0)
+        if (SeStricmp(entry.path().extension().string().c_str(), ".sif") != 0)
             continue;
 
         std::filesystem::path relPath = std::filesystem::relative(entry.path(), exportRoot, ec);
@@ -3105,7 +3268,7 @@ void CharmyBee::RepackXpac()
             std::string seg = part.string();
             if (seg.empty())
                 continue;
-            if (_stricmp(seg.c_str(), "_Resource") == 0)
+            if (SeStricmp(seg.c_str(), "_Resource") == 0)
                 continue;
             if (!seg.empty() && seg[0] == '_')
                 seg.erase(seg.begin());
@@ -3170,9 +3333,9 @@ void CharmyBee::LoadSifFile(std::filesystem::path const& path)
     if (data.empty())
     {
         std::filesystem::path fallback = path;
-        if (_stricmp(path.extension().string().c_str(), ".sif") == 0)
+        if (SeStricmp(path.extension().string().c_str(), ".sif") == 0)
             fallback.replace_extension(".zif");
-        else if (_stricmp(path.extension().string().c_str(), ".sig") == 0)
+        else if (SeStricmp(path.extension().string().c_str(), ".sig") == 0)
             fallback.replace_extension(".zig");
 
         if (fallback != path && std::filesystem::exists(fallback))
@@ -3241,48 +3404,151 @@ void CharmyBee::LoadSifFile(std::filesystem::path const& path)
         _logicLocatorMeshes.clear();
         _logicLocatorHasMesh.clear();
 
+        bool bigEndian = !_sifChunks.empty() && _sifChunks.front().BigEndian;
         try
         {
-            std::filesystem::path gpuPath = path;
-            std::filesystem::path altGpuPath;
-            if (gpuPath.extension() == ".sif")
+            if (!bigEndian)
             {
-                gpuPath.replace_extension(".sig");
-                altGpuPath = path;
-                altGpuPath.replace_extension(".zig");
-            }
-            else if (gpuPath.extension() == ".zif")
-            {
-                gpuPath.replace_extension(".zig");
-                altGpuPath = path;
-                altGpuPath.replace_extension(".sig");
-            }
-
-            std::filesystem::path chosenGpuPath;
-            if (std::filesystem::exists(gpuPath))
-                chosenGpuPath = gpuPath;
-            else if (!altGpuPath.empty() && std::filesystem::exists(altGpuPath))
-                chosenGpuPath = altGpuPath;
-
-            if (!chosenGpuPath.empty())
-            {
-                std::ifstream gpuFile(chosenGpuPath, std::ios::binary);
-                if (gpuFile)
+                std::filesystem::path gpuPath = path;
+                std::filesystem::path altGpuPath;
+                if (gpuPath.extension() == ".sif")
                 {
+                    gpuPath.replace_extension(".sig");
+                    altGpuPath = path;
+                    altGpuPath.replace_extension(".zig");
+                }
+                else if (gpuPath.extension() == ".zif")
+                {
+                    gpuPath.replace_extension(".zig");
+                    altGpuPath = path;
+                    altGpuPath.replace_extension(".sig");
+                }
+
+                std::filesystem::path chosenGpuPath;
+                if (std::filesystem::exists(gpuPath))
+                    chosenGpuPath = gpuPath;
+                else if (!altGpuPath.empty() && std::filesystem::exists(altGpuPath))
+                    chosenGpuPath = altGpuPath;
+
+                if (!chosenGpuPath.empty())
+                {
+                    std::ifstream gpuFile(chosenGpuPath, std::ios::binary);
+                    if (gpuFile)
+                    {
+                        std::vector<char> gpuBuffer((std::istreambuf_iterator<char>(gpuFile)), {});
+                        std::vector<std::uint8_t> gpuData(gpuBuffer.begin(), gpuBuffer.end());
+                        bool compressed = false;
+                        if (LooksLikeZlib(gpuData))
+                        {
+                            auto inflated = DecompressZlib(gpuData);
+                            if (inflated.size() >= 4)
+                                gpuData.assign(inflated.begin() + 4, inflated.end());
+                            compressed = true;
+                        }
+
+                        if (!compressed)
+                            StripLengthPrefixIfPresent(gpuData);
+
+                        _sifGpuRaw.assign(gpuData.begin(), gpuData.end());
+                        std::cout << "[CharmyBee] Using raw GPU buffer (" << _sifGpuRaw.size() << " bytes) for "
+                                  << chosenGpuPath.string() << '.' << std::endl;
+                    }
+                }
+            }
+            else
+            {
+                std::filesystem::path gpuPath = path;
+                std::filesystem::path altGpuPath;
+                if (gpuPath.extension() == ".sif")
+                {
+                    gpuPath.replace_extension(".sig");
+                    altGpuPath = path;
+                    altGpuPath.replace_extension(".zig");
+                }
+                else if (gpuPath.extension() == ".zif")
+                {
+                    gpuPath.replace_extension(".zig");
+                    altGpuPath = path;
+                    altGpuPath.replace_extension(".sig");
+                }
+
+                bool preferCompressedGpu = true;
+                auto loadGpuFromPath = [&](std::filesystem::path const& candidate,
+                                           std::vector<std::uint8_t>& out) -> bool {
+                    if (candidate.empty() || !std::filesystem::exists(candidate))
+                        return false;
+
+                    std::ifstream gpuFile(candidate, std::ios::binary);
+                    if (!gpuFile)
+                        return false;
+
                     std::vector<char> gpuBuffer((std::istreambuf_iterator<char>(gpuFile)), {});
                     std::vector<std::uint8_t> gpuData(gpuBuffer.begin(), gpuBuffer.end());
-                    bool compressed = false;
-                    if (LooksLikeZlib(gpuData))
+                    if (gpuData.empty())
+                        return false;
+
+                    bool decoded = false;
                     {
-                        auto inflated = DecompressZlib(gpuData);
-                        if (inflated.size() >= 4)
-                            gpuData.assign(inflated.begin() + 4, inflated.end());
-                        compressed = true;
+                        std::string decodeError;
+                        std::vector<std::uint8_t> decodedGpu;
+                        if (SeEditor::Xpac::DecodeZifZig(gpuData, decodedGpu, decodeError) && !decodedGpu.empty())
+                        {
+                            gpuData.swap(decodedGpu);
+                            decoded = true;
+                        }
                     }
 
-                    if (!compressed)
-                        StripLengthPrefixIfPresent(gpuData);
+                    if (!decoded)
+                    {
+                        if (LooksLikeZlib(gpuData))
+                        {
+                            auto inflated = DecompressZlib(gpuData);
+                            if (inflated.size() >= 4)
+                                gpuData.assign(inflated.begin() + 4, inflated.end());
+                        }
+                        else
+                        {
+                            StripLengthPrefixIfPresent(gpuData);
+                        }
+                    }
 
+                    out.swap(gpuData);
+                    return true;
+                };
+
+                std::vector<std::filesystem::path> candidates;
+                if (preferCompressedGpu)
+                {
+                    if (!altGpuPath.empty())
+                        candidates.push_back(altGpuPath);
+                    candidates.push_back(gpuPath);
+                }
+                else
+                {
+                    candidates.push_back(gpuPath);
+                    if (!altGpuPath.empty())
+                        candidates.push_back(altGpuPath);
+                }
+
+                std::filesystem::path chosenGpuPath;
+                std::vector<std::uint8_t> gpuData;
+                for (auto const& candidate : candidates)
+                {
+                    if (candidate.empty() || !std::filesystem::exists(candidate))
+                        continue;
+                    std::vector<std::uint8_t> attempt;
+                    if (!loadGpuFromPath(candidate, attempt))
+                        continue;
+                    if (!attempt.empty())
+                    {
+                        chosenGpuPath = candidate;
+                        gpuData.swap(attempt);
+                        break;
+                    }
+                }
+
+                if (!chosenGpuPath.empty())
+                {
                     _sifGpuRaw.assign(gpuData.begin(), gpuData.end());
                     std::cout << "[CharmyBee] Using raw GPU buffer (" << _sifGpuRaw.size() << " bytes) for "
                               << chosenGpuPath.string() << '.' << std::endl;
@@ -3378,6 +3644,34 @@ void CharmyBee::LoadForestDebugGeometry()
 
 void CharmyBee::LoadForestResources()
 {
+    auto log = [&](std::string const& msg) {
+        static std::ofstream s_forestLog;
+        static bool s_inited = false;
+        if (!s_inited)
+        {
+            s_inited = true;
+            try
+            {
+                std::filesystem::path outPath = std::filesystem::current_path() / "ForestPS3.log";
+                // New log per program run: truncate on first use.
+                s_forestLog.open(outPath, std::ios::out | std::ios::trunc);
+                if (s_forestLog)
+                    s_forestLog << "\n=== ForestPS3 session ===\n";
+                std::cout << "[ForestPS3] Logging to " << outPath.string() << std::endl;
+            }
+            catch (...)
+            {
+                // ignore
+            }
+        }
+
+        if (s_forestLog)
+        {
+            s_forestLog << "[ForestPS3] " << msg << "\n";
+            s_forestLog.flush();
+        }
+    };
+
     _renderer.SetForestMeshes({});
     _renderer.SetDrawForestMeshes(false);
     _drawForestMeshes = false;
@@ -3389,7 +3683,10 @@ void CharmyBee::LoadForestResources()
         [](SifChunkInfo const& c) { return c.TypeValue == MakeTypeCode('F', 'O', 'R', 'E'); });
 
     if (it == _sifChunks.end())
+    {
+        log("No FORE chunk present in loaded SIF.");
         return;
+    }
 
     auto const& chunk = *it;
     std::span<const std::uint8_t> cpuData(chunk.Data.data(), chunk.Data.size());
@@ -3405,10 +3702,1418 @@ void CharmyBee::LoadForestResources()
     }
 
     static SlLib::Resources::Database::SlPlatform s_win32("win32", false, false, 0);
-    static SlLib::Resources::Database::SlPlatform s_xbox360("x360", true, false, 0);
-    SlLib::Serialization::ResourceLoadContext context(cpuData, gpuData);
+    static SlLib::Resources::Database::SlPlatform s_ps3("ps3", true, false, 0);
+    std::vector<SlLib::Resources::Database::SlResourceRelocation> relocations;
+    relocations.reserve(chunk.Relocations.size());
+    for (auto offset : chunk.Relocations)
+        relocations.push_back({static_cast<int>(offset), 0});
+    SlLib::Serialization::ResourceLoadContext context(cpuData, gpuData, std::move(relocations));
     bool isBigEndian = chunk.BigEndian;
-    context.Platform = isBigEndian ? &s_xbox360 : &s_win32;
+    context.Platform = isBigEndian ? &s_ps3 : &s_win32;
+
+    if (isBigEndian)
+    {
+        log("FORE chunk is big-endian (PS3). cpuBytes=" + std::to_string(cpuData.size()) +
+            " gpuBytes=" + std::to_string(gpuData.size()) +
+            " relocCount=" + std::to_string(chunk.Relocations.size()));
+        // Keep console output compact; detailed trace goes to ForestPS3.log
+        std::cout << "[ForestPS3] PS3 FORE load started (details in ForestPS3.log)\n";
+
+        auto readU32BE = [&](std::size_t off) -> std::uint32_t {
+            if (off + 4 > cpuData.size())
+                return 0;
+            return (static_cast<std::uint32_t>(cpuData[off]) << 24) |
+                   (static_cast<std::uint32_t>(cpuData[off + 1]) << 16) |
+                   (static_cast<std::uint32_t>(cpuData[off + 2]) << 8) |
+                   static_cast<std::uint32_t>(cpuData[off + 3]);
+        };
+        auto hex8 = [](std::uint32_t v) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%08X", v);
+            return std::string(buf);
+        };
+
+        struct PrimitiveHitRaw
+        {
+            std::uint32_t PrimitiveStart = 0;
+            std::uint32_t Sig = 0;
+            std::uint32_t NumIndices = 0;
+            std::uint32_t IndexPtrRaw = 0;
+            std::uint32_t VbBasePtrRaw = 0;
+            std::uint32_t StreamSlot = 0;
+        };
+        std::vector<PrimitiveHitRaw> primitiveHitsRaw;
+        primitiveHitsRaw.reserve(512);
+
+        if (cpuData.size() >= 0x10)
+        {
+            std::uint32_t h0 = readU32BE(0x00);
+            std::uint32_t h1 = readU32BE(0x04);
+            std::uint32_t h2 = readU32BE(0x08);
+            std::uint32_t rootOffsetHdr = readU32BE(0x0C);
+            log("ForestHeader: one=0x" + hex8(h0) + " id=0x" + hex8(h1) + " sizeMinus12=0x" + hex8(h2) +
+                " rootOffset=0x" + hex8(rootOffsetHdr));
+
+            if (rootOffsetHdr + 0x34 <= cpuData.size())
+            {
+                std::uint32_t sectionCount = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x00);
+                std::uint32_t rootStructBytes = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x04);
+                std::uint32_t sectionTableOff = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x0C);
+                std::uint32_t hashTableOff = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x14);
+                std::uint32_t nameRegistryPtr = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x24);
+                std::uint32_t relocCountRoot = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x28);
+                std::uint32_t relocPtrRoot = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x2C);
+                std::uint32_t libraryPtr = readU32BE(static_cast<std::size_t>(rootOffsetHdr) + 0x30);
+                log("Root@0x" + hex8(rootOffsetHdr) + ": sectionCount=" + std::to_string(sectionCount) +
+                    " rootBytes=0x" + hex8(rootStructBytes) +
+                    " sectionTableOff=0x" + hex8(sectionTableOff) +
+                    " hashTableOff=0x" + hex8(hashTableOff) +
+                    " nameRegistryPtr=0x" + hex8(nameRegistryPtr) +
+                    " relocCount=0x" + hex8(relocCountRoot) +
+                    " relocPtr=0x" + hex8(relocPtrRoot) +
+                    " libraryPtr=0x" + hex8(libraryPtr));
+                bool relocRangeOk = false;
+                if (relocCountRoot > 0 && relocCountRoot < 2'000'000 && relocPtrRoot > 0 && (relocPtrRoot % 4) == 0)
+                {
+                    std::uint64_t end = static_cast<std::uint64_t>(relocPtrRoot) + static_cast<std::uint64_t>(relocCountRoot) * 4ull;
+                    relocRangeOk = (end <= cpuData.size());
+                }
+                log(std::string("Root relocation range ok=") + (relocRangeOk ? "true" : "false"));
+
+                // Dump section table (first 16 entries) for deterministic reverse-engineering.
+                if (sectionTableOff != 0 && sectionCount > 0 &&
+                    static_cast<std::size_t>(sectionTableOff) + static_cast<std::size_t>(sectionCount) * 4 <= cpuData.size())
+                {
+                    std::string s = "SectionTable[0..min(15)] @0x" + hex8(sectionTableOff) + ":";
+                    std::uint32_t lim = std::min<std::uint32_t>(sectionCount, 16);
+                    for (std::uint32_t i = 0; i < lim; ++i)
+                    {
+                        std::uint32_t off = readU32BE(static_cast<std::size_t>(sectionTableOff) + static_cast<std::size_t>(i) * 4);
+                        s += " " + hex8(off);
+                    }
+                    log(s);
+                }
+
+                // Dump first bytes of library block (deterministic, no scanning).
+                if (libraryPtr != 0 && static_cast<std::size_t>(libraryPtr) + 0x100 <= cpuData.size())
+                {
+                    std::string s = "Library u32[0..15] @0x" + hex8(libraryPtr) + ":";
+                    for (int i = 0; i < 16; ++i)
+                    {
+                        std::uint32_t v = readU32BE(static_cast<std::size_t>(libraryPtr) + static_cast<std::size_t>(i) * 4);
+                        s += " " + hex8(v);
+                    }
+                    log(s);
+                }
+
+                // Deterministic graph walk from known root pointers (no file-wide scanning).
+                // Safeguards:
+                //  - bounded node count
+                //  - bounded words inspected per node
+                //  - strict pointer plausibility checks
+                {
+                    // NOTE: PS3 track forests require walking deeper than racer forests.
+                    // Keep the walk bounded, but large enough to reach primitives/streams.
+                    constexpr std::size_t kMaxNodes = 4096;
+                    constexpr std::size_t kWordsPerNode = 48; // 192 bytes
+                    constexpr std::size_t kMaxPrimitiveHits = 512;
+                    constexpr std::size_t kMaxNodeDumps = 256;
+
+                    // PS3 pointers can be raw offsets (cpu) or tagged VAs:
+                    //   CPU: 0x0020_0000 + offset
+                    //   GPU: 0x0180_0000 + offset
+                    struct Ps3Ptr
+                    {
+                        std::uint32_t Raw = 0;
+                        std::uint32_t Offset = 0;
+                        bool IsGpu = false;
+                        bool Valid = false;
+                    };
+                    auto decodePs3PtrLocal = [&](std::uint32_t raw) -> Ps3Ptr {
+                        Ps3Ptr out{};
+                        out.Raw = raw;
+                        if (raw == 0)
+                            return out;
+
+                        // Untagged offsets.
+                        if (raw < cpuData.size())
+                        {
+                            out.Offset = raw;
+                            out.IsGpu = false;
+                            out.Valid = true;
+                            return out;
+                        }
+
+                        // Tagged bases.
+                        constexpr std::uint32_t kCpuBase = 0x00200000u;
+                        constexpr std::uint32_t kGpuBase = 0x01800000u;
+                        if (raw >= kCpuBase)
+                        {
+                            std::uint32_t off = raw - kCpuBase;
+                            if (off < cpuData.size())
+                            {
+                                out.Offset = off;
+                                out.IsGpu = false;
+                                out.Valid = true;
+                                return out;
+                            }
+                        }
+                        if (raw >= kGpuBase)
+                        {
+                            std::uint32_t off = raw - kGpuBase;
+                            if (off < gpuData.size())
+                            {
+                                out.Offset = off;
+                                out.IsGpu = true;
+                                out.Valid = true;
+                                return out;
+                            }
+                        }
+
+                        return out;
+                    };
+
+                    auto isPlausibleCpuPtr = [&](std::uint32_t p) -> bool {
+                        return p >= 0x20 && (p % 4) == 0 && static_cast<std::size_t>(p) + 4 <= cpuData.size();
+                    };
+
+                    std::vector<std::uint32_t> queue;
+                    queue.reserve(kMaxNodes);
+                    std::unordered_set<std::uint32_t> visited;
+                    visited.reserve(kMaxNodes * 2);
+
+                    auto enqueue = [&](std::uint32_t p, const char* reason) {
+                        if (!isPlausibleCpuPtr(p))
+                            return;
+                        if (visited.find(p) != visited.end())
+                            return;
+                        if (visited.size() >= kMaxNodes)
+                            return;
+                        visited.insert(p);
+                        queue.push_back(p);
+                        log(std::string("enqueue ") + reason + " @0x" + hex8(p));
+                    };
+
+                    auto enqueueFromRaw = [&](std::uint32_t raw, const char* reason) {
+                        Ps3Ptr p = decodePs3PtrLocal(raw);
+                        if (!p.Valid || p.IsGpu)
+                            return;
+                        enqueue(p.Offset, reason);
+                    };
+
+                    // Seed pointers: library/name registry/hash table + any section entries that are in-range.
+                    enqueue(libraryPtr, "libraryPtr");
+                    enqueue(nameRegistryPtr, "nameRegistryPtr");
+                    enqueue(hashTableOff, "hashTableOff");
+
+                    if (sectionTableOff != 0 && sectionCount > 0 &&
+                        static_cast<std::size_t>(sectionTableOff) + static_cast<std::size_t>(sectionCount) * 4 <= cpuData.size())
+                    {
+                        for (std::uint32_t i = 0; i < sectionCount; ++i)
+                        {
+                            std::uint32_t off = readU32BE(static_cast<std::size_t>(sectionTableOff) + static_cast<std::size_t>(i) * 4);
+                            // Section table contents are not reliably "pure offsets" on PS3 tracks, but may contain
+                            // tagged pointers. Decode and enqueue only plausible CPU pointers.
+                            enqueueFromRaw(off, "sectionEntry");
+                        }
+                    }
+
+                    std::size_t walked = 0;
+                    while (!queue.empty() && walked < kMaxNodes)
+                    {
+                        std::uint32_t addr = queue.back();
+                        queue.pop_back();
+                        walked++;
+
+                        // Dump a small window of u32s so we can see structure signatures.
+                        std::string dump = "node @0x" + hex8(addr) + " u32:";
+                        std::size_t maxWords = std::min<std::size_t>(kWordsPerNode,
+                            (cpuData.size() - static_cast<std::size_t>(addr)) / 4);
+                        for (std::size_t wi = 0; wi < std::min<std::size_t>(16, maxWords); ++wi)
+                        {
+                            std::uint32_t v = readU32BE(static_cast<std::size_t>(addr) + wi * 4);
+                            dump += " " + hex8(v);
+                        }
+                        if (walked <= kMaxNodeDumps)
+                            log(dump);
+
+                        // Primitive detector (deterministic local check; PS3 track variant).
+                        // We do NOT require knowing the full struct type here. We only extract the proven tail fields:
+                        //  - numIndices @ +0x90 (BE u32)
+                        //  - indexPtrRaw @ +0x94 (tag/off24)
+                        //  - vbBasePtrRaw @ +0x18 (tag=0x04, off24 in BIN/cpuData)
+                        //  - streamSlot @ +0x9C (small enum/slot; NOT a pointer)
+                        // Additionally we record sig/selfOff if present for later filtering.
+                        if (primitiveHitsRaw.size() < kMaxPrimitiveHits && static_cast<std::size_t>(addr) + 0xA8 <= cpuData.size())
+                        {
+                            // Primitives are often elements inside a struct array and not directly pointer-targeted.
+                            // Try a small local search window within this node for an aligned primitive start.
+                            for (std::size_t so = 0; so <= 0x80 && primitiveHitsRaw.size() < kMaxPrimitiveHits; so += 4)
+                            {
+                                std::uint32_t cand = addr + static_cast<std::uint32_t>(so);
+                                if (static_cast<std::size_t>(cand) + 0xA8 > cpuData.size())
+                                    break;
+
+                                std::uint32_t sig = readU32BE(static_cast<std::size_t>(cand) + 0x00);
+                                std::uint32_t selfOff = readU32BE(static_cast<std::size_t>(cand) + 0x2C);
+
+                                std::uint32_t vbBaseRaw = readU32BE(static_cast<std::size_t>(cand) + 0x18);
+                                std::uint32_t vbOff24 = (vbBaseRaw & 0x00FFFFFFu);
+                                if (vbOff24 == 0)
+                                    continue;
+
+                                std::uint32_t numIndices = readU32BE(static_cast<std::size_t>(cand) + 0x90);
+                                if (numIndices < 3 || numIndices > 2'000'000)
+                                    continue;
+
+                                std::uint32_t idxRaw = readU32BE(static_cast<std::size_t>(cand) + 0x94);
+                                if (idxRaw == 0)
+                                    continue;
+
+                                std::uint32_t slot32 = readU32BE(static_cast<std::size_t>(cand) + 0x9C);
+                                std::uint8_t slot8 = cpuData[static_cast<std::size_t>(cand) + 0x9F];
+                                std::uint32_t slot = (slot32 <= 0xFFu) ? slot32 : static_cast<std::uint32_t>(slot8);
+
+                                PrimitiveHitRaw hit;
+                                hit.PrimitiveStart = cand;
+                                hit.Sig = sig;
+                                hit.NumIndices = numIndices;
+                                hit.IndexPtrRaw = idxRaw;
+                                hit.VbBasePtrRaw = vbBaseRaw;
+                                hit.StreamSlot = slot;
+                                primitiveHitsRaw.push_back(hit);
+                                log("primitiveHit @0x" + hex8(cand) +
+                                    " sig=0x" + hex8(sig) +
+                                    (selfOff == cand ? " selfOk" : " selfNo") +
+                                    " slot32=0x" + hex8(slot32) +
+                                    " slot8=" + std::to_string(static_cast<unsigned>(slot8)) +
+                                    " slot=" + std::to_string(slot) +
+                                    " numIdx=" + std::to_string(numIndices) +
+                                    " vbBaseRaw=0x" + hex8(vbBaseRaw) +
+                                    " idxPtrRaw=0x" + hex8(idxRaw));
+                            }
+                        }
+
+                        // Heuristic-free pointer harvesting: treat any in-range u32 as potential pointer target.
+                        // This is bounded and driven strictly by the pointer graph (no global scan).
+                        for (std::size_t wi = 0; wi < maxWords; ++wi)
+                        {
+                            std::uint32_t v = readU32BE(static_cast<std::size_t>(addr) + wi * 4);
+                            // Many pointers are tagged. Decode and enqueue CPU pointers only.
+                            enqueueFromRaw(v, "field");
+
+                            // Also detect simple array headers (count, ptr) patterns locally.
+                            if (wi + 1 < maxWords)
+                            {
+                                std::uint32_t count = v;
+                                std::uint32_t ptr = readU32BE(static_cast<std::size_t>(addr) + (wi + 1) * 4);
+                                if (count > 0 && count < 100000)
+                                {
+                                    Ps3Ptr p = decodePs3PtrLocal(ptr);
+                                    if (p.Valid && !p.IsGpu && isPlausibleCpuPtr(p.Offset))
+                                    {
+                                        log("array? at 0x" + hex8(static_cast<std::uint32_t>(addr + wi * 4)) +
+                                            " count=" + std::to_string(count) +
+                                            " ptrRaw=0x" + hex8(ptr) +
+                                            " ptrOff=0x" + hex8(p.Offset));
+                                        enqueue(p.Offset, "arrayPtr");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    log("Graph walk done: visited=" + std::to_string(visited.size()) +
+                        " walked=" + std::to_string(walked));
+                    std::cout << "[ForestPS3] Graph walk done: visited=" << visited.size()
+                              << " walked=" << walked << " (see ForestPS3.log)\n";
+
+                    log("primitiveHitsRaw=" + std::to_string(primitiveHitsRaw.size()));
+                    std::cout << "[ForestPS3] primitiveHits=" << primitiveHitsRaw.size() << " (see ForestPS3.log)\n";
+                }
+            }
+            else
+            {
+                log("RootOffset points out of range for expected PS3 root fields.");
+            }
+        }
+
+        // PS3 forest: the PC object graph loader does not match the BE layout yet.
+        // Deterministic PS3 rendering path:
+        // - Use the SIF relocation table as the only "entry set" (no file-wide scanning).
+        // - Find stream headers (Layout-B) and then find primitives via relocation pointers to VertexStream fields.
+        // - Render using position-at-offset-0 as float3 (no UV/normal mapping yet), and u16 indices.
+        auto looksAscii = [&](std::uint32_t ptr, std::size_t minLen, std::size_t maxLen) -> bool {
+            if (ptr == 0 || ptr >= cpuData.size())
+                return false;
+            std::size_t len = 0;
+            for (; len <= maxLen && ptr + len < cpuData.size(); ++len)
+            {
+                unsigned char c = cpuData[ptr + len];
+                if (c == 0)
+                    break;
+                if (c < 0x20 || c > 0x7E)
+                    return false;
+            }
+            return (len >= minLen && len <= maxLen && ptr + len < cpuData.size() && cpuData[ptr + len] == 0);
+        };
+        auto readFloatLE = [](std::uint32_t u) -> float {
+            float f{};
+            std::memcpy(&f, &u, sizeof(float));
+            return f;
+        };
+        auto swapU32 = [](std::uint32_t v) -> std::uint32_t {
+            return (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
+        };
+
+        // PS3 pointers in track forests can be tagged virtual addresses.
+        // Observed bases:
+        //  - CPU: 0x0020_0000 + offset
+        //  - GPU: 0x0180_0000 + offset
+        struct Ps3Ptr
+        {
+            std::uint32_t Raw = 0;
+            std::uint32_t Offset = 0;
+            bool IsGpu = false;
+            bool Valid = false;
+        };
+        auto decodePs3Ptr = [&](std::uint32_t raw) -> Ps3Ptr {
+            Ps3Ptr out{};
+            out.Raw = raw;
+            if (raw == 0)
+                return out;
+
+            // Untagged offsets.
+            if (raw < cpuData.size())
+            {
+                out.Offset = raw;
+                out.IsGpu = false;
+                out.Valid = true;
+                return out;
+            }
+            if (raw < gpuData.size())
+            {
+                // This can happen for small GPU pointers when they are already relative.
+                out.Offset = raw;
+                out.IsGpu = true;
+                out.Valid = true;
+                return out;
+            }
+
+            // Tagged bases.
+            constexpr std::uint32_t kCpuBase = 0x00200000u;
+            constexpr std::uint32_t kGpuBase = 0x01800000u;
+            if (raw >= kCpuBase)
+            {
+                std::uint32_t off = raw - kCpuBase;
+                if (off < cpuData.size())
+                {
+                    out.Offset = off;
+                    out.IsGpu = false;
+                    out.Valid = true;
+                    return out;
+                }
+            }
+            if (raw >= kGpuBase)
+            {
+                std::uint32_t off = raw - kGpuBase;
+                if (off < gpuData.size())
+                {
+                    out.Offset = off;
+                    out.IsGpu = true;
+                    out.Valid = true;
+                    return out;
+                }
+            }
+
+            return out;
+        };
+
+        struct Ps3StreamHeader
+        {
+            std::uint32_t headerStart = 0;
+            std::uint32_t stride = 0;
+            std::uint32_t count = 0;
+            std::uint32_t vertexDataPtr = 0;
+            bool vertexInGpu = false;
+        };
+
+        std::vector<Ps3StreamHeader> streams;
+        streams.reserve(256);
+        std::unordered_map<std::uint32_t, std::size_t> streamIndex;
+        streamIndex.reserve(256);
+
+        // Prefer the relocation table embedded in the PS3 Forest data itself (deterministic, no scanning).
+        // The SIF chunk relocation list for PS3 tracks can be tiny (e.g. 14), which is insufficient.
+        std::vector<SlLib::Resources::Database::SlResourceRelocation> ps3Relocs;
+        ps3Relocs.reserve(8192);
+        std::vector<std::uint32_t> relocOffsets; // offset-only (field offsets)
+        relocOffsets.reserve(8192);
+        {
+            if (cpuData.size() >= 0x30)
+            {
+                std::uint32_t rootOffset = readU32BE(0x0C);
+                if (rootOffset + 0x30 <= cpuData.size())
+                {
+                    std::uint32_t relocCount = readU32BE(static_cast<std::size_t>(rootOffset) + 0x28);
+                    std::uint32_t relocPtr = readU32BE(static_cast<std::size_t>(rootOffset) + 0x2C);
+                    if (relocCount > 0 && relocCount < 2'000'000 && relocPtr > 0 && (relocPtr % 4) == 0)
+                    {
+                        // Dump a small raw preview so we can verify the actual on-disk format.
+                        {
+                            std::size_t dumpBytes = std::min<std::size_t>(64, cpuData.size() - static_cast<std::size_t>(relocPtr));
+                            std::string hex;
+                            hex.reserve(dumpBytes * 3);
+                            for (std::size_t i = 0; i < dumpBytes; ++i)
+                            {
+                                char b[4];
+                                std::snprintf(b, sizeof(b), "%02X", cpuData[static_cast<std::size_t>(relocPtr) + i]);
+                                hex += b;
+                                if (i + 1 < dumpBytes)
+                                    hex += ' ';
+                            }
+                            log("Reloc raw @0x" + hex8(relocPtr) + " (first " + std::to_string(dumpBytes) + "): " + hex);
+                        }
+
+                        auto isPlausibleOff = [&](std::uint32_t off) -> bool {
+                            return off >= 0x20 && off < cpuData.size() && (off % 4) == 0;
+                        };
+
+                        auto readU16BE = [&](std::size_t off) -> std::uint16_t {
+                            if (off + 2 > cpuData.size())
+                                return 0;
+                            return static_cast<std::uint16_t>((cpuData[off] << 8) | cpuData[off + 1]);
+                        };
+                        auto readU16LE = [&](std::size_t off) -> std::uint16_t {
+                            if (off + 2 > cpuData.size())
+                                return 0;
+                            return static_cast<std::uint16_t>(cpuData[off] | (cpuData[off + 1] << 8));
+                        };
+                        auto readU32LELocal = [&](std::size_t off) -> std::uint32_t {
+                            if (off + 4 > cpuData.size())
+                                return 0;
+                            return static_cast<std::uint32_t>(cpuData[off]) |
+                                   (static_cast<std::uint32_t>(cpuData[off + 1]) << 8) |
+                                   (static_cast<std::uint32_t>(cpuData[off + 2]) << 16) |
+                                   (static_cast<std::uint32_t>(cpuData[off + 3]) << 24);
+                        };
+
+                        struct Candidate
+                        {
+                            const char* Name = nullptr;
+                            std::size_t StrideBytes = 0;
+                            bool Little = false;
+                            bool U16 = false;
+                            std::size_t Plausible = 0;
+                            std::size_t NonZero = 0;
+                        };
+                        Candidate cands[] = {
+                            {"u32-be", 4, false, false, 0, 0},
+                            {"u32-le", 4, true, false, 0, 0},
+                            {"u16-be", 2, false, true, 0, 0},
+                            {"u16-le", 2, true, true, 0, 0},
+                        };
+
+                        auto score = [&](Candidate& c) {
+                            c.Plausible = 0;
+                            c.NonZero = 0;
+                            std::uint32_t sampleN = std::min<std::uint32_t>(relocCount, 512);
+                            std::size_t need = static_cast<std::size_t>(relocPtr) + static_cast<std::size_t>(sampleN) * c.StrideBytes;
+                            if (need > cpuData.size())
+                                return;
+                            for (std::uint32_t i = 0; i < sampleN; ++i)
+                            {
+                                std::size_t at = static_cast<std::size_t>(relocPtr) + static_cast<std::size_t>(i) * c.StrideBytes;
+                                std::uint32_t off = 0;
+                                if (c.U16)
+                                    off = c.Little ? readU16LE(at) : readU16BE(at);
+                                else
+                                    off = c.Little ? readU32LELocal(at) : readU32BE(at);
+                                if (off != 0)
+                                    c.NonZero++;
+                                if (isPlausibleOff(off))
+                                    c.Plausible++;
+                            }
+                        };
+
+                        for (auto& c : cands)
+                            score(c);
+
+                        Candidate* best = &cands[0];
+                        for (auto& c : cands)
+                        {
+                            if (c.Plausible > best->Plausible)
+                                best = &c;
+                        }
+
+                        log(std::string("Reloc decode candidates: ") +
+                            "u32-be(p=" + std::to_string(cands[0].Plausible) + ",nz=" + std::to_string(cands[0].NonZero) + ") " +
+                            "u32-le(p=" + std::to_string(cands[1].Plausible) + ",nz=" + std::to_string(cands[1].NonZero) + ") " +
+                            "u16-be(p=" + std::to_string(cands[2].Plausible) + ",nz=" + std::to_string(cands[2].NonZero) + ") " +
+                            "u16-le(p=" + std::to_string(cands[3].Plausible) + ",nz=" + std::to_string(cands[3].NonZero) + ")");
+                        log(std::string("Selected reloc decode: ") + best->Name + " (plausible=" + std::to_string(best->Plausible) + ")");
+
+                        // Decode using the selected format.
+                        relocOffsets.clear();
+                        relocOffsets.reserve(relocCount);
+                        for (std::uint32_t i = 0; i < relocCount; ++i)
+                        {
+                            std::size_t at = static_cast<std::size_t>(relocPtr) + static_cast<std::size_t>(i) * best->StrideBytes;
+                            if (at + best->StrideBytes > cpuData.size())
+                                break;
+                            std::uint32_t off = 0;
+                            if (best->U16)
+                                off = best->Little ? readU16LE(at) : readU16BE(at);
+                            else
+                                off = best->Little ? readU32LELocal(at) : readU32BE(at);
+                            // Filter zero entries (common padding/no-op).
+                            if (off != 0)
+                                relocOffsets.push_back(off);
+                        }
+                        log("Using embedded PS3 relocations (" + std::string(best->Name) + "): count=" + std::to_string(relocOffsets.size()) +
+                            " rootOffset=0x" + hex8(rootOffset) +
+                            " relocPtr=0x" + hex8(relocPtr));
+                    }
+                }
+            }
+            if (ps3Relocs.empty() && relocOffsets.empty())
+            {
+                log("Embedded PS3 relocation table not found/invalid; falling back to SIF relocations.");
+                relocOffsets = chunk.Relocations;
+            }
+        }
+
+        auto tryParseStreamLayoutKindFirst = [&](std::uint32_t addr, Ps3StreamHeader& out) -> bool {
+            // Layout (big-endian, deterministic local parse):
+            //   +0x00 kind
+            //   +0x04 vertexDataPtr
+            //   +0x18 numExtra
+            //   +0x1C stride
+            //   +0x20 count
+            //   +0x24 flags
+            if (addr + 0x28 > cpuData.size() || (addr % 4) != 0)
+                return false;
+            std::uint32_t stride = readU32BE(addr + 0x1C);
+            std::uint32_t count = readU32BE(addr + 0x20);
+            Ps3Ptr vertexPtr = decodePs3Ptr(readU32BE(addr + 0x04));
+            if (stride < 12 || stride > 0x400 || (stride % 2) != 0 || count == 0 || count > 5'000'000)
+                return false;
+            std::uint64_t bytes = static_cast<std::uint64_t>(stride) * static_cast<std::uint64_t>(count);
+            if (!vertexPtr.Valid || vertexPtr.Offset == 0)
+                return false;
+            bool inGpu = vertexPtr.IsGpu && (static_cast<std::uint64_t>(vertexPtr.Offset) + bytes <= gpuData.size());
+            bool inCpu = (!vertexPtr.IsGpu) && (static_cast<std::uint64_t>(vertexPtr.Offset) + bytes <= cpuData.size());
+            if (!inGpu && !inCpu)
+                return false;
+            // Filter obvious false-positives: vertex buffers for tracks won't live in the header region.
+            if (inCpu && vertexPtr.Offset < 0x1000)
+                return false;
+            out.headerStart = addr;
+            out.stride = stride;
+            out.count = count;
+            out.vertexDataPtr = vertexPtr.Offset;
+            out.vertexInGpu = inGpu;
+            return true;
+        };
+
+        auto tryParseStreamLayoutExtraFirst = [&](std::uint32_t addr, Ps3StreamHeader& out) -> bool {
+            // Alternate layout (extraPtr first) that we used for racer forests:
+            //   +0x0C stride
+            //   +0x10 count
+            //   vertex data ptr is stored in an owner tail at -0x14 (not always true for tracks)
+            if (addr + 0x18 > cpuData.size() || (addr % 4) != 0 || addr < 0x18)
+                return false;
+            std::uint32_t stride = readU32BE(addr + 0x0C);
+            std::uint32_t count = readU32BE(addr + 0x10);
+            if (stride < 12 || stride > 0x400 || (stride % 2) != 0 || count == 0 || count > 5'000'000)
+                return false;
+            Ps3Ptr vertexPtr = decodePs3Ptr(readU32BE(addr - 0x14));
+            std::uint64_t bytes = static_cast<std::uint64_t>(stride) * static_cast<std::uint64_t>(count);
+            if (!vertexPtr.Valid || vertexPtr.Offset == 0)
+                return false;
+            bool inGpu = vertexPtr.IsGpu && (static_cast<std::uint64_t>(vertexPtr.Offset) + bytes <= gpuData.size());
+            bool inCpu = (!vertexPtr.IsGpu) && (static_cast<std::uint64_t>(vertexPtr.Offset) + bytes <= cpuData.size());
+            if (!inGpu && !inCpu)
+                return false;
+            if (inCpu && vertexPtr.Offset < 0x1000)
+                return false;
+            out.headerStart = addr;
+            out.stride = stride;
+            out.count = count;
+            out.vertexDataPtr = vertexPtr.Offset;
+            out.vertexInGpu = inGpu;
+            return true;
+        };
+
+        auto looksAsciiAt = [&](std::uint32_t ptr, std::size_t minLen, std::size_t maxLen) -> bool {
+            if (ptr == 0 || ptr >= cpuData.size())
+                return false;
+            std::size_t len = 0;
+            for (; len <= maxLen && static_cast<std::size_t>(ptr) + len < cpuData.size(); ++len)
+            {
+                unsigned char c = cpuData[static_cast<std::size_t>(ptr) + len];
+                if (c == 0)
+                    break;
+                if (c < 0x20 || c > 0x7E)
+                    return false;
+            }
+            return (len >= minLen && len <= maxLen && static_cast<std::size_t>(ptr) + len < cpuData.size() &&
+                    cpuData[static_cast<std::size_t>(ptr) + len] == 0);
+        };
+
+        auto tryParseStreamLayoutB = [&](std::uint32_t addr, Ps3StreamHeader& out) -> bool {
+            // Layout-B (extraPtr/namePtr/numExtra/stride/count/flags), common on PS3.
+            // Vertex data ptr typically lives in an "owner tail" at addr-0x14 (tagged pointer allowed).
+            if (addr + 0x18 > cpuData.size() || (addr % 4) != 0 || addr < 0x18)
+                return false;
+            std::uint32_t extraPtrRaw = readU32BE(addr + 0x00);
+            std::uint32_t namePtrRaw = readU32BE(addr + 0x04);
+            std::uint32_t stride = readU32BE(addr + 0x0C);
+            std::uint32_t count = readU32BE(addr + 0x10);
+            if (stride < 12 || stride > 0x400 || (stride % 2) != 0 || count == 0 || count > 5'000'000)
+                return false;
+
+            // Name pointer should point into ASCII string table region for this track.
+            if (!looksAsciiAt(namePtrRaw, 2, 96))
+                return false;
+
+            // Extra pointer typically points to a code list (first u32 <= 0xFF) or is 0.
+            if (extraPtrRaw != 0)
+            {
+                Ps3Ptr extraPtr = decodePs3Ptr(extraPtrRaw);
+                if (!extraPtr.Valid || extraPtr.IsGpu || static_cast<std::size_t>(extraPtr.Offset) + 4 > cpuData.size())
+                    return false;
+                std::uint32_t code0 = readU32BE(extraPtr.Offset);
+                if (code0 > 0xFF)
+                    return false;
+            }
+
+            Ps3Ptr vertexPtr = decodePs3Ptr(readU32BE(addr - 0x14));
+            std::uint64_t bytes = static_cast<std::uint64_t>(stride) * static_cast<std::uint64_t>(count);
+            if (!vertexPtr.Valid || vertexPtr.Offset == 0)
+                return false;
+            bool inGpu = vertexPtr.IsGpu && (static_cast<std::uint64_t>(vertexPtr.Offset) + bytes <= gpuData.size());
+            bool inCpu = (!vertexPtr.IsGpu) && (static_cast<std::uint64_t>(vertexPtr.Offset) + bytes <= cpuData.size());
+            if (!inGpu && !inCpu)
+                return false;
+            if (inCpu && vertexPtr.Offset < 0x1000)
+                return false;
+
+            out.headerStart = addr;
+            out.stride = stride;
+            out.count = count;
+            out.vertexDataPtr = vertexPtr.Offset;
+            out.vertexInGpu = inGpu;
+            return true;
+        };
+
+        // Seed candidates: every relocation points at a pointer field.
+        // We only inspect pointer targets reachable from those pointers (no file-wide scanning).
+        std::size_t streamsKindFirst = 0;
+        std::size_t streamsExtraFirst = 0;
+        std::size_t streamsLayoutB = 0;
+        std::size_t relocCpuPtrCount = 0;
+        std::size_t relocGpuPtrCount = 0;
+        std::size_t relocZeroPtrCount = 0;
+        std::size_t relocOtherPtrCount = 0;
+        std::size_t loggedRelocs = 0;
+
+        // Pointer field reads (raw), then decode tagged addresses.
+        auto readPtrAt = [&](std::uint32_t off, bool& gpu) -> std::uint32_t {
+            gpu = false;
+            if (off + 4 > cpuData.size())
+                return 0;
+            std::uint32_t raw = readU32BE(off);
+            Ps3Ptr p = decodePs3Ptr(raw);
+            gpu = p.Valid && p.IsGpu;
+            return p.Valid ? p.Offset : 0;
+        };
+
+        auto const& seedRelocs = !ps3Relocs.empty() ? ps3Relocs : [&]() {
+            static std::vector<SlLib::Resources::Database::SlResourceRelocation> tmp;
+            tmp.clear();
+            tmp.reserve(relocOffsets.size());
+            for (auto off : relocOffsets)
+                tmp.push_back({static_cast<int>(off), 0});
+            return tmp;
+        }();
+
+        for (auto const& rel : seedRelocs)
+        {
+            std::uint32_t fieldOff = static_cast<std::uint32_t>(rel.Offset);
+            if (fieldOff + 4 > cpuData.size())
+                continue;
+            bool ptrGpu = false;
+            std::uint32_t target = readPtrAt(fieldOff, ptrGpu);
+            if (target == 0)
+            {
+                relocZeroPtrCount++;
+                continue;
+            }
+
+            bool pointsCpu = (!ptrGpu) && (target < cpuData.size());
+            bool pointsGpu = ptrGpu && (target < gpuData.size());
+            if (pointsCpu)
+                relocCpuPtrCount++;
+            else if (pointsGpu)
+                relocGpuPtrCount++;
+            else
+                relocOtherPtrCount++;
+
+            if (loggedRelocs < 20)
+            {
+                log("reloc[" + std::to_string(loggedRelocs) + "]: fieldOff=0x" + hex8(fieldOff) +
+                    " ptr=0x" + hex8(target) +
+                    (pointsCpu ? " (cpu)" : (pointsGpu ? " (gpu)" : " (out)")));
+                loggedRelocs++;
+            }
+
+            if (target < 0x20 || (target % 4) != 0)
+                continue;
+
+            if (streamIndex.find(target) != streamIndex.end())
+                continue;
+
+            Ps3StreamHeader parsed{};
+            if (tryParseStreamLayoutKindFirst(target, parsed))
+            {
+                streamIndex.emplace(target, streams.size());
+                streams.push_back(parsed);
+                streamsKindFirst++;
+                continue;
+            }
+            if (tryParseStreamLayoutExtraFirst(target, parsed))
+            {
+                streamIndex.emplace(target, streams.size());
+                streams.push_back(parsed);
+                streamsExtraFirst++;
+                continue;
+            }
+            if (tryParseStreamLayoutB(target, parsed))
+            {
+                streamIndex.emplace(target, streams.size());
+                streams.push_back(parsed);
+                streamsLayoutB++;
+                continue;
+            }
+        }
+
+        log("Discovered PS3 stream headers: " + std::to_string(streams.size()) +
+            " (kindFirst=" + std::to_string(streamsKindFirst) +
+            " extraFirst=" + std::to_string(streamsExtraFirst) +
+            " layoutB=" + std::to_string(streamsLayoutB) + ")");
+        std::cout << "[ForestPS3] streamHeaders=" << streams.size()
+                  << " kindFirst=" << streamsKindFirst
+                  << " extraFirst=" << streamsExtraFirst
+                  << " layoutB=" << streamsLayoutB
+                  << " (see ForestPS3.log)\n";
+        log("Reloc ptr distribution: cpu=" + std::to_string(relocCpuPtrCount) +
+            " gpu=" + std::to_string(relocGpuPtrCount) +
+            " zero=" + std::to_string(relocZeroPtrCount) +
+            " out=" + std::to_string(relocOtherPtrCount) +
+            " total=" + std::to_string(relocOffsets.size()));
+        // Deterministic PS3 track path (BillyHatcher_Hard proven):
+        // - streamSlot is an index into a global table in BIN (cpuData)
+        // - stream table is u32be array at 0x144 terminated by 0xFFFFFFFF
+        // - table[slot] points to a kind-first stream header (vbOff/stride/count)
+        // - vbBasePtrRaw(tag=0x04) gives BIN base; vbOff is relative to that
+        if (!primitiveHitsRaw.empty())
+        {
+            auto readU32BEAt = [&](std::size_t off) -> std::uint32_t { return readU32BE(off); };
+            auto readF32BEAt = [&](std::span<const std::uint8_t> data, std::size_t off) -> float {
+                if (off + 4 > data.size())
+                    return 0.0f;
+                std::uint32_t u = (static_cast<std::uint32_t>(data[off]) << 24) |
+                                  (static_cast<std::uint32_t>(data[off + 1]) << 16) |
+                                  (static_cast<std::uint32_t>(data[off + 2]) << 8) |
+                                  static_cast<std::uint32_t>(data[off + 3]);
+                u = swapU32(u);
+                return readFloatLE(u);
+            };
+
+            auto parseStreamTable = [&](std::uint32_t tableOff, std::vector<std::uint32_t>& out) -> bool {
+                out.clear();
+                if (tableOff == 0 || (tableOff % 4) != 0 || tableOff + 8 > cpuData.size())
+                    return false;
+                constexpr std::size_t kMax = 256;
+                for (std::size_t i = 0; i < kMax; ++i)
+                {
+                    std::size_t at = static_cast<std::size_t>(tableOff) + i * 4;
+                    if (at + 4 > cpuData.size())
+                        return false;
+                    std::uint32_t v = readU32BEAt(at);
+                    if (v == 0xFFFFFFFFu)
+                        return !out.empty();
+                    out.push_back(v);
+                }
+                return false;
+            };
+
+            std::vector<std::uint32_t> streamTable;
+            bool hasTable = parseStreamTable(0x144, streamTable);
+            log(std::string("ps3SlotTable @0x00000144 ") + (hasTable ? "ok" : "missing") +
+                " count=" + std::to_string(streamTable.size()));
+
+            if (hasTable)
+            {
+                auto readMatrixBE = [&](std::uint32_t off) -> SlLib::Math::Matrix4x4 {
+                    SlLib::Math::Matrix4x4 m{};
+                    if (static_cast<std::size_t>(off) + 0x40 > cpuData.size())
+                        return m;
+                    for (int r = 0; r < 4; ++r)
+                    {
+                        for (int c = 0; c < 4; ++c)
+                        {
+                            std::uint32_t u = readU32BEAt(static_cast<std::size_t>(off) + static_cast<std::size_t>((r * 4 + c) * 4));
+                            u = swapU32(u);
+                            float f = readFloatLE(u);
+                            m(r, c) = f;
+                        }
+                    }
+                    return m;
+                };
+
+                auto resolveIndexPtr = [&](std::uint32_t raw, std::span<const std::uint8_t>& outData, std::uint32_t& outOff) -> bool {
+                    std::uint32_t tag = (raw >> 24) & 0xFFu;
+                    std::uint32_t off24 = (raw & 0x00FFFFFFu);
+                    outOff = off24;
+                    if (off24 == 0)
+                        return false;
+                    // Observed in BH_Hard PS3:
+                    //  - tag 0x1A points into GPU blob (sig)
+                    //  - tag 0x08 points into CPU blob (bin)
+                    if (tag == 0x1A)
+                    {
+                        outData = gpuData;
+                        return static_cast<std::size_t>(off24) < gpuData.size();
+                    }
+                    if (tag == 0x08 || tag == 0x04)
+                    {
+                        outData = cpuData;
+                        return static_cast<std::size_t>(off24) < cpuData.size();
+                    }
+                    return false;
+                };
+
+                std::unordered_map<std::uint64_t, std::uint64_t> seenPrimitiveKey;
+                seenPrimitiveKey.reserve(2048);
+
+                std::vector<Renderer::SlRenderer::ForestCpuMesh> meshes;
+                meshes.reserve(2048);
+
+                std::size_t primitiveMatches = 0;
+                std::size_t primitiveBadSlot = 0;
+                std::size_t primitiveBadHeader = 0;
+                std::size_t primitiveBadVb = 0;
+                std::size_t primitiveBadIndex = 0;
+                std::size_t primitiveMatchesU16 = 0;
+                std::size_t primitiveMatchesU32 = 0;
+                std::size_t primitiveSlot8 = 0;
+                std::size_t primitiveSlot18 = 0;
+                std::size_t primitiveSlot255 = 0;
+                std::size_t primitiveSigA = 0;
+                std::size_t primitiveSigB = 0;
+
+                for (auto const& ph : primitiveHitsRaw)
+                {
+                    if (ph.Sig == 0x04FF3002u)
+                        primitiveSigA++;
+                    else if (ph.Sig == 0x04030403u)
+                        primitiveSigB++;
+                    if (ph.StreamSlot == 8)
+                        primitiveSlot8++;
+                    else if (ph.StreamSlot == 18)
+                        primitiveSlot18++;
+                    else if (ph.StreamSlot == 255)
+                        primitiveSlot255++;
+
+                    if (ph.StreamSlot >= streamTable.size())
+                    {
+                        primitiveBadSlot++;
+                        continue;
+                    }
+                    std::uint32_t hdrOff = streamTable[ph.StreamSlot];
+                    if (hdrOff + 0x28 > cpuData.size())
+                    {
+                        primitiveBadHeader++;
+                        continue;
+                    }
+
+                    std::uint32_t kind = readU32BEAt(hdrOff + 0x00);
+                    std::uint32_t vbOff = readU32BEAt(hdrOff + 0x04);
+                    std::uint32_t stride = readU32BEAt(hdrOff + 0x1C);
+                    std::uint32_t vcount = readU32BEAt(hdrOff + 0x20);
+                    (void)kind;
+                    if (stride < 12 || stride > 0x400 || vcount == 0 || vcount > 5'000'000)
+                    {
+                        primitiveBadHeader++;
+                        continue;
+                    }
+
+                    std::uint32_t vbBaseOff = (ph.VbBasePtrRaw & 0x00FFFFFFu);
+                    // In this PS3 track format, vbBasePtrRaw is expected to be a tagged pointer;
+                    // we don't hard-require a tag value here, we just need the resolved base+vbOff range to be valid.
+                    std::uint64_t vbStart = static_cast<std::uint64_t>(vbBaseOff) + static_cast<std::uint64_t>(vbOff);
+                    std::uint64_t vbBytes = static_cast<std::uint64_t>(stride) * static_cast<std::uint64_t>(vcount);
+                    if (vbStart + vbBytes > cpuData.size())
+                    {
+                        primitiveBadVb++;
+                        continue;
+                    }
+
+                    std::span<const std::uint8_t> indexData;
+                    std::uint32_t indexOff = 0;
+                    if (!resolveIndexPtr(ph.IndexPtrRaw, indexData, indexOff))
+                    {
+                        primitiveBadIndex++;
+                        continue;
+                    }
+
+                    auto canReadIndices = [&](std::size_t bytesPerIndex) -> bool {
+                        std::uint64_t bytes = static_cast<std::uint64_t>(ph.NumIndices) * static_cast<std::uint64_t>(bytesPerIndex);
+                        return static_cast<std::uint64_t>(indexOff) + bytes <= indexData.size();
+                    };
+                    auto readU16BEFrom = [&](std::size_t off) -> std::uint16_t {
+                        if (off + 2 > indexData.size())
+                            return 0;
+                        return static_cast<std::uint16_t>((indexData[off] << 8) | indexData[off + 1]);
+                    };
+                    auto readU32BEFrom = [&](std::size_t off) -> std::uint32_t {
+                        if (off + 4 > indexData.size())
+                            return 0;
+                        return (static_cast<std::uint32_t>(indexData[off]) << 24) |
+                               (static_cast<std::uint32_t>(indexData[off + 1]) << 16) |
+                               (static_cast<std::uint32_t>(indexData[off + 2]) << 8) |
+                               static_cast<std::uint32_t>(indexData[off + 3]);
+                    };
+                    auto scoreIndexFormat = [&](std::size_t bytesPerIndex) -> int {
+                        if (!canReadIndices(bytesPerIndex))
+                            return -1;
+                        std::size_t sample = std::min<std::size_t>(static_cast<std::size_t>(ph.NumIndices), 512);
+                        int ok = 0;
+                        for (std::size_t i = 0; i < sample; ++i)
+                        {
+                            std::uint32_t idx = 0;
+                            if (bytesPerIndex == 2)
+                                idx = readU16BEFrom(static_cast<std::size_t>(indexOff) + i * 2);
+                            else
+                                idx = readU32BEFrom(static_cast<std::size_t>(indexOff) + i * 4);
+                            if (idx == 0xFFFFu || idx == 0xFFFFFFFFu)
+                                continue;
+                            if (idx < vcount)
+                                ok++;
+                        }
+                        return ok;
+                    };
+
+                    int score16 = scoreIndexFormat(2);
+                    int score32 = scoreIndexFormat(4);
+                    std::size_t bytesPerIndex = (score32 > score16) ? 4 : 2;
+                    if (!canReadIndices(bytesPerIndex))
+                    {
+                        primitiveBadIndex++;
+                        continue;
+                    }
+
+                    // Unique primitive: primitiveStart + slot (in practice also avoids duplicates)
+                    std::uint64_t key = (static_cast<std::uint64_t>(ph.PrimitiveStart) << 32) | static_cast<std::uint64_t>(ph.StreamSlot);
+                    if (seenPrimitiveKey.find(key) != seenPrimitiveKey.end())
+                        continue;
+                    seenPrimitiveKey.emplace(key, 1);
+
+                    Renderer::SlRenderer::ForestCpuMesh mesh;
+                    mesh.Skinned = false;
+                    mesh.Model = readMatrixBE(ph.PrimitiveStart);
+                    mesh.Vertices.resize(static_cast<std::size_t>(vcount) * 20, 0.0f);
+
+                    std::span<const std::uint8_t> vbData = cpuData;
+                    for (std::uint32_t vi = 0; vi < vcount; ++vi)
+                    {
+                        std::size_t base = static_cast<std::size_t>(vbStart) + static_cast<std::size_t>(vi) * static_cast<std::size_t>(stride);
+                        if (base + 12 > vbData.size())
+                            break;
+                        float x = readF32BEAt(vbData, base + 0);
+                        float y = readF32BEAt(vbData, base + 4);
+                        float z = readF32BEAt(vbData, base + 8);
+                        std::size_t out = static_cast<std::size_t>(vi) * 20;
+                        mesh.Vertices[out + 0] = x;
+                        mesh.Vertices[out + 1] = y;
+                        mesh.Vertices[out + 2] = z;
+                        mesh.Vertices[out + 3] = 0.0f;
+                        mesh.Vertices[out + 4] = 1.0f;
+                        mesh.Vertices[out + 5] = 0.0f;
+                        mesh.Vertices[out + 6] = 0.0f;
+                        mesh.Vertices[out + 7] = 0.0f;
+                        mesh.Vertices[out + 8] = 1.0f;
+                        mesh.Vertices[out + 9] = 0.0f;
+                        mesh.Vertices[out + 10] = 0.0f;
+                        mesh.Vertices[out + 11] = 0.0f;
+                    }
+
+                    mesh.Indices.reserve(ph.NumIndices);
+                    for (std::uint32_t ii = 0; ii < ph.NumIndices; ++ii)
+                    {
+                        std::uint32_t idx = 0;
+                        if (bytesPerIndex == 2)
+                        {
+                            idx = readU16BEFrom(static_cast<std::size_t>(indexOff) + static_cast<std::size_t>(ii) * 2);
+                            if (idx == 0xFFFFu)
+                                continue;
+                        }
+                        else
+                        {
+                            idx = readU32BEFrom(static_cast<std::size_t>(indexOff) + static_cast<std::size_t>(ii) * 4);
+                            if (idx == 0xFFFFFFFFu)
+                                continue;
+                        }
+                        if (idx >= vcount)
+                            continue;
+                        mesh.Indices.push_back(idx);
+                    }
+
+                    if (mesh.Indices.size() >= 3)
+                    {
+                        meshes.push_back(std::move(mesh));
+                        primitiveMatches++;
+                        if (bytesPerIndex == 2)
+                            primitiveMatchesU16++;
+                        else
+                            primitiveMatchesU32++;
+                    }
+
+                    if (meshes.size() >= 2048)
+                        break;
+                }
+
+                log("PS3 slot-table matches=" + std::to_string(primitiveMatches) +
+                    " meshes=" + std::to_string(meshes.size()) +
+                    " (u16=" + std::to_string(primitiveMatchesU16) +
+                    " u32=" + std::to_string(primitiveMatchesU32) +
+                    " sigA=" + std::to_string(primitiveSigA) +
+                    " sigB=" + std::to_string(primitiveSigB) +
+                    " slot8=" + std::to_string(primitiveSlot8) +
+                    " slot18=" + std::to_string(primitiveSlot18) +
+                    " slot255=" + std::to_string(primitiveSlot255) +
+                    " badSlot=" + std::to_string(primitiveBadSlot) +
+                    " badHdr=" + std::to_string(primitiveBadHeader) +
+                    " badVb=" + std::to_string(primitiveBadVb) +
+                    " badIdx=" + std::to_string(primitiveBadIndex) + ")");
+                std::cout << "[ForestPS3] slotTable meshesBuilt=" << meshes.size()
+                          << " (see ForestPS3.log)\n";
+
+                if (!meshes.empty())
+                {
+                    _forestLibrary.reset();
+                    _forestMeshSources.clear();
+                    _allForestMeshes = meshes;
+                    _renderer.SetForestMeshes(std::move(meshes));
+                    _renderer.SetDrawForestMeshes(true);
+                    _drawForestMeshes = true;
+
+                    _forestHierarchy.clear();
+                    ForestHierarchy fh;
+                    fh.Name = "PS3 Forest (slot-table)";
+                    fh.Visible = true;
+                    _forestHierarchy.push_back(std::move(fh));
+                    return;
+                }
+            }
+        }
+
+        // If the deterministic slot-table path didn't render anything, stop here for now.
+        // (The older pointer-based stream discovery used fields that are not valid for this PS3 track format.)
+        log("PS3 slot-table path did not produce meshes; stopping (no fallback renderer yet).");
+        return;
+
+#if 0
+        auto determineSwapForStream = [&](Ps3StreamHeader const& s) -> bool {
+            int plausibleSwapped = 0;
+            int plausibleRaw = 0;
+            int sample = static_cast<int>(std::min<std::uint32_t>(s.count, 32));
+            std::span<const std::uint8_t> vb = s.vertexInGpu ? gpuData : cpuData;
+            auto readU32BEFrom = [&](std::size_t off) -> std::uint32_t {
+                if (off + 4 > vb.size())
+                    return 0;
+                return (static_cast<std::uint32_t>(vb[off]) << 24) |
+                       (static_cast<std::uint32_t>(vb[off + 1]) << 16) |
+                       (static_cast<std::uint32_t>(vb[off + 2]) << 8) |
+                       static_cast<std::uint32_t>(vb[off + 3]);
+            };
+            for (int vi = 0; vi < sample; ++vi)
+            {
+                std::size_t base = static_cast<std::size_t>(s.vertexDataPtr) + static_cast<std::size_t>(vi) *
+                                   static_cast<std::size_t>(s.stride);
+                if (base + 12 > vb.size())
+                    break;
+                std::uint32_t ux = readU32BEFrom(base + 0);
+                std::uint32_t uy = readU32BEFrom(base + 4);
+                std::uint32_t uz = readU32BEFrom(base + 8);
+                float xRaw = readFloatLE(ux);
+                float yRaw = readFloatLE(uy);
+                float zRaw = readFloatLE(uz);
+                float xSw = readFloatLE(swapU32(ux));
+                float ySw = readFloatLE(swapU32(uy));
+                float zSw = readFloatLE(swapU32(uz));
+                auto ok = [](float v) { return std::isfinite(v) && std::abs(v) < 1.0e6f; };
+                if (ok(xRaw) && ok(yRaw) && ok(zRaw))
+                    plausibleRaw++;
+                if (ok(xSw) && ok(ySw) && ok(zSw))
+                    plausibleSwapped++;
+            }
+            return plausibleSwapped > plausibleRaw;
+        };
+
+        constexpr std::size_t kPrimitiveVertexStreamField = 0x9C;
+        constexpr std::size_t kPrimitiveNumIndicesField = 0x90;
+        constexpr std::size_t kPrimitiveIndexPtrField = 0x94;
+
+        std::unordered_map<std::uint64_t, std::uint64_t> seenPrimitiveKey;
+        seenPrimitiveKey.reserve(1024);
+
+        std::vector<Renderer::SlRenderer::ForestCpuMesh> meshes;
+        meshes.reserve(2048);
+        std::size_t primitiveMatches = 0;
+        std::size_t primitiveMatchesU16 = 0;
+        std::size_t primitiveMatchesU32 = 0;
+        std::size_t primitiveIndexUnknown = 0;
+
+        auto readU16BEAt = [&](std::span<const std::uint8_t> data, std::size_t off) -> std::uint16_t {
+            if (off + 2 > data.size())
+                return 0;
+            return static_cast<std::uint16_t>((data[off] << 8) | data[off + 1]);
+        };
+
+        auto readMatrixBE = [&](std::uint32_t off) -> SlLib::Math::Matrix4x4 {
+            SlLib::Math::Matrix4x4 m{};
+            if (off + 0x40 > cpuData.size())
+                return m;
+            for (int r = 0; r < 4; ++r)
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    std::uint32_t u = readU32BE(static_cast<std::size_t>(off) + static_cast<std::size_t>((r * 4 + c) * 4));
+                    u = swapU32(u);
+                    float f = readFloatLE(u);
+                    m(r, c) = f;
+                }
+            }
+            return m;
+        };
+
+        // Build meshes from the primitive candidates found during the PS3 graph walk.
+        // Do NOT rely on the SIF relocation list here (it is incomplete for PS3 tracks).
+        for (auto const& ph : primitiveHitsRaw)
+        {
+            Ps3Ptr vsPtr = decodePs3Ptr(ph.VertexStreamPtrRaw);
+            Ps3Ptr idxPtr = decodePs3Ptr(ph.IndexPtrRaw);
+            if (!vsPtr.Valid || vsPtr.IsGpu)
+                continue;
+            if (!idxPtr.Valid || idxPtr.Offset == 0)
+                continue;
+
+            auto itStream = streamIndex.find(vsPtr.Offset);
+            if (itStream == streamIndex.end())
+                continue;
+
+            std::uint32_t primitiveStart = ph.PrimitiveStart;
+            if (primitiveStart == 0 || static_cast<std::size_t>(primitiveStart) + 0xA8 > cpuData.size())
+                continue;
+
+            std::uint32_t numIndices = ph.NumIndices;
+            if (numIndices < 3 || numIndices > 2'000'000)
+                continue;
+
+            std::span<const std::uint8_t> indexData = idxPtr.IsGpu ? gpuData : cpuData;
+
+            auto canReadIndices = [&](std::size_t bytesPerIndex) -> bool {
+                std::uint64_t bytes = static_cast<std::uint64_t>(numIndices) * static_cast<std::uint64_t>(bytesPerIndex);
+                return static_cast<std::uint64_t>(idxPtr.Offset) + bytes <= indexData.size();
+            };
+
+            Ps3StreamHeader const& stream = streams[itStream->second];
+            bool swapFloats = determineSwapForStream(stream);
+
+            auto scoreIndexFormat = [&](std::size_t bytesPerIndex) -> int {
+                if (!canReadIndices(bytesPerIndex))
+                    return -1;
+                std::size_t sample = std::min<std::size_t>(static_cast<std::size_t>(numIndices), 512);
+                int ok = 0;
+                for (std::size_t i = 0; i < sample; ++i)
+                {
+                    std::uint32_t idx = 0;
+                    if (bytesPerIndex == 2)
+                    {
+                        idx = readU16BEAt(indexData, static_cast<std::size_t>(idxPtr.Offset) + i * 2);
+                    }
+                    else
+                    {
+                        std::size_t off = static_cast<std::size_t>(idxPtr.Offset) + i * 4;
+                        if (off + 4 > indexData.size())
+                            break;
+                        idx = (static_cast<std::uint32_t>(indexData[off]) << 24) |
+                              (static_cast<std::uint32_t>(indexData[off + 1]) << 16) |
+                              (static_cast<std::uint32_t>(indexData[off + 2]) << 8) |
+                              static_cast<std::uint32_t>(indexData[off + 3]);
+                    }
+                    // treat some common sentinels as "ok" (restart / padding)
+                    if (idx == 0xFFFFu || idx == 0xFFFFFFFFu)
+                        continue;
+                    if (idx < stream.count)
+                        ok++;
+                }
+                return ok;
+            };
+
+            // Uniqueness: primitiveStart + vsPtr should be unique.
+            std::uint64_t key = (static_cast<std::uint64_t>(primitiveStart) << 32) | static_cast<std::uint64_t>(vsPtr.Offset);
+            if (seenPrimitiveKey.find(key) != seenPrimitiveKey.end())
+                continue;
+            seenPrimitiveKey.emplace(key, 1);
+
+            int score16 = scoreIndexFormat(2);
+            int score32 = scoreIndexFormat(4);
+            std::size_t bytesPerIndex = (score32 > score16) ? 4 : 2;
+            if (!canReadIndices(bytesPerIndex))
+            {
+                primitiveIndexUnknown++;
+                continue;
+            }
+
+            // Build vertex buffer (pos only, other channels default).
+            Renderer::SlRenderer::ForestCpuMesh mesh;
+            mesh.Skinned = false;
+            mesh.Model = readMatrixBE(primitiveStart);
+            std::span<const std::uint8_t> vbData = stream.vertexInGpu ? gpuData : cpuData;
+            mesh.Vertices.resize(static_cast<std::size_t>(stream.count) * 20, 0.0f);
+            for (std::uint32_t vi = 0; vi < stream.count; ++vi)
+            {
+                std::size_t base = static_cast<std::size_t>(stream.vertexDataPtr) + static_cast<std::size_t>(vi) *
+                                   static_cast<std::size_t>(stream.stride);
+                if (base + 12 > vbData.size())
+                    break;
+
+                auto readU32BEFrom = [&](std::size_t off) -> std::uint32_t {
+                    if (off + 4 > vbData.size())
+                        return 0;
+                    return (static_cast<std::uint32_t>(vbData[off]) << 24) |
+                           (static_cast<std::uint32_t>(vbData[off + 1]) << 16) |
+                           (static_cast<std::uint32_t>(vbData[off + 2]) << 8) |
+                           static_cast<std::uint32_t>(vbData[off + 3]);
+                };
+                std::uint32_t ux = readU32BEFrom(base + 0);
+                std::uint32_t uy = readU32BEFrom(base + 4);
+                std::uint32_t uz = readU32BEFrom(base + 8);
+                if (swapFloats)
+                {
+                    ux = swapU32(ux);
+                    uy = swapU32(uy);
+                    uz = swapU32(uz);
+                }
+                float x = readFloatLE(ux);
+                float y = readFloatLE(uy);
+                float z = readFloatLE(uz);
+
+                std::size_t out = static_cast<std::size_t>(vi) * 20;
+                mesh.Vertices[out + 0] = x;
+                mesh.Vertices[out + 1] = y;
+                mesh.Vertices[out + 2] = z;
+                // normal
+                mesh.Vertices[out + 3] = 0.0f;
+                mesh.Vertices[out + 4] = 1.0f;
+                mesh.Vertices[out + 5] = 0.0f;
+                // uv
+                mesh.Vertices[out + 6] = 0.0f;
+                mesh.Vertices[out + 7] = 0.0f;
+                // weights
+                mesh.Vertices[out + 8] = 1.0f;
+                mesh.Vertices[out + 9] = 0.0f;
+                mesh.Vertices[out + 10] = 0.0f;
+                mesh.Vertices[out + 11] = 0.0f;
+                // indices (as floats)
+                mesh.Vertices[out + 12] = 0.0f;
+                mesh.Vertices[out + 13] = 0.0f;
+                mesh.Vertices[out + 14] = 0.0f;
+                mesh.Vertices[out + 15] = 0.0f;
+                // pad remaining (16..19) if renderer expects 20 floats; keep 0.
+            }
+
+            mesh.Indices.reserve(numIndices);
+            for (std::uint32_t ii = 0; ii < numIndices; ++ii)
+            {
+                std::uint32_t idx = 0;
+                if (bytesPerIndex == 2)
+                {
+                    idx = readU16BEAt(indexData, static_cast<std::size_t>(idxPtr.Offset) + static_cast<std::size_t>(ii) * 2);
+                    if (idx == 0xFFFFu)
+                        continue;
+                }
+                else
+                {
+                    std::size_t off = static_cast<std::size_t>(idxPtr.Offset) + static_cast<std::size_t>(ii) * 4;
+                    if (off + 4 > indexData.size())
+                        break;
+                    idx = (static_cast<std::uint32_t>(indexData[off]) << 24) |
+                          (static_cast<std::uint32_t>(indexData[off + 1]) << 16) |
+                          (static_cast<std::uint32_t>(indexData[off + 2]) << 8) |
+                          static_cast<std::uint32_t>(indexData[off + 3]);
+                    if (idx == 0xFFFFFFFFu)
+                        continue;
+                }
+
+                if (idx >= stream.count)
+                    continue;
+                mesh.Indices.push_back(idx);
+            }
+            if (mesh.Indices.size() >= 3)
+            {
+                meshes.push_back(std::move(mesh));
+                primitiveMatches++;
+                if (bytesPerIndex == 2)
+                    primitiveMatchesU16++;
+                else
+                    primitiveMatchesU32++;
+            }
+
+            if (meshes.size() >= 2048)
+                break;
+        }
+
+        log("Primitive matches: " + std::to_string(primitiveMatches) +
+            " (u16=" + std::to_string(primitiveMatchesU16) +
+            " u32=" + std::to_string(primitiveMatchesU32) +
+            " unk=" + std::to_string(primitiveIndexUnknown) + ")" +
+            " meshes=" + std::to_string(meshes.size()));
+        std::cout << "[ForestPS3] primitiveMatches=" << primitiveMatches
+                  << " meshesBuilt=" << meshes.size() << " (see ForestPS3.log)\n";
+        if (meshes.empty())
+        {
+            log("No meshes built (likely index/stream pairing mismatch).");
+            std::cout << "[ForestPS3] No meshes built (see ForestPS3.log)\n";
+            return;
+        }
+
+        _forestLibrary.reset();
+        _forestMeshSources.clear();
+        _allForestMeshes = meshes;
+        _renderer.SetForestMeshes(std::move(meshes));
+        _renderer.SetDrawForestMeshes(true);
+        _drawForestMeshes = true;
+
+        // Populate minimal hierarchy so the Hierarchy tab isn't empty on PS3.
+        _forestHierarchy.clear();
+        ForestHierarchy fh;
+        fh.Name = "PS3 Forest (primitive-matched)";
+        fh.Visible = true;
+        _forestHierarchy.push_back(std::move(fh));
+
+        // Optional: also show boxes as a debug aid (off by default).
+        _drawForestBoxes = false;
+        _forestBoxLayers.clear();
+        _renderer.SetForestBoxes({});
+        _renderer.SetDrawForestBoxes(false);
+        return;
+#endif
+    }
 
     auto library = std::make_shared<SeEditor::Forest::ForestLibrary>();
     try
@@ -4499,8 +6204,8 @@ void CharmyBee::LoadItemsForestResources()
                               : std::span<const std::uint8_t>(forestGpuData.data(), forestGpuData.size()),
         std::move(relocations));
     static SlLib::Resources::Database::SlPlatform s_win32("win32", false, false, 0);
-    static SlLib::Resources::Database::SlPlatform s_xbox360("x360", true, false, 0);
-    context.Platform = bigEndian ? &s_xbox360 : &s_win32;
+    static SlLib::Resources::Database::SlPlatform s_ps3("ps3", true, false, 0);
+    context.Platform = bigEndian ? &s_ps3 : &s_win32;
 
     auto library = std::make_shared<SeEditor::Forest::ForestLibrary>();
     try

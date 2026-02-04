@@ -63,6 +63,9 @@ std::optional<std::filesystem::path> FindDefaultMappingPath(std::filesystem::pat
 
 XpacUnpackResult UnpackXpac(XpacUnpackOptions const& options);
 XpacRepackResult RepackXpac(XpacRepackOptions const& options);
+bool DecodeZifZig(std::span<const std::uint8_t> data, std::vector<std::uint8_t>& out, std::string& error);
+bool DecodeZifZigPs3(std::span<const std::uint8_t> data, std::vector<std::uint8_t>& out, std::string& error);
 bool EncodeZifZig(std::span<const std::uint8_t> raw, std::vector<std::uint8_t>& out, std::string& error);
+bool EncodeZifZigPs3(std::span<const std::uint8_t> raw, std::vector<std::uint8_t>& out, std::string& error);
 
 } // namespace SeEditor::Xpac

@@ -6,6 +6,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <vector>
+#include <sstream>
 
 #include <zlib.h>
 
@@ -31,10 +32,10 @@ std::uint32_t ReadUint32(const std::uint8_t* ptr)
 
 std::uint32_t ReadUint32BE(const std::uint8_t* ptr)
 {
-    return static_cast<std::uint32_t>(ptr[3]) |
-           (static_cast<std::uint32_t>(ptr[2]) << 8) |
+    return (static_cast<std::uint32_t>(ptr[0]) << 24) |
            (static_cast<std::uint32_t>(ptr[1]) << 16) |
-           (static_cast<std::uint32_t>(ptr[0]) << 24);
+           (static_cast<std::uint32_t>(ptr[2]) << 8) |
+           static_cast<std::uint32_t>(ptr[3]);
 }
 
 bool LooksLikeZlib(std::span<const std::uint8_t> data)
@@ -198,7 +199,12 @@ std::optional<SifParseResult> ParseSifFile(std::span<const std::uint8_t> raw, st
 
         if (chunkSize < 0x10 || chunkSize > size - offset)
         {
-            error = "Invalid SIF chunk size.";
+            std::ostringstream oss;
+            oss << "Invalid SIF chunk size at offset 0x"
+                << std::hex << offset
+                << " size=0x" << chunkSize
+                << " remaining=0x" << (size - offset) << std::dec;
+            error = oss.str();
             return std::nullopt;
         }
 

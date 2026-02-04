@@ -9,6 +9,7 @@
 #include "SlLib/Resources/Database/SlPlatform.hpp"
 #include "SlLib/Resources/Database/SlResourceRelocation.hpp"
 #include "SlLib/Serialization/ResourceLoadContext.hpp"
+#include "SeEditor/Platform/Stricmp.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1934,7 +1935,7 @@ static std::optional<std::filesystem::path> TryPrepareUnityProjectAtRoot(std::fi
             return std::nullopt;
         }
         const auto name = entry.path().filename().string();
-        if (_stricmp(name.c_str(), "Assets") == 0)
+        if (SeStricmp(name.c_str(), "Assets") == 0)
             continue;
 
         const std::filesystem::path dst = unity / entry.path().filename();

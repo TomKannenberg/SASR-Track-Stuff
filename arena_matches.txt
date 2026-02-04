@@ -1,0 +1,13 @@
+465573664:.\Resource\Tracks\hotd_arena.zif;
+3410982091:.\Resource\Tracks\hotd_arena.zig;
+352618593:.\Resource\Tracks\hotd_arena_4p.zif;
+4038372842:.\Resource\Tracks\hotd_arena_4p.zig;
+3526118211:.\Resource\Tracks\hotd_arena_PCRT_SH_Data.zif;
+180473780:.\Resource\Tracks\hotd_arena_PCRT_SH_Data.zig;
+2538219414:.\Resource\Tracks\seasidehill_arena_4p.zig;
+4141714873:.\Resource\Tracks\monkeyball_arena.zif;
+4060118188:.\Resource\Tracks\monkeyball_arena.zig;
+631630034:.\Resource\Tracks\monkeyball_arena_4p.zif;
+1911663859:.\Resource\Tracks\monkeyball_arena_4p.zig;
+4168937572:.\Resource\Tracks\monkeyball_arena_PCRT_SH_Data.zif;
+16555821:.\Resource\Tracks\monkeyball_arena_PCRT_SH_Data.zig;

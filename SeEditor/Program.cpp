@@ -9,6 +9,7 @@
 #include "Editor/Scene.hpp"
 #include "Forest/ForestTypes.hpp"
 #include "SlLib/Resources/Database/SlPlatform.hpp"
+#include "Platform/Stricmp.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include <string>
 #include <iomanip>
 #include <array>
+#include <zlib.h>
 #include <filesystem>
 #include <unordered_map>
 #include <algorithm>
@@ -37,6 +39,55 @@ namespace {
 constexpr int kZlibFlushNone = 0;
 constexpr int kZlibOkValue = 0;
 constexpr int kZlibStreamEndValue = 1;
+
+std::uint32_t ReadU32BE(std::span<const std::uint8_t> data, std::size_t offset)
+{
+    return (static_cast<std::uint32_t>(data[offset]) << 24) |
+           (static_cast<std::uint32_t>(data[offset + 1]) << 16) |
+           (static_cast<std::uint32_t>(data[offset + 2]) << 8) |
+           static_cast<std::uint32_t>(data[offset + 3]);
+}
+
+struct InflateResult
+{
+    bool Ok = false;
+    std::size_t Consumed = 0;
+    std::vector<std::uint8_t> Output;
+};
+
+InflateResult InflateOnce(std::span<const std::uint8_t> data, std::size_t start, int wbits)
+{
+    InflateResult result;
+    if (start >= data.size())
+        return result;
+    z_stream stream{};
+    if (inflateInit2(&stream, wbits) != Z_OK)
+        return result;
+    stream.next_in = const_cast<std::uint8_t*>(data.data() + start);
+    stream.avail_in = static_cast<uInt>(data.size() - start);
+    std::vector<std::uint8_t> buffer(1 << 14);
+    int status = Z_OK;
+    while (status != Z_STREAM_END)
+    {
+        stream.next_out = buffer.data();
+        stream.avail_out = static_cast<uInt>(buffer.size());
+        status = inflate(&stream, 0);
+        if (status != Z_OK && status != Z_STREAM_END && status != -5)
+        {
+            inflateEnd(&stream);
+            return result;
+        }
+        std::size_t have = buffer.size() - stream.avail_out;
+        if (have > 0)
+            result.Output.insert(result.Output.end(), buffer.begin(), buffer.begin() + have);
+        if (status == -5 && stream.avail_in == 0 && have == 0)
+            break;
+    }
+    result.Ok = true;
+    result.Consumed = stream.total_in;
+    inflateEnd(&stream);
+    return result;
+}
 
 struct ObjVertex
 {
@@ -543,26 +594,12 @@ std::vector<std::uint8_t> DecodeZifZig(std::span<const std::uint8_t> data)
     if (data.empty())
         return {};
 
-    auto stripLengthPrefix = [](std::span<const std::uint8_t> buffer) {
-        if (buffer.size() < 4)
-            return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
+    std::vector<std::uint8_t> decoded;
+    std::string error;
+    if (Xpac::DecodeZifZig(data, decoded, error))
+        return decoded;
 
-        std::uint32_t expected = ReadU32LE(buffer, 0);
-        std::size_t payloadSize = buffer.size() - 4;
-        if (expected > 0 && expected <= payloadSize)
-            return std::vector<std::uint8_t>(buffer.begin() + 4, buffer.begin() + 4 + expected);
-
-        return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
-    };
-
-    if (!LooksLikeZlib(data))
-        return stripLengthPrefix(data);
-
-    std::vector<std::uint8_t> decompressed = DecompressZlib(data);
-    if (decompressed.empty())
-        return {};
-
-    return stripLengthPrefix(decompressed);
+    return {};
 }
 
 bool ReadFileBytes(std::filesystem::path const& path, std::vector<std::uint8_t>& out)
@@ -629,16 +666,9 @@ std::vector<std::uint8_t> LoadGpuDataForSif(std::filesystem::path const& sifPath
 
     std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
     std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
-    if (LooksLikeZlib(data))
-    {
-        auto inflated = DecompressZlib(data);
-        if (inflated.size() >= 4)
-            data.assign(inflated.begin() + 4, inflated.end());
-    }
-    else
-    {
-        StripLengthPrefixIfPresent(data);
-    }
+    auto decoded = DecodeZifZig(data);
+    if (!decoded.empty())
+        data.swap(decoded);
 
     return data;
 }
@@ -1112,7 +1142,7 @@ int Program::Run(int argc, char** argv)
         options.ReplacementRoot = exportSif.parent_path();
         options.MappingPath = Xpac::FindDefaultMappingPath(options.XpacPath, options.InputRoot);
         options.SelectedSifRelativePaths.push_back(exportSif.filename());
-        if (_stricmp(exportSif.extension().string().c_str(), ".sif") == 0)
+        if (SeStricmp(exportSif.extension().string().c_str(), ".sif") == 0)
         {
             std::filesystem::path sigPath = exportSif;
             sigPath.replace_extension(".sig");
@@ -1255,6 +1285,171 @@ int Program::Run(int argc, char** argv)
         }
 
         std::cout << "[SIFRebuild] Converted=" << converted << " Skipped=" << skipped << std::endl;
+        return 0;
+    }
+
+    if (argc >= 4 && std::string(argv[1]) == "--decode-zif-ps3")
+    {
+        std::filesystem::path input = argv[2];
+        std::filesystem::path output = argv[3];
+        std::vector<std::uint8_t> data;
+        if (!ReadFileBytes(input, data))
+        {
+            std::cerr << "[PS3ZIF] Failed to read " << input.string() << std::endl;
+            return 1;
+        }
+        std::vector<std::uint8_t> decoded;
+        std::string error;
+        if (!Xpac::DecodeZifZigPs3(data, decoded, error))
+        {
+            std::cerr << "[PS3ZIF] Decode failed: " << error << std::endl;
+            return 2;
+        }
+        if (!WriteFileBytes(output, decoded))
+        {
+            std::cerr << "[PS3ZIF] Failed to write " << output.string() << std::endl;
+            return 3;
+        }
+        std::cout << "[PS3ZIF] Wrote " << output.string() << " (" << decoded.size() << " bytes)\n";
+        return 0;
+    }
+
+    if (argc >= 4 && std::string(argv[1]) == "--decode-zif-ps3-seq")
+    {
+        std::filesystem::path input = argv[2];
+        std::filesystem::path output = argv[3];
+        std::vector<std::uint8_t> data;
+        if (!ReadFileBytes(input, data))
+        {
+            std::cerr << "[PS3ZIF] Failed to read " << input.string() << std::endl;
+            return 1;
+        }
+        if (data.size() < 8)
+        {
+            std::cerr << "[PS3ZIF] File too small." << std::endl;
+            return 2;
+        }
+        std::uint32_t count = ReadU32BE(data, 4);
+        std::size_t headerSize = 8 + static_cast<std::size_t>(count) * 4;
+        std::size_t pos = headerSize;
+        std::vector<std::uint8_t> decoded;
+        for (std::uint32_t i = 0; i < count && pos < data.size(); ++i)
+        {
+            InflateResult raw = InflateOnce(data, pos, -15);
+            if (!raw.Ok || raw.Consumed == 0 || raw.Output.empty())
+            {
+                std::cerr << "[PS3ZIF] Seq decode failed at stream " << i << " pos=0x"
+                          << std::hex << pos << std::dec << std::endl;
+                return 3;
+            }
+            decoded.insert(decoded.end(), raw.Output.begin(), raw.Output.end());
+            pos += raw.Consumed;
+        }
+        if (!WriteFileBytes(output, decoded))
+        {
+            std::cerr << "[PS3ZIF] Failed to write " << output.string() << std::endl;
+            return 4;
+        }
+        std::cout << "[PS3ZIF] Wrote " << output.string() << " (" << decoded.size() << " bytes)\n";
+        return 0;
+    }
+
+    if (argc >= 4 && std::string(argv[1]) == "--dump-forest")
+    {
+        std::filesystem::path input = argv[2];
+        std::filesystem::path output = argv[3];
+        std::ifstream file(input, std::ios::binary);
+        if (!file)
+        {
+            std::cerr << "[ForestDump] Failed to open " << input.string() << std::endl;
+            return 1;
+        }
+        std::vector<char> buffer((std::istreambuf_iterator<char>(file)), {});
+        std::vector<std::uint8_t> data(buffer.begin(), buffer.end());
+        std::string error;
+        auto parsed = ParseSifFile(std::span<const std::uint8_t>(data.data(), data.size()), error);
+        if (!parsed)
+        {
+            std::cerr << "[ForestDump] Parse error: " << error << std::endl;
+            return 2;
+        }
+        std::optional<SifChunkInfo> forestChunk;
+        for (auto const& chunk : parsed->Chunks)
+        {
+            if (chunk.TypeValue == 0x45524F46) // 'FORE'
+            {
+                forestChunk = chunk;
+                break;
+            }
+        }
+        if (!forestChunk)
+        {
+            std::cerr << "[ForestDump] No FORE chunk found." << std::endl;
+            return 3;
+        }
+        if (!WriteFileBytes(output, forestChunk->Data))
+        {
+            std::cerr << "[ForestDump] Failed to write " << output.string() << std::endl;
+            return 4;
+        }
+        std::cout << "[ForestDump] Wrote " << output.string()
+                  << " (" << forestChunk->Data.size() << " bytes)\n";
+        return 0;
+    }
+
+    if (argc >= 3 && std::string(argv[1]) == "--debug-zif-ps3")
+    {
+        std::filesystem::path input = argv[2];
+        std::vector<std::uint8_t> data;
+        if (!ReadFileBytes(input, data))
+        {
+            std::cerr << "[PS3ZIF] Failed to read " << input.string() << std::endl;
+            return 1;
+        }
+        if (data.size() < 8)
+        {
+            std::cerr << "[PS3ZIF] File too small." << std::endl;
+            return 2;
+        }
+
+        std::uint32_t be0 = ReadU32BE(data, 0);
+        std::uint32_t count = ReadU32BE(data, 4);
+        std::size_t headerSize = 8 + static_cast<std::size_t>(count) * 4;
+        std::cout << "[PS3ZIF] be0=0x" << std::hex << std::setw(8) << std::setfill('0') << be0
+                  << " count=" << std::dec << count
+                  << " header=0x" << std::hex << headerSize << std::dec << "\n";
+
+        std::size_t pos = headerSize;
+        std::size_t totalOut = 0;
+        for (std::uint32_t i = 0; i < count && pos < data.size(); ++i)
+        {
+            InflateResult zlib = InflateOnce(data, pos, 15);
+            InflateResult raw = InflateOnce(data, pos, -15);
+            InflateResult best = (zlib.Ok && raw.Ok)
+                                 ? (zlib.Output.size() >= raw.Output.size() ? zlib : raw)
+                                 : (zlib.Ok ? zlib : raw);
+
+            std::cout << "  [" << i << "] pos=0x" << std::hex << pos << std::dec
+                      << " rawOut=" << raw.Output.size() << " rawIn=" << raw.Consumed
+                      << " zlibOut=" << zlib.Output.size() << " zlibIn=" << zlib.Consumed;
+
+            if (best.Ok && !best.Output.empty())
+            {
+                std::cout << " bestOut=" << best.Output.size()
+                          << " bestIn=" << best.Consumed
+                          << " head=";
+                for (std::size_t h = 0; h < std::min<std::size_t>(4, best.Output.size()); ++h)
+                    std::cout << std::hex << std::setw(2) << std::setfill('0')
+                              << static_cast<int>(best.Output[h]) << ' ';
+                std::cout << std::dec;
+                totalOut += best.Output.size();
+                pos += best.Consumed > 0 ? best.Consumed : 0;
+            }
+            std::cout << "\n";
+        }
+
+        std::cout << "[PS3ZIF] totalOut=" << totalOut << " finalPos=0x"
+                  << std::hex << pos << std::dec << "\n";
         return 0;
     }
 
@@ -3138,3 +3333,6 @@ int Program::Run(int argc, char** argv)
 }
 
 } // namespace SeEditor
+namespace {
+
+} // namespace

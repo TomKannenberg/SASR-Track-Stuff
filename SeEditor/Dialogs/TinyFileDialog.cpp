@@ -2,25 +2,28 @@
 
 #include <string>
 #include <vector>
+#include <iostream>
+#include <cstring>
+
+#if defined(_WIN32)
 #include <windows.h>
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shobjidl.h>
-#include <cstring>
-#include <iostream>
 
-extern "C" {
-static thread_local std::string g_tinyfdResult;
+namespace {
 
-static const char* saveResult(std::string const& value)
+thread_local std::string g_tinyfdResult;
+
+const char* saveResult(std::string const& value)
 {
     g_tinyfdResult = value;
     return g_tinyfdResult.c_str();
 }
 
-static std::vector<char> buildFilter(int numPatterns,
-                                     const char* const* patterns,
-                                     const char* description)
+std::vector<char> buildFilter(int numPatterns,
+                              const char* const* patterns,
+                              const char* description)
 {
     std::vector<char> filter;
     auto append = [&filter](std::string const& text) {
@@ -28,9 +31,9 @@ static std::vector<char> buildFilter(int numPatterns,
         filter.push_back('\0');
     };
 
-    if (numPatterns > 0 && patterns != nullptr && patterns[0] != nullptr)
+    if (numPatterns > 0 && patterns && patterns[0])
     {
-        append(description != nullptr ? description : patterns[0]);
+        append(description ? description : patterns[0]);
         append(patterns[0]);
     }
 
@@ -40,7 +43,7 @@ static std::vector<char> buildFilter(int numPatterns,
     return filter;
 }
 
-static HWND pickOwnerWindow()
+HWND pickOwnerWindow()
 {
     HWND owner = GetActiveWindow();
     if (!owner)
@@ -48,9 +51,9 @@ static HWND pickOwnerWindow()
     return owner;
 }
 
-static std::wstring widenUtf8(char const* text)
+std::wstring widenUtf8(char const* text)
 {
-    if (text == nullptr || *text == '\0')
+    if (!text || *text == '\0')
         return {};
     int size = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
     if (size <= 0)
@@ -60,9 +63,9 @@ static std::wstring widenUtf8(char const* text)
     return result;
 }
 
-static std::string narrowUtf8(wchar_t const* text)
+std::string narrowUtf8(wchar_t const* text)
 {
-    if (text == nullptr || *text == L'\0')
+    if (!text || *text == L'\0')
         return {};
     int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
     if (size <= 0)
@@ -72,6 +75,10 @@ static std::string narrowUtf8(wchar_t const* text)
     return result;
 }
 
+} // namespace
+
+extern "C" {
+
 const char* tinyfd_openFileDialog(const char* aTitle,
                                   const char* aDefaultPathAndFile,
                                   int aNumOfFilterPatterns,
@@ -80,7 +87,7 @@ const char* tinyfd_openFileDialog(const char* aTitle,
                                   int aAllowMultipleSelects)
 {
     char fileBuffer[MAX_PATH] = {0};
-    if (aDefaultPathAndFile != nullptr)
+    if (aDefaultPathAndFile)
         std::strncpy(fileBuffer, aDefaultPathAndFile, MAX_PATH - 1);
 
     auto filter = buildFilter(aNumOfFilterPatterns, aFilterPatterns, aSingleFilterDescription);
@@ -112,7 +119,7 @@ const char* tinyfd_saveFileDialog(const char* aTitle,
                                   const char* aSingleFilterDescription)
 {
     char fileBuffer[MAX_PATH] = {0};
-    if (aDefaultPathAndFile != nullptr)
+    if (aDefaultPathAndFile)
         std::strncpy(fileBuffer, aDefaultPathAndFile, MAX_PATH - 1);
 
     auto filter = buildFilter(aNumOfFilterPatterns, aFilterPatterns, aSingleFilterDescription);
@@ -149,230 +156,119 @@ const char* tinyfd_selectFolderDialog(const char* aTitle, const char* aDefaultPa
         if (SUCCEEDED(dialog->GetOptions(&options)))
             dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
 
-        if (aTitle != nullptr)
+        if (aTitle)
+            dialog->SetTitle(widenUtf8(aTitle).c_str());
+        if (aDefaultPathAndFile)
         {
-            std::wstring title = widenUtf8(aTitle);
-            if (!title.empty())
-                dialog->SetTitle(title.c_str());
-        }
-
-        if (aDefaultPathAndFile != nullptr && *aDefaultPathAndFile != '\0')
-        {
-            std::wstring defaultPath = widenUtf8(aDefaultPathAndFile);
-            if (!defaultPath.empty())
+            IShellItem* folder = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(widenUtf8(aDefaultPathAndFile).c_str(), nullptr, IID_PPV_ARGS(&folder))))
             {
-                IShellItem* folderItem = nullptr;
-                if (SUCCEEDED(SHCreateItemFromParsingName(defaultPath.c_str(), nullptr,
-                                                          IID_PPV_ARGS(&folderItem))))
-                {
-                    dialog->SetFolder(folderItem);
-                    dialog->SetDefaultFolder(folderItem);
-                    folderItem->Release();
-                }
+                dialog->SetFolder(folder);
+                folder->Release();
             }
         }
 
         hr = dialog->Show(pickOwnerWindow());
         if (SUCCEEDED(hr))
         {
-            IShellItem* item = nullptr;
-            if (SUCCEEDED(dialog->GetResult(&item)) && item != nullptr)
+            IShellItem* result = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&result)))
             {
-                PWSTR wpath = nullptr;
-                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &wpath)) && wpath != nullptr)
+                PWSTR path = nullptr;
+                if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path)
                 {
-                    std::string path = narrowUtf8(wpath);
-                    CoTaskMemFree(wpath);
-                    item->Release();
+                    auto narrowed = narrowUtf8(path);
+                    CoTaskMemFree(path);
+                    result->Release();
                     dialog->Release();
-                    if (coInit && initResult != RPC_E_CHANGED_MODE)
+                    if (coInit)
                         CoUninitialize();
-                    return path.empty() ? nullptr : saveResult(path);
+                    return saveResult(narrowed);
                 }
-                item->Release();
+                if (path)
+                    CoTaskMemFree(path);
+                result->Release();
             }
         }
         dialog->Release();
     }
 
-    if (coInit && initResult != RPC_E_CHANGED_MODE)
+    if (coInit)
         CoUninitialize();
-
-    BROWSEINFOA bi{};
-    char path[MAX_PATH] = {0};
-    bi.hwndOwner = pickOwnerWindow();
-    bi.lpszTitle = aTitle;
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (pidl == nullptr)
-        return nullptr;
-
-    if (!SHGetPathFromIDListA(pidl, path))
-    {
-        CoTaskMemFree(pidl);
-        return nullptr;
-    }
-
-    CoTaskMemFree(pidl);
-    return saveResult(path);
+    return nullptr;
 }
 
-int tinyfd_notifyPopup(const char* aTitle, const char* aMessage, const char* aIconType)
-{
-    UINT flags = MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TASKMODAL;
-    if (aIconType != nullptr && std::strcmp(aIconType, "warning") == 0)
-        flags = MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TASKMODAL;
-    else if (aIconType != nullptr && std::strcmp(aIconType, "error") == 0)
-        flags = MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TASKMODAL;
+} // extern "C"
 
-    MessageBoxA(GetActiveWindow(), aMessage, aTitle, flags);
-    return 1;
+namespace SeEditor::Dialogs {
+
+std::optional<std::string> TinyFileDialog::convertResult(char const* result)
+{
+    if (result == nullptr || *result == '\0')
+        return std::nullopt;
+    return std::string(result);
 }
-
-int tinyfd_messageBox(const char* aTitle,
-                      const char* aMessage,
-                      const char* aDialogType,
-                      const char* aIconType,
-                      int aDefaultButton)
-{
-    UINT flags = MB_SETFOREGROUND | MB_TASKMODAL;
-    if (aDialogType != nullptr && std::strcmp(aDialogType, "yesno") == 0)
-        flags |= MB_YESNO;
-    else if (aDialogType != nullptr && std::strcmp(aDialogType, "okcancel") == 0)
-        flags |= MB_OKCANCEL;
-    else
-        flags |= MB_OK;
-
-    if (aIconType != nullptr && std::strcmp(aIconType, "warning") == 0)
-        flags |= MB_ICONWARNING;
-    else if (aIconType != nullptr && std::strcmp(aIconType, "error") == 0)
-        flags |= MB_ICONERROR;
-    else
-        flags |= MB_ICONINFORMATION;
-
-    int result = MessageBoxA(GetActiveWindow(), aMessage, aTitle, flags);
-    if (flags & MB_YESNO)
-        return result == IDYES;
-
-    if (flags & MB_OKCANCEL)
-        return result == IDOK;
-
-    return result == IDOK;
-}
-}
-
-namespace SeEditor::Dialogs
-{
-
-namespace
-{
-constexpr char ok[] = "ok";
-constexpr char okcancel[] = "okcancel";
-constexpr char yesno[] = "yesno";
-constexpr char yesnocancel[] = "yesnocancel";
-
-constexpr char info[] = "info";
-constexpr char warning[] = "warning";
-constexpr char error[] = "error";
-constexpr char question[] = "question";
-
-const char* messageBoxModeToString(MessageBoxMode mode)
-{
-    switch (mode)
-    {
-    case MessageBoxMode::Ok:
-        return ok;
-    case MessageBoxMode::OkCancel:
-        return okcancel;
-    case MessageBoxMode::YesNo:
-        return yesno;
-    case MessageBoxMode::YesNoCancel:
-        return yesnocancel;
-    }
-
-    return ok;
-}
-
-const char* messageIconToString(MessageIcon icon)
-{
-    switch (icon)
-    {
-    case MessageIcon::Info:
-        return info;
-    case MessageIcon::Warning:
-        return warning;
-    case MessageIcon::Error:
-        return error;
-    case MessageIcon::Question:
-        return question;
-    }
-
-    return info;
-}
-
-std::vector<char const*> collectFilterPatterns(std::vector<std::string> const& patterns)
-{
-    std::vector<char const*> result;
-    result.reserve(patterns.size());
-    for (auto const& pattern : patterns)
-        result.push_back(pattern.c_str());
-    return result;
-}
-
-} // namespace
 
 std::optional<std::string> TinyFileDialog::openFileDialog(FileDialogOptions const& options)
 {
-    auto patternStorage = collectFilterPatterns(options.FilterPatterns);
-    char const* description = options.FilterDescription.has_value() ? options.FilterDescription->c_str() : nullptr;
-    char const* defaultPath = options.DefaultPathAndFile.empty() ? nullptr : options.DefaultPathAndFile.c_str();
-
-    char const* result = tinyfd_openFileDialog(
+    return convertResult(tinyfd_openFileDialog(
         options.Title.c_str(),
-        defaultPath,
-        static_cast<int>(patternStorage.size()),
-        patternStorage.empty() ? nullptr : patternStorage.data(),
-        description,
-        options.AllowMultipleSelects ? 1 : 0);
-
-    return convertResult(result);
+        options.DefaultPathAndFile.empty() ? nullptr : options.DefaultPathAndFile.c_str(),
+        static_cast<int>(options.FilterPatterns.size()),
+        options.FilterPatterns.empty()
+            ? nullptr
+            : [&]() {
+                  static std::vector<const char*> ptrs;
+                  ptrs.clear();
+                  for (auto const& s : options.FilterPatterns) ptrs.push_back(s.c_str());
+                  return ptrs.data();
+              }(),
+        options.FilterDescription ? options.FilterDescription->c_str() : nullptr,
+        options.AllowMultipleSelects ? 1 : 0));
 }
 
 std::optional<std::string> TinyFileDialog::saveFileDialog(FileDialogOptions const& options)
 {
-    auto patternStorage = collectFilterPatterns(options.FilterPatterns);
-    char const* description = options.FilterDescription.has_value() ? options.FilterDescription->c_str() : nullptr;
-    char const* defaultPath = options.DefaultPathAndFile.empty() ? nullptr : options.DefaultPathAndFile.c_str();
-
-    char const* result = tinyfd_saveFileDialog(
+    return convertResult(tinyfd_saveFileDialog(
         options.Title.c_str(),
-        defaultPath,
-        static_cast<int>(patternStorage.size()),
-        patternStorage.empty() ? nullptr : patternStorage.data(),
-        description);
-
-    return convertResult(result);
+        options.DefaultPathAndFile.empty() ? nullptr : options.DefaultPathAndFile.c_str(),
+        static_cast<int>(options.FilterPatterns.size()),
+        options.FilterPatterns.empty()
+            ? nullptr
+            : [&]() {
+                  static std::vector<const char*> ptrs;
+                  ptrs.clear();
+                  for (auto const& s : options.FilterPatterns) ptrs.push_back(s.c_str());
+                  return ptrs.data();
+              }(),
+        options.FilterDescription ? options.FilterDescription->c_str() : nullptr));
 }
 
 std::optional<std::string> TinyFileDialog::selectFolderDialog(std::string_view title,
-                                                              std::string_view defaultPath)
+                                                             std::string_view defaultPath)
 {
-    std::string titleBuffer(title);
-    std::string defaultPathBuffer(defaultPath);
-    char const* defaultPathCStr = defaultPathBuffer.empty() ? nullptr : defaultPathBuffer.c_str();
-
-    char const* result = tinyfd_selectFolderDialog(titleBuffer.c_str(), defaultPathCStr);
-    return convertResult(result);
+    return convertResult(tinyfd_selectFolderDialog(
+        title.empty() ? nullptr : std::string(title).c_str(),
+        defaultPath.empty() ? nullptr : std::string(defaultPath).c_str()));
 }
 
 bool TinyFileDialog::notifyPopup(std::string_view title,
                                 std::string_view message,
                                 MessageIcon icon)
 {
-    std::string titleBuffer(title);
-    std::string messageBuffer(message);
-    return tinyfd_notifyPopup(titleBuffer.c_str(), messageBuffer.c_str(), messageIconToString(icon)) != 0;
+    UINT flags = MB_OK;
+    switch (icon)
+    {
+    case MessageIcon::Warning: flags |= MB_ICONWARNING; break;
+    case MessageIcon::Error: flags |= MB_ICONERROR; break;
+    case MessageIcon::Question: flags |= MB_ICONQUESTION; break;
+    default: flags |= MB_ICONINFORMATION; break;
+    }
+    int res = MessageBoxA(pickOwnerWindow(),
+                          std::string(message).c_str(),
+                          std::string(title).c_str(),
+                          flags);
+    return res != 0;
 }
 
 bool TinyFileDialog::messageBox(std::string_view title,
@@ -381,21 +277,80 @@ bool TinyFileDialog::messageBox(std::string_view title,
                                MessageIcon icon,
                                int defaultButton)
 {
-    std::string titleBuffer(title);
-    std::string messageBuffer(message);
-    return tinyfd_messageBox(titleBuffer.c_str(),
-                             messageBuffer.c_str(),
-                             messageBoxModeToString(mode),
-                             messageIconToString(icon),
-                             defaultButton) != 0;
-}
-
-std::optional<std::string> TinyFileDialog::convertResult(char const* result)
-{
-    if (result == nullptr)
-        return std::nullopt;
-
-    return std::string(result);
+    UINT flags = 0;
+    switch (mode)
+    {
+    case MessageBoxMode::Ok: flags = MB_OK; break;
+    case MessageBoxMode::OkCancel: flags = MB_OKCANCEL; break;
+    case MessageBoxMode::YesNo: flags = MB_YESNO; break;
+    case MessageBoxMode::YesNoCancel: flags = MB_YESNOCANCEL; break;
+    }
+    switch (icon)
+    {
+    case MessageIcon::Warning: flags |= MB_ICONWARNING; break;
+    case MessageIcon::Error: flags |= MB_ICONERROR; break;
+    case MessageIcon::Question: flags |= MB_ICONQUESTION; break;
+    default: flags |= MB_ICONINFORMATION; break;
+    }
+    if (defaultButton == 2)
+        flags |= MB_DEFBUTTON2;
+    else if (defaultButton == 3)
+        flags |= MB_DEFBUTTON3;
+    int res = MessageBoxA(pickOwnerWindow(),
+                          std::string(message).c_str(),
+                          std::string(title).c_str(),
+                          flags);
+    return res == IDOK || res == IDYES;
 }
 
 } // namespace SeEditor::Dialogs
+
+#else // !_WIN32
+
+namespace SeEditor::Dialogs {
+
+std::optional<std::string> TinyFileDialog::openFileDialog(FileDialogOptions const&)
+{
+    std::cerr << "[TinyFileDialog] openFileDialog not supported on this platform build.\n";
+    return std::nullopt;
+}
+
+std::optional<std::string> TinyFileDialog::saveFileDialog(FileDialogOptions const&)
+{
+    std::cerr << "[TinyFileDialog] saveFileDialog not supported on this platform build.\n";
+    return std::nullopt;
+}
+
+std::optional<std::string> TinyFileDialog::selectFolderDialog(std::string_view,
+                                                             std::string_view)
+{
+    std::cerr << "[TinyFileDialog] selectFolderDialog not supported on this platform build.\n";
+    return std::nullopt;
+}
+
+bool TinyFileDialog::notifyPopup(std::string_view,
+                                std::string_view,
+                                MessageIcon)
+{
+    std::cerr << "[TinyFileDialog] notifyPopup not supported on this platform build.\n";
+    return false;
+}
+
+bool TinyFileDialog::messageBox(std::string_view,
+                               std::string_view,
+                               MessageBoxMode,
+                               MessageIcon,
+                               int)
+{
+    std::cerr << "[TinyFileDialog] messageBox not supported on this platform build.\n";
+    return false;
+}
+
+std::optional<std::string> TinyFileDialog::convertResult(char const*)
+{
+    return std::nullopt;
+}
+
+} // namespace SeEditor::Dialogs
+
+#endif

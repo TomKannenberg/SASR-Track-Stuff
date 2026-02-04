@@ -135,8 +135,8 @@ bool LoadForestLibrary(std::vector<std::uint8_t> const& cpuData,
         gpuData.empty() ? std::span<const std::uint8_t>() : std::span<const std::uint8_t>(gpuData.data(), gpuData.size()),
         std::move(relocations));
     SlLib::Resources::Database::SlPlatform win32("win32", false, false, 0);
-    SlLib::Resources::Database::SlPlatform xbox360("x360", true, false, 0);
-    context.Platform = bigEndian ? &xbox360 : &win32;
+    SlLib::Resources::Database::SlPlatform ps3("ps3", true, false, 0);
+    context.Platform = bigEndian ? &ps3 : &win32;
     context.Version = 0;
 
     try

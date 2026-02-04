@@ -379,6 +379,8 @@ private:
     void RenderStuffTreeNode(std::filesystem::path const& path);
     void RenderStuffSifVirtualTree(std::filesystem::path const& root);
     void BuildStuffSifCache(std::filesystem::path const& root);
+    void DecompressZifZigFile(std::filesystem::path const& path);
+    void RecompressToZifZig(std::filesystem::path const& path, bool zig, bool ps3);
 };
 
 } // namespace SeEditor
